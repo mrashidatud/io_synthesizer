@@ -1,0 +1,3 @@
+/mnt/hasanfs/repos/io_synthesizer/outputs: 1
+
+Total .darshan files found: 1
