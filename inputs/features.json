@@ -1,7 +1,12 @@
 {
   "filename": "2025/4/22/4290323-7098400058022960405.txt",
   "jobid": 4290323,
+  "io_api": "posix",
+  "meta_api": "posix",
+  "use_mdtest": false,
+  "mpi_collective_mode": "none",
   "nprocs": 1,
+  "cap_total_gib": 512,
 
   "pct_file_not_aligned": 0.6,
   "pct_mem_not_aligned": 0.4,

@@ -1,6 +1,26 @@
-Mode: sequential prep; random read runs are independent
-Total bytes target (all ranks): 64.00 GiB
-IOR read subjobs: 4; per-job bytes ≈ 16.00 GiB
-Targets: fileUA=0.600, memUA=0.400, rwSwitch=0.000, seqR=0.500, seqW=1.000, consecR=0.500, consecW=0.000
-HARNESS ops/rank=131072, switches/rank=0
-Meta (global): open=225444, stat=36700, seek=94372, sync=73400
+=== Feature → Execution Mapping (OPS-first, uniform across files, single run) ===
+  cap_total_gib=512.00  pct_io_access=0.18  → IO bytes=92.16 GiB
+  Read ops=1473  |  Write ops=368
+  Read bin ops: S=736, M=0, L=737
+  Chosen xfer sizes: S=100.00 KiB, M=1.00 MiB, L=128.00 MiB, W=8B
+
+=== Seq/Consec ===
+  Reads: consec=0.500, seq=0.500 (consec⊂seq rule enforced)
+  Writes: consec=0.000, seq=1.000
+
+=== Alignment ===
+  Target file_unaligned=0.60, mem_unaligned=0.40
+  Large-op aligned fraction≈0.799 (small/medium always unaligned)
+  SITE ALIGNMENT: FILE=1MiB, MEM=8
+
+=== Files (uniform distribution) ===
+  RO=2  RW=0  WO=1
+  RO path: /mnt/hasanfs/out_synth/payload/data/ro/ro_shared_0.dat
+  RO path: /mnt/hasanfs/out_synth/payload/data/ro/ro_shared_1.dat
+  WO path: /mnt/hasanfs/out_synth/payload/data/wo/wo_shared_0.dat
+
+=== Meta Ops (derived for pct_io_access) ===
+  open=4398, stat=716, seek=1841, sync=1432  (total=8387, io_ops=1841)
+
+=== Command ===
+  mpiexec -n 1 -genv LD_PRELOAD /mnt/hasanfs/darshan-3.4.7/darshan-runtime/install/lib/libdarshan.so /mnt/hasanfs/bin/mpi_synthio --plan /mnt/hasanfs/out_synth/payload/plan.csv --io-api posix --meta-api posix --collective none

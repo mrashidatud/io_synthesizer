@@ -1,0 +1,7 @@
+type,path,total_bytes,xfer,p_write,p_rand,p_seq_r,p_consec_r,p_seq_w,p_consec_w,p_ua_file,p_ua_mem,rw_switch,meta_open,meta_stat,meta_seek,meta_sync,seed,flags,p_rand_fwd_r,p_rand_fwd_w,p_consec_internal
+data,/mnt/hasanfs/out_synth/payload/data/ro/ro_shared_0.dat,37683200,102400,0.000000,0.500000,0.500000,0.500000,1.000000,0.000000,1.000000,0.400000,0.0,0,0,0,0,288545019,,0.500000,0.000000,0.000000
+data,/mnt/hasanfs/out_synth/payload/data/ro/ro_shared_0.dat,49526341632,134217728,0.000000,0.500000,0.500000,0.500000,1.000000,0.000000,0.200543,0.400000,0.0,0,0,0,0,1222356006,,0.500000,0.000000,0.000000
+data,/mnt/hasanfs/out_synth/payload/data/ro/ro_shared_1.dat,37683200,102400,0.000000,0.500000,0.500000,0.500000,1.000000,0.000000,1.000000,0.400000,0.0,0,0,0,0,1819850096,,0.500000,0.000000,0.000000
+data,/mnt/hasanfs/out_synth/payload/data/ro/ro_shared_1.dat,49392123904,134217728,0.000000,0.500000,0.500000,0.500000,1.000000,0.000000,0.200543,0.400000,0.0,0,0,0,0,1722851097,,0.500000,0.000000,0.000000
+data,/mnt/hasanfs/out_synth/payload/data/wo/wo_shared_0.dat,2944,8,1.000000,0.000000,1.000000,0.000000,1.000000,0.000000,0.600000,0.400000,0.0,0,0,0,0,1640193507,,0.500000,0.000000,0.000000
+meta,/mnt/hasanfs/out_synth/payload/meta/meta_only.dat,0,1,0,0,0,0,0,0,0.600000,0.400000,0.0,4398,716,1841,1432,777,meta_only,0.5,0.0,0.0

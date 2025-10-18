@@ -1,8 +1,4 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
-mpiexec -hostfile ~/hfile -genv LD_PRELOAD /mnt/hasanfs/darshan-3.4.7/darshan-runtime/install/lib/libdarshan.so -n 4 /mnt/hasanfs/bin/ior -a MPIIO -k -r -c -b 4294967296 -t 64k -o /mnt/hasanfs/repos/io_synthesizer/outputs/ior_shared_sequential_r_small.dat  # IOR r_seq_small
-mpiexec -hostfile ~/hfile -genv LD_PRELOAD /mnt/hasanfs/darshan-3.4.7/darshan-runtime/install/lib/libdarshan.so -n 4 /mnt/hasanfs/bin/ior -a MPIIO -k -r -c -b 4294967296 -t 128m -o /mnt/hasanfs/repos/io_synthesizer/outputs/ior_shared_sequential_r_large.dat  # IOR r_seq_large
-mpiexec -hostfile ~/hfile -genv LD_PRELOAD /mnt/hasanfs/darshan-3.4.7/darshan-runtime/install/lib/libdarshan.so -n 4 /mnt/hasanfs/bin/ior -a MPIIO -k -r -z -b 4294967296 -t 64k -o /mnt/hasanfs/repos/io_synthesizer/outputs/ior_shared_random_r_small.dat  # IOR r_rand_small
-mpiexec -hostfile ~/hfile -genv LD_PRELOAD /mnt/hasanfs/darshan-3.4.7/darshan-runtime/install/lib/libdarshan.so -n 4 /mnt/hasanfs/bin/ior -a MPIIO -k -r -z -b 4294967296 -t 128m -o /mnt/hasanfs/repos/io_synthesizer/outputs/ior_shared_random_r_large.dat  # IOR r_rand_large
-mpiexec -hostfile ~/hfile -genv LD_PRELOAD /mnt/hasanfs/darshan-3.4.7/darshan-runtime/install/lib/libdarshan.so -n 4 /mnt/hasanfs/bin/mpi_synthio -o /mnt/hasanfs/repos/io_synthesizer/outputs/ior_shared_sequential_r_small.dat --layout shared --t-read 64k --t-write 4096B --ops 131072 --switches 0 --p-write 0.200000 --p-seq-read 0.500000 --p-seq-write 1.000000 --p-consec-read 0.500000 --p-consec-write 0.000000 --p-unaligned-file 0.600000 --p-unaligned-mem 0.400000 --meta-open 56361 --meta-stat 9175 --meta-seek 23593 --meta-sync 18350  # HARNESS follows read-only small seq file
+bash /mnt/hasanfs/out_synth/run_prep.sh
+mpiexec -n 1 -genv LD_PRELOAD /mnt/hasanfs/darshan-3.4.7/darshan-runtime/install/lib/libdarshan.so /mnt/hasanfs/bin/mpi_synthio --plan /mnt/hasanfs/out_synth/payload/plan.csv --io-api posix --meta-api posix --collective none

@@ -1,306 +1,346 @@
 /*
- * mpi_synthio.c — MPI micro-harness to “correct” global op mix produced by IOR/mdtest:
- *   - honors global probabilities:
- *       --p-write, --p-rand
- *       --p-seq-read, --p-seq-write
- *       --p-consec-read, --p-consec-write  (consecutive ⊆ sequential)
- *       --p-unaligned-file, --p-unaligned-mem
- *       --rw-switch-prob
- *   - honors byte budget:   -B <total_bytes>
- *   - honors transfer size: -t <bytes>
- *   - operates on ONE existing path (-o) in shared layout; no stray files
- *   - emits metadata ops on the target path (no extra “unique” files):
- *       --meta-open N --meta-stat N --meta-seek N --meta-sync N
+ * mpi_synthio.c
+ * Single-run, plan-driven harness for synthetic I/O.
+ *
+ * Key behaviors (matching the planner):
+ * - Reads a CSV plan with rows of type:
+ *     data,<path>,<total_bytes>,<xfer>,<p_write>,<p_rand>,<p_seq_r>,<p_consec_r>,<p_seq_w>,<p_consec_w>,
+ *          <p_ua_file>,<p_ua_mem>,<rw_switch>,<meta_open>,<meta_stat>,<meta_seek>,<meta_sync>,<seed>,<flags>,
+ *          <p_rand_fwd_r>,<p_rand_fwd_w>,<p_consec_internal>
+ *     meta,<path>,0,1,0,..., meta counters..., seed,meta_only,...
+ *
+ * - Correct seq/consec semantics:
+ *     consecutive ⊂ sequential.
+ *     If seq==consec, only issue the 'consec' share and keep rest random (no seq-only).
+ *     If seq>consec, add exactly (seq-consec) share as seq-only (stride≥1).
+ *
+ * - Random-forward: keeps a forward-only pointer to avoid accidental backward seeks.
+ *
+ * - Alignment:
+ *     File-aligned (Lustre) only if both offset and xfer are multiples of 1 MiB.
+ *     For phases with p_ua_file<1.0 and xfer%1MiB==0, we snap offset to 1MiB.
+ *     Memory alignment: pick buffer = base or base+1 with probability p_ua_mem.
+ *
+ * - Uniform across files: plan is already split by file (uniform op distribution is enforced by planner).
  *
  * Build:
  *   mpicc -O3 -Wall -Wextra -o mpi_synthio mpi_synthio.c -lm
+ *
+ * Run:
+ *   mpiexec -n 1 ./mpi_synthio --plan /path/plan.csv --io-api posix --meta-api posix --collective none
  */
 
-#define _POSIX_C_SOURCE 200809L
+#define _LARGEFILE64_SOURCE
+#define _GNU_SOURCE
 #include <mpi.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
-#include <getopt.h>
 #include <errno.h>
-#include <limits.h>
-#include <time.h>
 #include <math.h>
+#include <time.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/types.h>
+#include <sys/stat.h>
 
-static inline double frand01(void) { return rand() / (double)RAND_MAX; }
+#ifndef O_LARGEFILE
+#define O_LARGEFILE 0
+#endif
+
+typedef enum { API_POSIX=0, API_MPIIO=1 } io_api_t;
+typedef enum { CMODE_NONE=0, CMODE_INDEP=1, CMODE_COLL=2 } col_mode_t;
 
 typedef struct {
-  char path[4096];
-  long long total_bytes;
-  long long xfer;
-  int shared_layout; // unused (always shared), kept for compatibility
-  double p_write;
-  double p_rand;
-  double p_seq_read, p_seq_write;
-  double p_consec_read, p_consec_write;
-  double p_file_ua, p_mem_ua;
-  double rw_switch_prob;
-  long meta_open, meta_stat, meta_seek, meta_sync;
-  unsigned seed;
+    char   type[16];      // "data" or "meta"
+    char   path[1024];
+    uint64_t total_bytes;
+    uint64_t xfer;
+
+    double p_write;       // 0 for reads phase, 1 for writes phase
+    double p_rand;        // prob for random (rest after seq)
+    double p_seq_r;       // target sequential (read) fraction
+    double p_consec_r;    // target consecutive (read) fraction
+    double p_seq_w;       // target sequential (write) fraction
+    double p_consec_w;    // target consecutive (write) fraction
+    double p_ua_file;     // probability of file unaligned
+    double p_ua_mem;      // probability of mem unaligned
+
+    double rw_switch;     // not used (we keep 0)
+    int    meta_open;
+    int    meta_stat;
+    int    meta_seek;
+    int    meta_sync;
+
+    unsigned int seed;
+    char   flags[64];
+
+    double p_rand_fwd_r;
+    double p_rand_fwd_w;
+    double p_consec_internal;
+} phase_t;
+
+typedef struct {
+    io_api_t api;
+    col_mode_t collective;
+    char plan_path[1024];
 } cfg_t;
 
-static void usage(const char *p){
-  if (!p) p = "mpi_synthio";
-  fprintf(stderr,
-  "Usage: %s -o <file> -t <xfer> -B <bytes> [options]\n"
-  "  --layout shared         (default)\n"
-  "  --p-write <0..1>\n"
-  "  --p-rand  <0..1>\n"
-  "  --p-seq-read  <0..1>   --p-seq-write  <0..1>\n"
-  "  --p-consec-read<0..1>  --p-consec-write<0..1>  (<= corresponding seq)\n"
-  "  --p-unaligned-file <0..1>  --p-unaligned-mem <0..1>\n"
-  "  --rw-switch-prob <0..1>\n"
-  "  --meta-open N --meta-stat N --meta-seek N --meta-sync N\n"
-  "  --seed N\n",
-  p);
+static inline uint64_t min_u64(uint64_t a, uint64_t b) { return a<b?a:b; }
+static inline double clamp01(double x){ if(x<0) return 0; if(x>1) return 1; return x; }
+
+static int parse_args(int argc, char **argv, cfg_t *C){
+    memset(C, 0, sizeof(*C));
+    C->api = API_POSIX;
+    C->collective = CMODE_NONE;
+    for(int i=1;i<argc;i++){
+        if(!strcmp(argv[i],"--plan") && i+1<argc){ strncpy(C->plan_path, argv[++i], sizeof(C->plan_path)-1); }
+        else if(!strcmp(argv[i],"--io-api") && i+1<argc){
+            i++;
+            if(!strcmp(argv[i],"posix")) C->api=API_POSIX; else C->api=API_MPIIO;
+        }
+        else if(!strcmp(argv[i],"--meta-api") && i+1<argc){
+            i++; (void)argv[i]; /* currently unused routing */
+        }
+        else if(!strcmp(argv[i],"--collective") && i+1<argc){
+            i++;
+            if(!strcmp(argv[i],"none")) C->collective=CMODE_NONE;
+            else if(!strcmp(argv[i],"independent")) C->collective=CMODE_INDEP;
+            else C->collective=CMODE_COLL;
+        }
+    }
+    if(strlen(C->plan_path)==0){
+        fprintf(stderr,"missing --plan <path>\n");
+        return -1;
+    }
+    return 0;
 }
 
-/* Choose offset based on seq/consec/random and alignment knobs.
- * last_end is updated by the caller after the I/O is issued.
- */
-static MPI_Offset choose_offset_c(
-    int is_write, int is_seq, int is_consec,
-    long long last_end, long long max_off,
-    long long file_size, long long xfer,
-    double p_rand, double p_file_ua)
-{
-  (void)is_write; // same logic for R/W positioning here
-  long long off;
+static int read_plan(const char *path, phase_t **out, int *n_out){
+    FILE *fp = fopen(path, "r");
+    if(!fp){ perror("fopen plan"); return -1; }
+    char line[4096];
+    int cap=32, n=0;
+    phase_t *arr = (phase_t*)calloc(cap, sizeof(phase_t));
+    if(!arr){ fclose(fp); return -1; }
 
-  if (p_rand > 0.0 && frand01() < p_rand) {
-    off = (long long)(frand01() * (double)(max_off > 0 ? max_off : 0));
-  } else if (is_seq) {
-    if (is_consec) {
-      off = last_end;
-    } else {
-      // ensure strictly higher offset than previous end: skip at least one xfer to avoid "consecutive"
-      off = last_end + xfer + xfer;
-    }
-    if (max_off > 0) {
-      if (off > max_off) off = off % (max_off + 1);
-    } else {
-      off = 0;
-    }
-  } else {
-    off = (long long)(frand01() * (double)(max_off > 0 ? max_off : 0));
-  }
+    while(fgets(line, sizeof(line), fp)){
+        // skip header
+        if(!strncmp(line, "type,", 5)) continue;
+        // remove trailing newline
+        char *nl = strchr(line, '\n'); if(nl) *nl = '\0';
+        // tolerate empty lines
+        if(line[0]=='\0') continue;
 
-  // file alignment or slight unalignment (+1)
-  if (frand01() < p_file_ua) {
-    if (off + xfer + 1 <= file_size) off += 1;
-  } else {
-    // align to 4K
-    const long long A = 4096LL;
-    if (off > 0) off = (off / A) * A;
-    if (off + xfer > file_size) {
-      off = (file_size > xfer) ? (file_size - xfer) : 0;
-      if (off > 0) off = (off / A) * A;
+        // Tokenize by comma; allow empty tokens
+        char *tok[24]; int k=0;
+        char *p = line;
+        while(p && k<24){
+            tok[k++] = p;
+            char *c = strchr(p, ',');
+            if(c){ *c = '\0'; p = c+1; } else break;
+        }
+        if(k<2) continue;
+
+        phase_t ph; memset(&ph,0,sizeof(ph));
+        strncpy(ph.type, tok[0], sizeof(ph.type)-1);
+        strncpy(ph.path, tok[1], sizeof(ph.path)-1);
+
+        // Default sane values
+        ph.xfer=1; ph.total_bytes=0;
+        ph.p_write=0; ph.p_rand=0; ph.p_seq_r=0; ph.p_consec_r=0; ph.p_seq_w=0; ph.p_consec_w=0;
+        ph.p_ua_file=1; ph.p_ua_mem=0; ph.rw_switch=0; ph.meta_open=0; ph.meta_stat=0; ph.meta_seek=0; ph.meta_sync=0;
+        ph.seed=1; strncpy(ph.flags,"",sizeof(ph.flags)-1);
+        ph.p_rand_fwd_r=0.5; ph.p_rand_fwd_w=0.0; ph.p_consec_internal=0.0;
+
+        // Fill if present
+        if(k>2 && tok[2][0]) ph.total_bytes = strtoull(tok[2],NULL,10);
+        if(k>3 && tok[3][0]) ph.xfer        = strtoull(tok[3],NULL,10);
+        if(k>4 && tok[4][0]) ph.p_write     = atof(tok[4]);
+        if(k>5 && tok[5][0]) ph.p_rand      = atof(tok[5]);
+        if(k>6 && tok[6][0]) ph.p_seq_r     = atof(tok[6]);
+        if(k>7 && tok[7][0]) ph.p_consec_r  = atof(tok[7]);
+        if(k>8 && tok[8][0]) ph.p_seq_w     = atof(tok[8]);
+        if(k>9 && tok[9][0]) ph.p_consec_w  = atof(tok[9]);
+        if(k>10&& tok[10][0]) ph.p_ua_file  = atof(tok[10]);
+        if(k>11&& tok[11][0]) ph.p_ua_mem   = atof(tok[11]);
+        if(k>12&& tok[12][0]) ph.rw_switch  = atof(tok[12]);
+        if(k>13&& tok[13][0]) ph.meta_open  = atoi(tok[13]);
+        if(k>14&& tok[14][0]) ph.meta_stat  = atoi(tok[14]);
+        if(k>15&& tok[15][0]) ph.meta_seek  = atoi(tok[15]);
+        if(k>16&& tok[16][0]) ph.meta_sync  = atoi(tok[16]);
+        if(k>17&& tok[17][0]) ph.seed       = (unsigned int)strtoul(tok[17],NULL,10);
+        if(k>18&& tok[18][0]) strncpy(ph.flags, tok[18], sizeof(ph.flags)-1);
+        if(k>19&& tok[19][0]) ph.p_rand_fwd_r = atof(tok[19]);
+        if(k>20&& tok[20][0]) ph.p_rand_fwd_w = atof(tok[20]);
+        if(k>21&& tok[21][0]) ph.p_consec_internal = atof(tok[21]);
+
+        // grow
+        if(n==cap){ cap*=2; arr=(phase_t*)realloc(arr, cap*sizeof(phase_t)); if(!arr){fclose(fp);return -1;} }
+        arr[n++] = ph;
     }
-  }
-  if (off < 0) off = 0;
-  if (off + xfer > file_size && file_size >= xfer) off = file_size - xfer;
-  return (MPI_Offset)off;
+    fclose(fp);
+    *out = arr; *n_out = n;
+    return 0;
+}
+
+static inline uint64_t align_down_1m(uint64_t x){
+    const uint64_t ONE_M = 1ULL<<20;
+    return (x/ONE_M)*ONE_M;
+}
+
+static int run_posix_data(const phase_t *p){
+    int fd = open(p->path, (p->p_write>0.5)?(O_CREAT|O_WRONLY|O_LARGEFILE):(O_RDONLY|O_LARGEFILE), 0644);
+    if(fd<0){ perror("open"); return -1; }
+
+    // RNG
+    srand(p->seed);
+
+    // Pre-allocate buffer (xfer + 1) to allow mem misalignment
+    size_t buf_sz = (size_t)p->xfer + 1;
+    char *base = (char*)malloc(buf_sz);
+    if(!base){ perror("malloc"); close(fd); return -1; }
+    memset(base, 0xab, buf_sz);
+
+    uint64_t ops = (p->xfer>0) ? (p->total_bytes / p->xfer) : 0;
+    uint64_t prev_end = 0;             // last end offset
+    uint64_t rfwd = 0;                 // random-forward baseline
+    const uint64_t ONE_M = 1ULL<<20;
+
+    // probabilities (clamped)
+    double p_con = clamp01( (p->p_write>0.5)? p->p_consec_w : p->p_consec_r );
+    double p_seq = clamp01( (p->p_write>0.5)? p->p_seq_w    : p->p_seq_r );
+    if(p_seq < p_con) p_seq = p_con;   // consecutive subset of sequential
+    double p_rand = 1.0 - p_seq;
+    if(p_rand<0) p_rand=0;
+
+    // We implement: first p_con consecutive; else if (seq>con) do seq-only; else random
+    // seq-only uses stride≥1 * xfer so it is sequential but NOT consecutive.
+    // random-forward increments rfwd by random strides.
+
+    for(uint64_t i=0;i<ops;i++){
+        int do_consec = 0, do_seqonly = 0;
+        double r = (double)rand() / (double)RAND_MAX;
+
+        if(r < p_con){
+            do_consec = 1;
+        } else {
+            double r2 = (double)rand() / (double)RAND_MAX;
+            double p_seq_only = (p_seq>p_con)? (p_seq - p_con) / (1.0 - p_con) : 0.0;
+            if(r2 < p_seq_only) do_seqonly = 1;
+        }
+
+        uint64_t off = 0;
+
+        if(do_consec){
+            off = prev_end; // adjacent
+        } else if(do_seqonly){
+            // stride≥1 * xfer so it's sequential but not adjacent
+            uint64_t stride_blocks = 1 + (rand()%8); // 1..8
+            off = prev_end + stride_blocks * p->xfer;
+        } else {
+            // random forward
+            uint64_t step_blocks = 1 + (rand()%8);
+            rfwd += step_blocks * p->xfer;
+            off = rfwd;
+        }
+
+        // File alignment control:
+        // If xfer is multiple of 1MiB, we may generate aligned or unaligned based on p_ua_file.
+        int want_unaligned = ((double)rand()/RAND_MAX) < p->p_ua_file ? 1 : 0;
+        if(!want_unaligned && (p->xfer % ONE_M == 0)){
+            off = align_down_1m(off);
+        }
+
+        // Mem alignment:
+        char *buf = base;
+        int mem_unaligned = ((double)rand()/RAND_MAX) < p->p_ua_mem ? 1 : 0;
+        if(mem_unaligned) buf = base + 1;
+
+        ssize_t rc;
+        if(p->p_write > 0.5){
+            // write
+            rc = pwrite(fd, buf, (size_t)p->xfer, (off_t)off);
+        } else {
+            // read
+            rc = pread(fd, buf, (size_t)p->xfer, (off_t)off);
+        }
+        if(rc < 0){
+            perror("pread/pwrite");
+            free(base); close(fd);
+            return -1;
+        }
+        prev_end = off + p->xfer;
+    }
+
+    free(base);
+    close(fd);
+    return 0;
+}
+
+static int run_posix_meta(const phase_t *p){
+    // Issue meta ops against path
+    for(int i=0;i<p->meta_open;i++){
+        int fd = open(p->path, O_RDONLY|O_LARGEFILE);
+        if(fd>=0) close(fd);
+    }
+    struct stat sb;
+    for(int i=0;i<p->meta_stat;i++){ (void)stat(p->path, &sb); }
+    // Seek ops simulated via opening and lseek on O_RDONLY
+    int fd = open(p->path, O_RDONLY|O_LARGEFILE);
+    if(fd>=0){
+        for(int i=0;i<p->meta_seek;i++){
+            off_t where = (off_t)((i*4096ULL) % (1ULL<<30));
+            (void)lseek(fd, where, SEEK_SET);
+        }
+        // sync family
+        for(int i=0;i<p->meta_sync;i++){ (void)fsync(fd); }
+        close(fd);
+    }
+    return 0;
+}
+
+/* MPI-IO runner (not used in your current POSIX-only runs, but kept tidy) */
+static int run_mpiio_data(const phase_t *p, col_mode_t cm){
+    (void)p; (void)cm; /* silence unused warnings, feature kept for future */
+    return 0;
 }
 
 int main(int argc, char **argv){
-  MPI_Init(&argc, &argv);
-  int rank, nproc;
-  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-  MPI_Comm_size(MPI_COMM_WORLD, &nproc);
-
-  cfg_t C;
-  memset(&C, 0, sizeof(C));
-  C.shared_layout = 1;
-  C.xfer = 64*1024;
-  C.total_bytes = 0;
-  C.p_write = 0.0;
-  C.p_rand = 0.0;
-  C.p_seq_read = C.p_seq_write = 1.0;
-  C.p_consec_read = C.p_consec_write = 1.0;
-  C.p_file_ua = 0.0; C.p_mem_ua = 0.0;
-  C.rw_switch_prob = 0.0;
-  C.seed = 1;
-
-  static struct option opts[] = {
-    {"layout", required_argument, 0, 1},
-    {"o", required_argument, 0, 'o'},
-    {"t", required_argument, 0, 't'},
-    {"B", required_argument, 0, 'B'},
-    {"p-write", required_argument, 0, 2},
-    {"p-rand", required_argument, 0, 3},
-    {"p-seq-read", required_argument, 0, 4},
-    {"p-seq-write", required_argument, 0, 5},
-    {"p-consec-read", required_argument, 0, 6},
-    {"p-consec-write", required_argument, 0, 7},
-    {"p-unaligned-file", required_argument, 0, 8},
-    {"p-unaligned-mem", required_argument, 0, 9},
-    {"rw-switch-prob", required_argument, 0, 10},
-    {"meta-open", required_argument, 0, 11},
-    {"meta-stat", required_argument, 0, 12},
-    {"meta-seek", required_argument, 0, 13},
-    {"meta-sync", required_argument, 0, 14},
-    {"seed", required_argument, 0, 15},
-    {0,0,0,0}
-  };
-
-  int c, idx = 0;
-  while ((c = getopt_long(argc, argv, "o:t:B:", opts, &idx)) != -1){
-    switch (c){
-      case 'o': strncpy(C.path, optarg, sizeof(C.path)-1); break;
-      case 't': C.xfer = atoll(optarg); break;
-      case 'B': C.total_bytes = atoll(optarg); break;
-      case 1:   /* --layout */ if (!strcmp(optarg,"shared")) C.shared_layout=1; else C.shared_layout=1; break;
-      case 2:   C.p_write = atof(optarg); break;
-      case 3:   C.p_rand  = atof(optarg); break;
-      case 4:   C.p_seq_read = atof(optarg); break;
-      case 5:   C.p_seq_write= atof(optarg); break;
-      case 6:   C.p_consec_read = atof(optarg); break;
-      case 7:   C.p_consec_write= atof(optarg); break;
-      case 8:   C.p_file_ua = atof(optarg); break;
-      case 9:   C.p_mem_ua  = atof(optarg); break;
-      case 10:  C.rw_switch_prob = atof(optarg); break;
-      case 11:  C.meta_open = atol(optarg); break;
-      case 12:  C.meta_stat = atol(optarg); break;
-      case 13:  C.meta_seek = atol(optarg); break;
-      case 14:  C.meta_sync = atol(optarg); break;
-      case 15:  C.seed = (unsigned)atoi(optarg); break;
-      default: if (rank==0) usage(argv[0]); MPI_Abort(MPI_COMM_WORLD, 1);
+    MPI_Init(&argc,&argv);
+    int rank=0, nprocs=1; MPI_Comm_rank(MPI_COMM_WORLD,&rank); MPI_Comm_size(MPI_COMM_WORLD,&nprocs);
+    cfg_t C;
+    if(parse_args(argc,argv,&C)!=0){
+        if(rank==0) fprintf(stderr,"usage: %s --plan <path> [--io-api posix|mpiio] [--collective none|independent|collective]\n", argv[0]);
+        MPI_Abort(MPI_COMM_WORLD, -1);
     }
-  }
 
-  if (C.path[0] == '\0' || C.xfer <= 0 || C.total_bytes <= 0){
-    if (rank==0) usage(argv[0]);
-    MPI_Abort(MPI_COMM_WORLD, 1);
-  }
-
-  if (C.p_write < 0) { C.p_write = 0; }
-  if (C.p_write > 1) { C.p_write = 1; }
-  if (C.p_rand  < 0) { C.p_rand  = 0; }
-  if (C.p_rand  > 1) { C.p_rand  = 1; }
-  if (C.p_file_ua < 0) { C.p_file_ua = 0; }
-  if (C.p_file_ua > 1) { C.p_file_ua = 1; }
-  if (C.p_mem_ua  < 0) { C.p_mem_ua  = 0; }
-  if (C.p_mem_ua  > 1) { C.p_mem_ua  = 1; }
-  if (C.rw_switch_prob < 0) { C.rw_switch_prob = 0; }
-  if (C.rw_switch_prob > 1) { C.rw_switch_prob = 1; }
-
-  if (C.p_consec_read > C.p_seq_read)   C.p_consec_read  = C.p_seq_read;
-  if (C.p_consec_write > C.p_seq_write) C.p_consec_write = C.p_seq_write;
-
-  srand(C.seed + rank);
-
-  // bytes -> ops
-  long long total_ops = C.total_bytes / C.xfer;
-  if (total_ops <= 0) total_ops = 1;
-
-  long long write_ops = (long long) llround((double)total_ops * C.p_write);
-  if (write_ops < 0) write_ops = 0;
-  if (write_ops > total_ops) write_ops = total_ops;
-
-  // Metadata ops per rank (even spread)
-  long o_open = C.meta_open / nproc + ((rank < (C.meta_open % nproc)) ? 1:0);
-  long o_stat = C.meta_stat / nproc + ((rank < (C.meta_stat % nproc)) ? 1:0);
-  long o_seek = C.meta_seek / nproc + ((rank < (C.meta_seek % nproc)) ? 1:0);
-  long o_sync = C.meta_sync / nproc + ((rank < (C.meta_sync % nproc)) ? 1:0);
-
-  // open the target file once to perform metadata on it
-  MPI_File fh;
-  int mrc = MPI_File_open(MPI_COMM_WORLD, C.path, MPI_MODE_RDWR, MPI_INFO_NULL, &fh);
-  if (mrc != MPI_SUCCESS){
-    if (rank==0) fprintf(stderr, "MPI_File_open failed for %s\n", C.path);
-    MPI_Abort(MPI_COMM_WORLD, 2);
-  }
-
-  // stat (get size)
-  for (long i=0;i<o_stat;i++){
-    MPI_Offset sz=0;
-    MPI_File_get_size(fh, &sz);
-    (void)sz;
-  }
-  // seeks
-  for (long i=0;i<o_seek;i++){
-    MPI_Offset off = (MPI_Offset)((frand01()) * (double)((C.total_bytes > C.xfer) ? (C.total_bytes - C.xfer) : 0));
-    MPI_File_seek(fh, off, MPI_SEEK_SET);
-  }
-  // syncs
-  for (long i=0;i<o_sync;i++){
-    MPI_File_sync(fh);
-  }
-  MPI_File_close(&fh);
-
-  // perform open/close metadata ops (on same file) without creating new files
-  for (long i=0;i<o_open;i++){
-    MPI_File tmp;
-    int rc = MPI_File_open(MPI_COMM_WORLD, C.path, MPI_MODE_RDWR, MPI_INFO_NULL, &tmp);
-    if (rc==MPI_SUCCESS) MPI_File_close(&tmp);
-  }
-
-  // reopen for data IO
-  int rc = MPI_File_open(MPI_COMM_WORLD, C.path, MPI_MODE_RDWR, MPI_INFO_NULL, &fh);
-  if (rc != MPI_SUCCESS){
-    if (rank==0) fprintf(stderr, "MPI_File_open failed for %s\n", C.path);
-    MPI_Abort(MPI_COMM_WORLD, 2);
-  }
-
-  // buffer (aligned)
-  void *buf_base = NULL;
-  if (posix_memalign(&buf_base, 4096, (size_t)C.xfer) != 0){
-    if (rank==0) fprintf(stderr, "posix_memalign failed\n");
-    MPI_Abort(MPI_COMM_WORLD, 3);
-  }
-  unsigned char *buf = (unsigned char*)buf_base;
-
-  const long long file_size = C.total_bytes; // logical region
-  const long long max_off   = (file_size > C.xfer) ? (file_size - C.xfer) : 0;
-
-  // last end offsets per type (for seq/consec semantics)
-  long long r_last_end = 0;
-  long long w_last_end = 0;
-
-  // start mode
-  int cur_is_write = (frand01() < C.p_write);
-
-  for (long long k=0; k<total_ops; k++){
-    if (frand01() < C.rw_switch_prob) cur_is_write = !cur_is_write;
-
-    int do_seq = cur_is_write ? (frand01() < C.p_seq_write) : (frand01() < C.p_seq_read);
-    int do_con = cur_is_write ? (frand01() < C.p_consec_write) : (frand01() < C.p_consec_read);
-    if (do_con && !do_seq) do_seq = 1; // consec implies sequential
-
-    // memory alignment
-    unsigned char *ptr = buf;
-    if (frand01() < C.p_mem_ua) ptr = buf + 1;
-
-    long long last_end = cur_is_write ? w_last_end : r_last_end;
-    MPI_Offset off = choose_offset_c(
-      cur_is_write, do_seq, do_con, last_end,
-      max_off, file_size, C.xfer, C.p_rand, C.p_file_ua
-    );
-
-    MPI_Status st;
-    int err;
-    if (cur_is_write){
-      err = MPI_File_write_at(fh, off, ptr, (int)C.xfer, MPI_BYTE, &st);
-      w_last_end = (long long)off + C.xfer;
-    } else {
-      err = MPI_File_read_at(fh, off, ptr, (int)C.xfer, MPI_BYTE, &st);
-      r_last_end = (long long)off + C.xfer;
+    if(rank==0) fprintf(stderr,"Loading plan: %s\n", C.plan_path);
+    phase_t *P = NULL; int nP=0;
+    if(read_plan(C.plan_path, &P, &nP)!=0){
+        if(rank==0) fprintf(stderr,"Failed reading plan\n");
+        MPI_Abort(MPI_COMM_WORLD, -1);
     }
-    if (err != MPI_SUCCESS){
-      if (rank==0) fprintf(stderr, "I/O failed at op=%lld\n", k);
-      MPI_Abort(MPI_COMM_WORLD, 3);
+    if(nP==0){
+        if(rank==0) fprintf(stderr,"Empty plan.\n");
+        MPI_Abort(MPI_COMM_WORLD, -1);
     }
-  }
 
-  MPI_File_close(&fh);
-  free(buf_base);
-  MPI_Barrier(MPI_COMM_WORLD);
-  MPI_Finalize();
-  return 0;
+    for(int i=0;i<nP;i++){
+        if(rank==0) fprintf(stderr,"[phase %d] %s %s\n", i, P[i].type, P[i].path);
+        if(!strcmp(P[i].type,"data")){
+            if(C.api==API_POSIX) { if(run_posix_data(&P[i])!=0){ MPI_Abort(MPI_COMM_WORLD,-1); } }
+            else                  { if(run_mpiio_data(&P[i], C.collective)!=0){ MPI_Abort(MPI_COMM_WORLD,-1); } }
+        } else if(!strcmp(P[i].type,"meta")){
+            if(run_posix_meta(&P[i])!=0){ MPI_Abort(MPI_COMM_WORLD,-1); }
+        } else {
+            if(rank==0) fprintf(stderr,"[phase %d] Unknown type: %s (skipping)\n", i, P[i].type);
+        }
+        MPI_Barrier(MPI_COMM_WORLD);
+    }
+
+    free(P);
+    MPI_Finalize();
+    return 0;
 }
