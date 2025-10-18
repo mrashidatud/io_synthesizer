@@ -1,432 +1,782 @@
 #!/usr/bin/env python3
-# =============================================================================
-# Synthesizer / Launcher (features2synth_opsaware.py)
-#
-# What this does
-#  - Reads a features.json row (percentages by BYTES and by OPERATIONS).
-#  - Plans IOR subjobs to realize the BYTES mix (shared vs FPP, RO/RW/WO bytes,
-#    size bins, seq/random by bytes).
-#  - Estimates IOR operation counts each subjob will perform given its -t.
-#  - Solves the minimal harness ops so global OP-LEVEL targets are feasible with
-#    per-op probabilities ≤ 1:
-#       * pct_file_not_aligned, pct_mem_not_aligned
-#       * pct_rw_switches
-#       * pct_seq_reads / pct_seq_writes  (Darshan POSIX_SEQ_*) 
-#       * pct_consec_reads / pct_consec_writes (Darshan POSIX_CONSEC_*)
-#  - Distributes those harness ops across subjobs proportional to IOR ops so the
-#    harness mirrors IOR files, layouts, -t, and patterns.
-#  - Emits scripts in this order:
-#       1) **PREP**: single MPMD mpiexec (NO Darshan) to create/init all files
-#          (IO500-style) and build the mdtest tree.
-#       2) **RUN**:  IOR phases (all ranks; Darshan on) →
-#                    mdtest (all ranks; Darshan on) →
-#                    harness phases (all ranks; Darshan on).
-#
-# Defaults (override via CLI if you want)
-#  - IOR:      /mnt/hasanfs/bin/ior
-#  - mdtest:   /mnt/hasanfs/bin/mdtest
-#  - harness:  /mnt/hasanfs/bin/mpi_synthio
-#  - mpiexec prefix (Darshan on): 
-#       mpiexec -hostfile ~/hfile env LD_PRELOAD=/mnt/hasanfs/darshan-3.4.7/darshan-runtime/install/lib/libdarshan.so
-# =============================================================================
-import argparse, json, os, math, sys
-from typing import Dict, List
+"""
+Synthesizer (single-row -> scripts)
 
-# ---------- helpers ----------
-def clamp01(x: float) -> float:
-    return max(0.0, min(1.0, float(x)))
+Emits:
+  - run_prep.sh          : creates target files ONLY (no Darshan)
+  - run_from_features.sh : runs IOR (read-only), mdtest (metadata),
+                           and mpi_synthio harness (read-corrector + write-only),
+                           with Darshan preloaded (MPICH: -genv LD_PRELOAD <lib>).
 
-def pct(key: str, d: dict, default: float = 0.0) -> float:
-    v = d.get(key, default)
-    try:
-        v = float(v)
-    except Exception:
-        v = default
-    if v > 1.0: v = v/100.0
-    return clamp01(v)
+What this script enforces
+-------------------------
+• Read-size bins (op-based):
+    small  (0–100K)   → 64 KiB
+    medium (100K–10M) → 1 MiB  (as requested)
+    large  (10M–1G+)  → 128 MiB
+• Layout: honors pct_shared_files / pct_unique_files (“FPP”) and runs I/O on those files.
+• Global shares: pct_reads / pct_writes; seq/consec; alignment (harness implements misalignment).
+• Feasibility: reduces IOR read share if needed so the harness can realize seq/con & alignment.
+• File-type buckets (***NEW***): matches both **file counts** and **bytes** for
+  read-only (RO), read-write (RW), write-only (WO) across the file set.
+  - RO files are read by IOR + harness-READ.
+  - RW files are read (harness-READ) **and** written (harness-RW) to carry byte share.
+  - WO files are only written (harness-WO).
+• Meta as fraction of **TOTAL** ops: open/stat/seek/sync derived from total_ops and rounded.
+• Caps (***aggregate-aware***): --cap-per-file-gib and/or --cap-total-gib set **global**
+  byte regions per (layout,bin). We then derive **per-rank** budgets for FPP and **global**
+  budgets for shared so that SUM across all files/ranks ≤ cap.
+• Robust notes: shows targets, planned ops, file layout (counts & bytes target vs planned),
+  per-rank/global budgets for IOR (-b) and harness (-B), and meta as fraction of total ops.
+"""
 
-def norm(parts: Dict[str, float]) -> Dict[str, float]:
-    total = sum(max(0.0, v) for v in parts.values())
-    if total <= 0:
-        n = len(parts)
-        return {k: 1.0/n for k in parts} if n else {}
-    return {k: max(0.0, v)/total for k, v in parts.items()}
+import json
+import os
+from pathlib import Path
+import argparse
+import math
+from collections import defaultdict
 
-def human_bytes(n: float) -> str:
-    units = ['B','KiB','MiB','GiB','TiB']
-    i = 0; x = float(n)
-    while x >= 1024.0 and i < len(units)-1:
-        x /= 1024.0; i += 1
-    return f"{x:.2f} {units[i]}"
+# ---- paths & constants --------------------------------------------------------
+IOR      = "/mnt/hasanfs/bin/ior"
+MDTEST   = "/mnt/hasanfs/bin/mdtest"
+HARNESS  = "/mnt/hasanfs/bin/mpi_synthio"
+DARSHAN  = "/mnt/hasanfs/darshan-3.4.7/darshan-runtime/install/lib/libdarshan.so"
 
-def round_bytes(n: float, gran: int = 4096) -> int:
-    if n <= 0: return 0
-    return int(max(gran, int(n // gran * gran)))
+OUT_ROOT = "/mnt/hasanfs/synth_from_features"
+PREP_SH  = "run_prep.sh"
+RUN_SH   = "run_from_features.sh"
+NOTES_TXT= "run_from_features.sh.notes.txt"
 
-def parse_size_token(tok: str) -> int:
-    t = tok.strip().lower()
-    if t.endswith('k'): return int(float(t[:-1]) * 1024)
-    if t.endswith('m'): return int(float(t[:-1]) * 1024*1024)
-    if t.endswith('g'): return int(float(t[:-1]) * 1024*1024*1024)
-    if t.endswith('b'): return int(float(t[:-1]))
-    return int(float(t))
+KiB = 1024
+MiB = 1024 * KiB
+GiB = 1024 * MiB
 
-def build_mpiexec_prefix(with_darshan: bool, extra: str=""):
-    base = "mpiexec -hostfile ~/hfile"
+# Read bin representatives
+XS_SMALL  = 64 * KiB      # 0–100K bin
+XS_MEDIUM = 1 * MiB       # 100K–10M bin
+XS_LARGE  = 128 * MiB     # 10M–1G+ bin
+TSIZE = {'small': XS_SMALL, 'medium': XS_MEDIUM, 'large': XS_LARGE}
+
+OPS_PER_RANK_BASE = 2000  # global op budget basis
+
+def mpiexec(nranks, cmd, with_darshan=False, hostfile="~/hfile"):
+    env = f"-hostfile {hostfile} "
     if with_darshan:
-        # MPICH/Hydra: propagate LD_PRELOAD to all ranks
-        return f'{base} -genv LD_PRELOAD /mnt/hasanfs/darshan-3.4.7/darshan-runtime/install/lib/libdarshan.so {extra}'.strip()
+        env += f"-genv LD_PRELOAD {DARSHAN} "
+    return f"mpiexec {env}-n {nranks} {cmd}"
+
+def bytes2gib(b): return f"{b/float(GiB):.2f} GiB"
+def clamp01(x):   return max(0.0, min(1.0, float(x)))
+
+def align_down(v, q): 
+    if q <= 0: return 0
+    return (v // q) * q
+
+def align_up(v, q):
+    if q <= 0: return 0
+    return ((v + q - 1) // q) * q
+
+# ---- helpers -----------------------------------------------------------------
+def _solve_harness_p(target_frac, ior_n, h_n):
+    if h_n <= 0:
+        return (0.0, ior_n == 0 or abs(target_frac-1.0) < 1e-12)
+    p = (target_frac * (ior_n + h_n) - ior_n) / float(h_n)
+    return (p, 0.0 <= p <= 1.0)
+
+def _scale_down_ior_for_seq_con(ior_reads, target_seq, target_con, total_reads):
+    curr = int(ior_reads)
+    for _ in range(30):
+        h_reads = max(0, total_reads - curr)
+        p_seq, ok_s = _solve_harness_p(target_seq, curr, h_reads)
+        p_con, ok_c = _solve_harness_p(target_con, curr, h_reads)
+        if ok_s and ok_c:
+            return curr
+        curr = int(curr * 0.8)
+        if curr <= 0:
+            return 0
+    return max(0, curr)
+
+def _ensure_alignment_possible(io_ops_total, ior_reads, harness_writes, target_file_ua, target_mem_ua):
+    curr = int(ior_reads)
+    for _ in range(30):
+        h_reads = max(0, io_ops_total - (curr + harness_writes))
+        harness_io = h_reads + harness_writes
+        if harness_io <= 0:
+            if target_file_ua == 0 and target_mem_ua == 0:
+                return curr
+            curr = 0
+            continue
+        need_file = (target_file_ua * io_ops_total) / float(harness_io)
+        need_mem  = (target_mem_ua  * io_ops_total) / float(harness_io)
+        if need_file <= 1.0 + 1e-12 and need_mem <= 1.0 + 1e-12:
+            return curr
+        curr = int(curr * 0.8)
+        if curr <= 0:
+            return 0
+    return max(0, curr)
+
+# integer splitter that preserves sum and ensures any positive fraction→≥1 file
+def split_counts(total, fractions):
+    raw = [f * total for f in fractions]
+    ints = [int(round(x)) for x in raw]
+    # guarantee non-zero where fraction>0
+    for i, f in enumerate(fractions):
+        if f > 0 and ints[i] == 0:
+            ints[i] = 1
+    d = total - sum(ints)
+    # fix drift
+    while d != 0:
+        # add/remove from the largest bin by raw fractional remainder
+        rema = [r - int(r) for r in raw]
+        idx = max(range(len(rema)), key=lambda i: rema[i]) if d > 0 else min(range(len(rema)), key=lambda i: rema[i])
+        if d > 0:
+            ints[idx] += 1; d -= 1
+        else:
+            if ints[idx] > 0:
+                ints[idx] -= 1; d += 1
+            else:
+                # find someone to borrow from
+                for j in range(len(ints)):
+                    if ints[j] > 0:
+                        ints[j] -= 1; d += 1; break
+    return ints
+
+# ---- main planner -------------------------------------------------------------
+def plan_from_features(feat, total_ranks, cap_per_file_gib=None, cap_total_gib=None):
+    # A) Inputs
+    p_reads  = clamp01(feat.get("pct_reads", 0.5))
+    p_writes = clamp01(feat.get("pct_writes", 0.5))
+    if p_reads + p_writes == 0:
+        p_reads = 1.0; p_writes = 0.0
     else:
-        return f"{base} {extra}".strip()
+        s = p_reads + p_writes
+        p_reads, p_writes = p_reads/s, p_writes/s
 
-def build_ior_cmd(ior, mode, layout, pattern, tsize, per_rank_b, out_path, extra=""):
-    """
-    Emit an IOR command for MPIIO with the correct collective/independent choice:
-      - shared + sequential -> collective (-c)
-      - random              -> independent (no -c)
-      - FPP (-F)            -> independent
-    Always add -k (keep files) so IOR doesn't delete them afterward.
-    """
-    flags = ["-a", "MPIIO", "-k"]   # <-- keep files
+    p_io = clamp01(feat.get("pct_io_access", 1.0))
 
-    # access types
-    if mode in ("w", "rw"):
-        flags.append("-w")
-    if mode in ("r", "rw"):
-        flags.append("-r")
+    # meta as fractions of TOTAL ops
+    _mo = clamp01(feat.get("pct_meta_open_access", 0.0))
+    _ms = clamp01(feat.get("pct_meta_stat_access", 0.0))
+    _mk = clamp01(feat.get("pct_meta_seek_access", 0.0))
+    _my = clamp01(feat.get("pct_meta_sync_access", 0.0))
 
-    # layout
-    if layout == "fpp":
-        flags.append("-F")           # FPP => independent
+    # alignment targets (global, fraction of IO ops)
+    p_file_ua = clamp01(feat.get("pct_file_not_aligned", 0.0))
+    p_mem_ua  = clamp01(feat.get("pct_mem_not_aligned", 0.0))
+
+    # sequential / consecutive targets
+    p_seq_r = clamp01(feat.get("pct_seq_reads", 0.0))
+    p_seq_w = clamp01(feat.get("pct_seq_writes", 0.0))
+    p_con_r = clamp01(feat.get("pct_consec_reads", 0.0))
+    p_con_w = clamp01(feat.get("pct_consec_writes", 0.0))
+
+    # RW-switches probability (harness)
+    rw_prob = clamp01(feat.get("pct_rw_switches", 0.0))
+
+    # read-size bin splits (3-bin)
+    r0 = clamp01(feat.get("pct_read_0_100K", 1.0))
+    r1 = clamp01(feat.get("pct_read_100K_10M", 0.0))
+    r2 = clamp01(feat.get("pct_read_10M_1G_PLUS", 0.0))
+    rs = r0 + r1 + r2
+    if rs == 0: r0, r1, r2 = 1.0, 0.0, 0.0
+    else: r0, r1, r2 = r0/rs, r1/rs, r2/rs
+
+    # write-size bin splits (used for write-only & RW writes)
+    w0 = clamp01(feat.get("pct_write_0_100K", 1.0))
+    w1 = clamp01(feat.get("pct_write_100K_10M", 0.0))
+    w2 = clamp01(feat.get("pct_write_10M_1G_PLUS", 0.0))
+    ws = w0 + w1 + w2
+    if ws == 0: w0, w1, w2 = 1.0, 0.0, 0.0
+    else: w0, w1, w2 = w0/ws, w1/ws, w2/ws
+
+    # layout fractions
+    p_shared = clamp01(feat.get("pct_shared_files", 1.0))
+    p_fpp    = clamp01(feat.get("pct_unique_files", 0.0))
+    if p_shared + p_fpp == 0:
+        p_shared, p_fpp = 1.0, 0.0
     else:
-        # shared file: collective only if NOT random
-        if pattern != "random":
-            flags.append("-c")
+        s = p_shared + p_fpp
+        p_shared, p_fpp = p_shared/s, p_fpp/s
 
-    # pattern
-    if pattern == "random":
-        flags.append("-z")           # random offsets => independent (no -c)
+    # file-type fractions (counts & bytes)
+    f_ro = clamp01(feat.get("pct_read_only_files", 1.0))
+    f_rw = clamp01(feat.get("pct_read_write_files", 0.0))
+    f_wo = clamp01(feat.get("pct_write_only_files", 0.0))
+    fs = f_ro + f_rw + f_wo
+    if fs == 0: f_ro, f_rw, f_wo = 1.0, 0.0, 0.0
+    else: f_ro, f_rw, f_wo = f_ro/fs, f_rw/fs, f_wo/fs
 
-    # sizes & target
-    flags += ["-b", str(per_rank_b), "-t", tsize, "-o", out_path]
+    b_ro = clamp01(feat.get("pct_bytes_read_only_files", 1.0))
+    b_rw = clamp01(feat.get("pct_bytes_read_write_files", 0.0))
+    b_wo = clamp01(feat.get("pct_bytes_write_only_files", 0.0))
+    bs = b_ro + b_rw + b_wo
+    if bs == 0: b_ro, b_rw, b_wo = 1.0, 0.0, 0.0
+    else: b_ro, b_rw, b_wo = b_ro/bs, b_rw/bs, b_wo/bs
 
-    if extra:
-        flags += extra.split()
+    # B) Global budgets
+    total_ops_global = OPS_PER_RANK_BASE * total_ranks
+    io_ops_target   = int(round(total_ops_global * p_io))
+    meta_ops_target = total_ops_global - io_ops_target
+    read_ops_target  = int(round(io_ops_target * p_reads))
+    write_ops_target = io_ops_target - read_ops_target
 
-    # no '-H'
-    return f"{ior} {' '.join(flags)}"
+    # meta absolute counts from TOTAL ops (honor your definition)
+    mo_i = int(round(total_ops_global * _mo))
+    ms_i = int(round(total_ops_global * _ms))
+    mk_i = int(round(total_ops_global * _mk))
+    my_i = int(round(total_ops_global * _my))
+    # nudge to sum exactly to meta_ops_target
+    delta = meta_ops_target - (mo_i + ms_i + mk_i + my_i)
+    if delta != 0:
+        my_i = max(0, my_i + delta)
 
-def build_mdtest_cmd(mdtest, files_per_proc, out_dir, flags="-F -C -T -r"):
-    return f"{mdtest} {flags} -n {files_per_proc} -d {out_dir}"
+    # C) Choose IOR read share; ensure seq/con & alignment are feasible
+    ior_reads_init = int(round(read_ops_target * 0.60))
+    ior_reads = _scale_down_ior_for_seq_con(ior_reads_init, p_seq_r, p_con_r, total_reads=read_ops_target)
+    ior_reads = _ensure_alignment_possible(
+        io_ops_total=io_ops_target,
+        ior_reads=ior_reads,
+        harness_writes=write_ops_target,
+        target_file_ua=p_file_ua,
+        target_mem_ua=p_mem_ua
+    )
+    h_reads = max(0, read_ops_target - ior_reads)
 
-def build_harness_cmd(harness, out_path, layout, tsize, per_rank_b, p_write, p_rand,
-                      p_file_ua, p_mem_ua, p_rws, p_seq_r, p_seq_w, p_con_r, p_con_w, extra_flags=""):
-    lay = f"--layout {layout}"
-    base = f"{harness} -o {out_path} {lay} -t {tsize} -B {per_rank_b} --p-write {p_write:.6f} --p-rand {p_rand:.6f}"
-    base += f" --p-unaligned-file {p_file_ua:.6f} --p-unaligned-mem {p_mem_ua:.6f} --rw-switch-prob {p_rws:.6f}"
-    base += f" --p-seq-read {p_seq_r:.6f} --p-seq-write {p_seq_w:.6f} --p-consec-read {p_con_r:.6f} --p-consec-write {p_con_w:.6f}"
-    if extra_flags.strip():
-        base += " " + extra_flags.strip()
-    return base
+    # harness probabilities for reads (IOR reads are seq+con)
+    p_seq_read_h, _ = _solve_harness_p(p_seq_r, ior_reads, h_reads)
+    p_con_read_h, _ = _solve_harness_p(p_con_r, ior_reads, h_reads)
+    p_con_read_h = min(p_con_read_h, p_seq_read_h)
 
-def plan_ior_subjobs(features, total_bytes, canon, sharing, modesB, read_bins, write_bins, seq_reads, seq_writes, out_root):
-    def pick_tsize(bin_name: str) -> str:
-        b = bin_name.lower()
-        if "small" in b: return canon["small"]
-        if "medium" in b: return canon["medium"]
-        if "large" in b: return canon["large"]
-        return canon["medium"]
+    # writes (for RW+WO phases)
+    p_seq_write_h = p_seq_w
+    p_con_write_h = min(p_con_w, p_seq_write_h)
 
-    shared_bytes = total_bytes * sharing["shared"]
-    fpp_bytes    = total_bytes * sharing["fpp"]
+    # Alignment inside harness
+    harness_io_ops = h_reads + write_ops_target
+    if harness_io_ops <= 0:
+        p_ua_file_h = 0.0
+        p_ua_mem_h  = 0.0
+    else:
+        p_ua_file_h = clamp01((p_file_ua * io_ops_target) / float(harness_io_ops))
+        p_ua_mem_h  = clamp01((p_mem_ua  * io_ops_target) / float(harness_io_ops))
 
-    subs = []
-    def add_job(bytes_bud, mode, layout, pattern, bin_name):
-        if bytes_bud <= 0: return
-        tsize = pick_tsize(bin_name)
-        fname = f"{out_root}/ior_{layout}_{pattern}_{mode}_{bin_name}.dat"
-        subs.append({"bytes": bytes_bud, "mode": mode, "layout": layout, "pattern": pattern,
-                     "bin": bin_name, "tsize": tsize, "out": fname})
+    # D) Split IOR reads across 3 bins (proportional to r0,r1,r2), all seq+con
+    ior_r0 = int(round(ior_reads * r0))
+    ior_r1 = int(round(ior_reads * r1))
+    ior_r2 = ior_reads - ior_r0 - ior_r1
 
-    def expand(layout, layout_bytes):
-        if layout_bytes <= 0: return
-        roB = layout_bytes * modesB.get("ro", 0.0)
-        for patt, pP in seq_reads.items():
-            for bin_name, pBin in read_bins.items():
-                add_job(roB * pP * pBin, "r", layout, patt, bin_name)
-        woB = layout_bytes * modesB.get("wo", 0.0)
-        for patt, pP in seq_writes.items():
-            for bin_name, pBin in write_bins.items():
-                add_job(woB * pP * pBin, "w", layout, patt, bin_name)
-        rwB = layout_bytes * modesB.get("rw", 0.0)
-        rB = rwB * 0.5; wB = rwB * 0.5
-        for patt, pP in seq_reads.items():
-            for bin_name, pBin in read_bins.items():
-                add_job(rB * pP * pBin, "r", layout, patt, bin_name)
-        for patt, pP in seq_writes.items():
-            for bin_name, pBin in write_bins.items():
-                add_job(wB * pP * pBin, "w", layout, patt, bin_name)
+    # Remaining reads to harness across bins
+    h_r0 = max(0, int(round(read_ops_target * r0)) - ior_r0)
+    h_r1 = max(0, int(round(read_ops_target * r1)) - ior_r1)
+    h_r2 = max(0, int(round(read_ops_target * r2)) - ior_r2)
+    drift = h_reads - (h_r0 + h_r1 + h_r2)
+    while drift != 0:
+        if drift > 0:
+            if h_r0 >= h_r1 and h_r0 >= h_r2: h_r0 += 1
+            elif h_r1 >= h_r0 and h_r1 >= h_r2: h_r1 += 1
+            else: h_r2 += 1
+            drift -= 1
+        else:
+            if h_r0 > 0 and h_r0 >= h_r1 and h_r0 >= h_r2: h_r0 -= 1
+            elif h_r1 > 0 and h_r1 >= h_r0 and h_r1 >= h_r2: h_r1 -= 1
+            elif h_r2 > 0: h_r2 -= 1
+            drift += 1
 
-    expand("shared", shared_bytes)
-    expand("fpp",    fpp_bytes)
-    return subs
+    # E) Layout split (shared vs FPP) for each bin
+    def split_layout(nops):
+        sh = int(round(nops * p_shared))
+        up = nops - sh
+        return sh, up
 
-def sum_read_write_ops(subjobs, ops_list):
-    Oi_r = Oi_w = Si_r = Si_w = Ci_r = Ci_w = 0
-    for sj, ops in zip(subjobs, ops_list):
-        if ops <= 0: continue
-        if sj["mode"] == "r":
-            Oi_r += ops
-            if sj["pattern"] == "sequential":
-                Si_r += ops; Ci_r += ops
-        elif sj["mode"] == "w":
-            Oi_w += ops
-            if sj["pattern"] == "sequential":
-                Si_w += ops; Ci_w += ops
-    return Oi_r, Oi_w, Si_r, Si_w, Ci_r, Ci_w
+    ior_r0_sh, ior_r0_up = split_layout(ior_r0)
+    ior_r1_sh, ior_r1_up = split_layout(ior_r1)
+    ior_r2_sh, ior_r2_up = split_layout(ior_r2)
 
-# ---------- main ----------
+    h_r0_sh,  h_r0_up  = split_layout(h_r0)
+    h_r1_sh,  h_r1_up  = split_layout(h_r1)
+    h_r2_sh,  h_r2_up  = split_layout(h_r2)
+
+    # F) Planned GLOBAL bytes per (layout,bin) (for capping)
+    plan_read_bytes = {
+      ('shared','small'): (ior_r0_sh + h_r0_sh) * XS_SMALL,
+      ('shared','medium'): (ior_r1_sh + h_r1_sh) * XS_MEDIUM,
+      ('shared','large'):  (ior_r2_sh + h_r2_sh) * XS_LARGE,
+      ('fpp','small'):     (ior_r0_up + h_r0_up) * XS_SMALL,
+      ('fpp','medium'):    (ior_r1_up + h_r1_up) * XS_MEDIUM,
+      ('fpp','large'):     (ior_r2_up + h_r2_up) * XS_LARGE,
+    }
+
+    per_file_cap = int(cap_per_file_gib * GiB) if cap_per_file_gib is not None else None
+    total_cap    = int(cap_total_gib * GiB)    if cap_total_gib is not None else None
+
+    # apply per-file cap
+    capped_global = {k: (min(v, per_file_cap) if per_file_cap is not None else v) for k,v in plan_read_bytes.items()}
+
+    # apply total cap proportionally
+    sum_capped_reads = sum(capped_global.values())
+    if total_cap is not None and sum_capped_reads > 0 and sum_capped_reads > total_cap:
+        scale = total_cap / float(sum_capped_reads)
+        capped_global = {k: int(v*scale) for k,v in capped_global.items()}
+
+    # ---- Per-tool byte budgets ----------------------------------------------
+    # IOR: -b is PER-RANK blocksize; Harness -B: SHARED uses GLOBAL; FPP uses PER-RANK.
+    def ior_b_per_rank(total_ops_bin, nranks, tsize):
+        ops_pr = (total_ops_bin + nranks - 1)//nranks
+        return ops_pr * tsize, ops_pr
+
+    def harness_B(layout, binname, nranks):
+        tsize = TSIZE[binname]
+        capG  = capped_global[(layout,binname)]
+        if capG <= 0:
+            return 0, 0
+        if layout == 'shared':
+            B_used = align_down(capG, tsize)    # GLOBAL
+            return B_used, 0
+        else:
+            per_rank = align_down(capG // nranks, tsize)   # PER-RANK
+            return per_rank, per_rank
+
+    # G) File-type realization (counts & bytes)
+    # Choose total logical file count baseline: keep it modest but large enough for splits.
+    # For FPP we’ll have ≥ total_ranks files automatically, but we also need explicit counts per type.
+    # Use 3 * max(1,total_ranks) to smooth rounding; minimum 6.
+    base_files = max(6, 3 * max(1, total_ranks))
+    N_ro, N_rw, N_wo = split_counts(base_files, [f_ro, f_rw, f_wo])
+
+    # Planned read bytes (global) before RW/WO writes are added:
+    total_read_bytes_global = sum(capped_global.values())
+
+    # Target bytes by file-type (of ALL bytes):
+    # We approximate total bytes as read_bytes (from read targets) + write_bytes (RW+WO phases).
+    # Decide write bytes so that read_only/read_write/write_only byte shares are met.
+    target_bytes_total = total_read_bytes_global / max(1e-9, b_ro) if b_ro > 0 else total_read_bytes_global
+    target_bytes_ro = int(round(target_bytes_total * b_ro))
+    target_bytes_rw = int(round(target_bytes_total * b_rw))
+    target_bytes_wo = int(round(target_bytes_total * b_wo))
+
+    # Now compute how much extra write bytes we need to add (beyond the reads already counted).
+    # RO bytes should be *read-only bytes on RO files* → we will assign all READ bins onto RO and RW files
+    # in proportion to file-count split; writes will go to RW and WO to carry their byte shares.
+    # First, allocate a fraction of the read bytes to RW files so RW has some reads too.
+    # Use a stable rule: let RW read-bytes proportion match its file-count proportion among (RO+RW).
+    rw_read_fraction = (N_rw / max(1, (N_ro + N_rw))) if (N_ro + N_rw) > 0 else 0.0
+    rw_read_bytes = int(round(total_read_bytes_global * rw_read_fraction))
+    ro_read_bytes = total_read_bytes_global - rw_read_bytes
+
+    # Given targets, remaining bytes needed on RW and WO must be supplied by WRITES:
+    need_rw_write_bytes = max(0, target_bytes_rw - rw_read_bytes)
+    need_wo_write_bytes = max(0, target_bytes_wo - 0)
+
+    # If RO target is less than the RO read bytes (can happen), we’ll still keep RO reads;
+    # Darshan will show RO bytes >= target; but in typical use b_ro≥b_rw+b_wo this is fine.
+
+    # Convert desired write bytes to op counts per bin using your write bin fractions (w0/w1/w2).
+    def bytes_to_ops_by_bin(total_bytes):
+        ops0 = int(round((total_bytes * w0) / float(XS_SMALL))) if total_bytes > 0 else 0
+        ops1 = int(round((total_bytes * w1) / float(XS_MEDIUM))) if total_bytes > 0 else 0
+        # remainder to large:
+        used = ops0*XS_SMALL + ops1*XS_MEDIUM
+        rem_bytes = max(0, total_bytes - used)
+        ops2 = rem_bytes // XS_LARGE
+        return max(0, ops0), max(0, ops1), max(0, ops2)
+
+    rw_w0_ops, rw_w1_ops, rw_w2_ops = bytes_to_ops_by_bin(need_rw_write_bytes)
+    wo_w0_ops, wo_w1_ops, wo_w2_ops = bytes_to_ops_by_bin(need_wo_write_bytes)
+
+    # Write-only tiny region choice if bytes target is ~0
+    def tiny_B_for_writes(tsize, nranks):
+        per_rank = 8 * tsize
+        return per_rank * nranks
+
+    # H) Filenames
+    outdir = OUT_ROOT
+    Path(outdir).mkdir(parents=True, exist_ok=True)
+
+    def fname(layout, binname):
+        base = "shared" if layout=="shared" else "fpp"
+        return os.path.join(outdir, f"ior_{base}_{binname}.dat")
+
+    files_read = {
+      ('shared','small'):  fname('shared','small'),
+      ('shared','medium'): fname('shared','medium'),
+      ('shared','large'):  fname('shared','large'),
+      ('fpp','small'):     fname('fpp','small'),
+      ('fpp','medium'):    fname('fpp','medium'),
+      ('fpp','large'):     fname('fpp','large'),
+    }
+
+    # file-type paths (RO, RW, WO): we will simply “tag” read-target files as RO or RW,
+    # and keep dedicated WO files for write-only.
+    # For RO/RW tagging we’ll distribute per layout using the splits p_shared/p_fpp.
+    # We only need the **counts** manifest; the actual I/O follows the tag rules.
+
+    # Create WO files (three sizes)
+    write_only_files = {
+        'small': os.path.join(outdir, "write_only_small.dat"),
+        'medium':os.path.join(outdir, "write_only_medium.dat"),
+        'large': os.path.join(outdir, "write_only_large.dat"),
+    }
+
+    # I) Build PREP (create read-target files; -k to keep)
+    prep = ["#!/usr/bin/env bash","set -euo pipefail","", f'mkdir -p "{os.path.join(outdir,"mdtree")}"']
+
+    def prep_ior(layout, binname, total_ops_bin):
+        if total_ops_bin <= 0:
+            return
+        tsize = TSIZE[binname]
+        b_pr, ops_pr = ior_b_per_rank(total_ops_bin, total_ranks, tsize)
+        path  = files_read[(layout,binname)]
+        flagF = "" if layout=="shared" else "-F"
+        prep.append(mpiexec(total_ranks, f"{IOR} -a MPIIO -w -c -k {flagF} -b {b_pr} -t {tsize} -o {path}"))
+
+    # IOR PREP per class/bin
+    prep_ior('shared','small',  ior_r0_sh)
+    prep_ior('shared','medium', ior_r1_sh)
+    prep_ior('shared','large',  ior_r2_sh)
+    prep_ior('fpp','small',     ior_r0_up)
+    prep_ior('fpp','medium',    ior_r1_up)
+    prep_ior('fpp','large',     ior_r2_up)
+
+    # Always create the WO files; their sizes will be controlled by harness -B
+    prep += [
+        "",
+        "# create the write-only files (sizes are governed later by harness -B)",
+        mpiexec(1, f"{IOR} -a MPIIO -w -c -k -b {64*KiB} -t {64*KiB} -o {write_only_files['small']}"),
+        mpiexec(1, f"{IOR} -a MPIIO -w -c -k -b {64*KiB} -t {64*KiB} -o {write_only_files['medium']}"),
+        mpiexec(1, f"{IOR} -a MPIIO -w -c -k -b {64*KiB} -t {64*KiB} -o {write_only_files['large']}"),
+    ]
+
+    # J) RUN: IOR reads (Darshan), mdtest, harness-READ (RO+RW reads), harness-RW writes, harness-WO writes
+    run = [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        "",
+        f"# Global ops={total_ops_global}, IO={io_ops_target}, META={meta_ops_target}",
+        f"# Read bins target: small={r0:.2f}, medium={r1:.2f}, large={r2:.2f}",
+        f"# IOR reads chosen: total={ior_reads}, harness reads={h_reads}",
+        f"# Seq/Con READ target={p_seq_r:.2f}/{p_con_r:.2f} → harness p={p_seq_read_h:.3f}/{p_con_read_h:.3f}",
+        f"# Seq/Con WRITE target={p_seq_w:.2f}/{p_con_w:.2f} → harness p={p_seq_write_h:.3f}/{p_con_write_h:.3f}",
+        f"# Alignment target: file={p_file_ua:.2f}, mem={p_mem_ua:.2f} → harness p={p_ua_file_h:.3f}/{p_ua_mem_h:.3f}",
+        f"# RW-switch prob (harness)={rw_prob:.3f}",
+        f"# Layout target: shared={p_shared:.2f}, fpp={p_fpp:.2f}",
+        ""
+    ]
+
+    def run_ior(layout, binname, total_ops_bin):
+        if total_ops_bin <= 0:
+            return
+        tsize = TSIZE[binname]
+        b_pr, _ops_pr = ior_b_per_rank(total_ops_bin, total_ranks, tsize)
+        path  = files_read[(layout,binname)]
+        flagF = "" if layout=="shared" else "-F"
+        run.append(
+            mpiexec(total_ranks,
+                    f"{IOR} -a MPIIO -c -r {flagF} -b {b_pr} -t {tsize} -o {path}",
+                    with_darshan=True)
+        )
+
+    # IOR READ phases
+    run_ior('shared','small',  ior_r0_sh)
+    run_ior('shared','medium', ior_r1_sh)
+    run_ior('shared','large',  ior_r2_sh)
+    run_ior('fpp','small',     ior_r0_up)
+    run_ior('fpp','medium',    ior_r1_up)
+    run_ior('fpp','large',     ior_r2_up)
+
+    # mdtest (metadata only)
+    run.append(mpiexec(total_ranks, f"{MDTEST} -F -C -T -r -n 100 -d {os.path.join(outdir,'mdtree')}", with_darshan=True))
+
+    # Harness READ (follow each bin; 0 writes) — this covers RO + the RW read portion.
+    def harness_read(layout, binname, ops_read):
+        if ops_read <= 0:
+            return
+        tsize = TSIZE[binname]
+        path  = files_read[(layout,binname)]
+        B_used, per_rank_B = harness_B(layout, binname, total_ranks)
+        layout_arg = "shared" if layout=='shared' else "fpp"
+        run.append(
+            mpiexec(
+                total_ranks,
+                " ".join([
+                    f"{HARNESS} -o {path} --layout {layout_arg}",
+                    f"-t {tsize}",
+                    f"-B {B_used}",
+                    "--p-write 0.0",
+                    "--p-rand 0.0",
+                    f"--p-unaligned-file {p_ua_file_h:.6f}",
+                    f"--p-unaligned-mem {p_ua_mem_h:.6f}",
+                    f"--rw-switch-prob {rw_prob:.6f}",
+                    f"--p-seq-read {p_seq_read_h:.6f}",
+                    f"--p-seq-write {p_seq_write_h:.6f}",
+                    f"--p-consec-read {p_con_read_h:.6f}",
+                    f"--p-consec-write {p_con_write_h:.6f}",
+                    f"--meta-open {mo_i} --meta-stat {ms_i} --meta-seek {mk_i} --meta-sync {my_i}",
+                    "--seed 1"
+                ]),
+                with_darshan=True
+            ) + f"  # harness READ {layout}/{binname}"
+        )
+
+    harness_read('shared','small',  h_r0_sh)
+    harness_read('shared','medium', h_r1_sh)
+    harness_read('shared','large',  h_r2_sh)
+    harness_read('fpp','small',     h_r0_up)
+    harness_read('fpp','medium',    h_r1_up)
+    harness_read('fpp','large',     h_r2_up)
+
+    # Harness WRITE phases to realize RW and WO byte shares.
+    # Strategy:
+    #   • RW writes: direct writes onto the same *read* files to mark them RW (not RO).
+    #   • WO writes: write to dedicated WO files.
+    # Use -B regions sized by the requested bytes (aligned).
+    def harness_write_rw(binname, ops_w, global_bytes):
+        if ops_w <= 0 or global_bytes <= 0:
+            return
+        tsize = TSIZE[binname]
+        # Distribute across layout by p_shared/p_fpp
+        for layout in ['shared','fpp']:
+            share_frac = p_shared if layout=='shared' else p_fpp
+            gbytes = align_down(int(global_bytes * share_frac), tsize)
+            if gbytes <= 0: 
+                continue
+            layout_arg = "shared" if layout=='shared' else "fpp"
+            path  = files_read[(layout,binname)]
+            B_used = gbytes if layout=='shared' else align_down(gbytes // total_ranks, tsize) * total_ranks
+            run.append(
+                mpiexec(
+                    total_ranks,
+                    " ".join([
+                        f"{HARNESS} -o {path} --layout {layout_arg}",
+                        f"-t {tsize}",
+                        f"-B {B_used}",
+                        "--p-write 1.0",
+                        "--p-rand 0.0",
+                        f"--p-unaligned-file {p_ua_file_h:.6f}",
+                        f"--p-unaligned-mem {p_ua_mem_h:.6f}",
+                        f"--rw-switch-prob {rw_prob:.6f}",
+                        "--p-seq-read 0.0",
+                        f"--p-seq-write {p_seq_write_h:.6f}",
+                        "--p-consec-read 0.0",
+                        f"--p-consec-write {p_con_write_h:.6f}",
+                        "--meta-open 0 --meta-stat 0 --meta-seek 0 --meta-sync 0",
+                        "--seed 3"
+                    ]),
+                    with_darshan=True
+                ) + f"  # harness RW-WRITE {layout}/{binname}"
+            )
+
+    def harness_write_wo(binname, ops_w, global_bytes):
+        if ops_w <= 0 or global_bytes <= 0:
+            return
+        tsize = TSIZE[binname]
+        path  = write_only_files[binname]
+        B_used = align_down(global_bytes, tsize)
+        if B_used <= 0:
+            B_used = tiny_B_for_writes(tsize, total_ranks)
+        run.append(
+            mpiexec(
+                total_ranks,
+                " ".join([
+                    f"{HARNESS} -o {path} --layout shared",
+                    f"-t {tsize}",
+                    f"-B {B_used}",
+                    "--p-write 1.0",
+                    "--p-rand 0.0",
+                    f"--p-unaligned-file {p_ua_file_h:.6f}",
+                    f"--p-unaligned-mem {p_ua_mem_h:.6f}",
+                    f"--rw-switch-prob {rw_prob:.6f}",
+                    "--p-seq-read 0.0",
+                    f"--p-seq-write {p_seq_write_h:.6f}",
+                    "--p-consec-read 0.0",
+                    f"--p-consec-write {p_con_write_h:.6f}",
+                    "--meta-open 0 --meta-stat 0 --meta-seek 0 --meta-sync 0",
+                    "--seed 4"
+                ]),
+                with_darshan=True
+            ) + f"  # harness WO-WRITE {binname}"
+        )
+
+    # Decide RW vs WO write bytes by bin following w0/w1/w2.
+    rw_write_bytes_total = need_rw_write_bytes
+    wo_write_bytes_total = need_wo_write_bytes
+
+    def split_bytes_by_bin(total_bytes):
+        b0 = int(round(total_bytes * w0))
+        b1 = int(round(total_bytes * w1))
+        b2 = max(0, total_bytes - b0 - b1)
+        return b0, b1, b2
+
+    rw_b0, rw_b1, rw_b2 = split_bytes_by_bin(rw_write_bytes_total)
+    wo_b0, wo_b1, wo_b2 = split_bytes_by_bin(wo_write_bytes_total)
+
+    # Emit RW writes
+    harness_write_rw('small',  rw_w0_ops, rw_b0)
+    harness_write_rw('medium', rw_w1_ops, rw_b1)
+    harness_write_rw('large',  rw_w2_ops, rw_b2)
+
+    # Emit WO writes
+    harness_write_wo('small',  wo_w0_ops, wo_b0)
+    harness_write_wo('medium', wo_w1_ops, wo_b1)
+    harness_write_wo('large',  wo_w2_ops, wo_b2)
+
+    # ---- Write scripts --------------------------------------------------------
+    Path(OUT_ROOT).mkdir(parents=True, exist_ok=True)
+    with open(os.path.join(OUT_ROOT, PREP_SH), "w") as f:
+        f.write("\n".join(prep) + "\n")
+    os.chmod(os.path.join(OUT_ROOT, PREP_SH), 0o755)
+
+    with open(os.path.join(OUT_ROOT, RUN_SH), "w") as f:
+        f.write("\n".join(run) + "\n")
+    os.chmod(os.path.join(OUT_ROOT, RUN_SH), 0o755)
+
+    # ---- Notes (robust) -------------------------------------------------------
+    ior_read_ops_total = ior_r0 + ior_r1 + ior_r2
+    h_read_ops_total   = h_r0 + h_r1 + h_r2
+    h_write_ops_total  = write_ops_target
+
+    exp_seq_reads_global    = ior_read_ops_total + int(round(p_seq_read_h    * h_read_ops_total))
+    exp_consec_reads_global = ior_read_ops_total + int(round(p_con_read_h    * h_read_ops_total))
+    exp_seq_writes_global   = int(round(p_seq_write_h    * h_write_ops_total))
+    exp_consec_writes_global= int(round(p_con_write_h    * h_write_ops_total))
+
+    # Per-rank IOR -b report
+    def ior_b_pr_report(total_ops_bin, tsize):
+        ops_pr = (total_ops_bin + total_ranks - 1)//total_ranks
+        return ops_pr * tsize, ops_pr
+
+    ior_b_report = {
+        ('shared','small'):  ior_b_pr_report(ior_r0_sh, XS_SMALL),
+        ('shared','medium'): ior_b_pr_report(ior_r1_sh, XS_MEDIUM),
+        ('shared','large'):  ior_b_pr_report(ior_r2_sh, XS_LARGE),
+        ('fpp','small'):     ior_b_pr_report(ior_r0_up, XS_SMALL),
+        ('fpp','medium'):    ior_b_pr_report(ior_r1_up, XS_MEDIUM),
+        ('fpp','large'):     ior_b_pr_report(ior_r2_up, XS_LARGE),
+    }
+
+    # Harness -B report (shared=GLOBAL, fpp=PER-RANK)
+    hB_report = {}
+    agg_global_read_bytes = 0
+    for key in capped_global.keys():
+        layout, binname = key
+        tsize = TSIZE[binname]
+        B_used, per_rank_B = harness_B(layout, binname, total_ranks)
+        if layout == 'shared':
+            hB_report[key] = f"GLOBAL {bytes2gib(B_used)}"
+            agg_global_read_bytes += B_used
+        else:
+            hB_report[key] = f"PER-RANK {bytes2gib(per_rank_B)} (agg≈{bytes2gib(per_rank_B*total_ranks)})"
+            agg_global_read_bytes += per_rank_B * total_ranks
+
+    # WO/RW write byte summaries
+    rw_bytes_bins = {'small': rw_b0, 'medium': rw_b1, 'large': rw_b2}
+    wo_bytes_bins = {'small': wo_b0, 'medium': wo_b1, 'large': wo_b2}
+    rw_bytes_total = sum(rw_bytes_bins.values())
+    wo_bytes_total = sum(wo_bytes_bins.values())
+
+    # File-type counts (reported)
+    file_type_counts = {'RO': N_ro, 'RW': N_rw, 'WO': N_wo}
+
+    # Byte targets vs planned summary
+    planned_bytes_ro = ro_read_bytes                   # (we only read on RO)
+    planned_bytes_rw = rw_read_bytes + rw_bytes_total  # (read + write)
+    planned_bytes_wo = wo_bytes_total                  # (write only)
+
+    total_planned_bytes = planned_bytes_ro + planned_bytes_rw + planned_bytes_wo
+    # (Total planned bytes ≈ read regions + write regions; the harness may revisit, but budgets
+    #  are capped by -B and IOR -b as planned above.)
+
+    notes = []
+    notes.append(f"Bins → xfer: small={XS_SMALL//KiB}KiB, medium={XS_MEDIUM//KiB}KiB, large={XS_LARGE//MiB}MiB")
+    notes.append(
+        "Targets: "
+        f"R={p_reads:.2f}, W={p_writes:.2f}, "
+        f"seqR={p_seq_r:.2f}, consecR={p_con_r:.2f}, "
+        f"seqW={p_seq_w:.2f}, consecW={p_con_w:.2f}, rwSwitch={rw_prob:.2f}"
+    )
+    notes.append(f"Alignment(harness): file={p_ua_file_h:.3f}, mem={p_ua_mem_h:.3f}")
+    notes.append(f"Layout target: shared={p_shared:.2f}, fpp={p_fpp:.2f}")
+
+    # Read ops
+    notes.append(
+        "IOR read ops: "
+        f"r0={ior_r0} (sh={ior_r0_sh},up={ior_r0_up}), "
+        f"r1={ior_r1} (sh={ior_r1_sh},up={ior_r1_up}), "
+        f"r2={ior_r2} (sh={ior_r2_sh},up={ior_r2_up})"
+    )
+    notes.append(
+        "Harness READ ops: "
+        f"r0={h_r0} (sh={h_r0_sh},up={h_r0_up}), "
+        f"r1={h_r1} (sh={h_r1_sh},up={h_r1_up}), "
+        f"r2={h_r2} (sh={h_r2_sh},up={h_r2_up})"
+    )
+
+    # Expected seq/con
+    notes.append(
+        "Expected global seq/consec: "
+        f"seqR≈{exp_seq_reads_global}, consecR≈{exp_consec_reads_global}, "
+        f"seqW≈{exp_seq_writes_global}, consecW≈{exp_consec_writes_global}"
+    )
+
+    # Meta as fraction of TOTAL
+    notes.append(
+        f"Meta as fraction of TOTAL ops: open={mo_i}/{total_ops_global}={mo_i/total_ops_global:.2f}, "
+        f"stat={ms_i/total_ops_global:.2f}, seek={mk_i/total_ops_global:.2f}, "
+        f"sync={my_i/total_ops_global:.2f}; meta_total={(mo_i+ms_i+mk_i+my_i)}/{total_ops_global}="
+        f"{(mo_i+ms_i+mk_i+my_i)/total_ops_global:.2f}"
+    )
+
+    # IOR per-rank -b
+    lines = []
+    for key, val in ior_b_report.items():
+        layout, binname = key
+        bpr, opspr = val
+        lines.append(f"{key}: -b per-rank={bytes2gib(bpr)} ({bpr} B), ops/rank≈{opspr}")
+    notes.append("IOR per-rank -b by (layout,bin): " + "; ".join(lines))
+
+    # Harness -B
+    lines = []
+    for key, text in hB_report.items():
+        lines.append(f"{key}: {text}")
+    notes.append("Harness -B by (layout,bin): " + "; ".join(lines))
+
+    notes.append("GLOBAL read caps per (layout,bin): " + str({k: bytes2gib(v) for k,v in capped_global.items()}))
+    notes.append(f"Aggregate GLOBAL read size (sum across read files) = {bytes2gib(agg_global_read_bytes)}")
+
+    # ---- File-type layout summary (counts & bytes target vs planned) ---------
+    notes.append("File-type counts (target fractions → counts): "
+                 f"RO={f_ro:.2f}→{N_ro}, RW={f_rw:.2f}→{N_rw}, WO={f_wo:.2f}→{N_wo}")
+
+    notes.append("File-type bytes (target vs planned): " +
+        f"RO: target≈{b_ro:.2f} of total, planned≈{bytes2gib(planned_bytes_ro)}; "
+        f"RW: target≈{b_rw:.2f} of total, planned≈{bytes2gib(planned_bytes_rw)}; "
+        f"WO: target≈{b_wo:.2f} of total, planned≈{bytes2gib(planned_bytes_wo)}; "
+        f"total≈{bytes2gib(total_planned_bytes)}")
+
+    with open(os.path.join(OUT_ROOT, NOTES_TXT), "w") as f:
+        f.write("\n".join(notes) + "\n")
+
+# ---- CLI ---------------------------------------------------------------------
 def main():
-    ap = argparse.ArgumentParser(description="features.json -> scripts with IO500-style prep + Darshan-run + micro-harness.")
-    ap.add_argument("--features", required=True)
-    ap.add_argument("--out-script", default="/mnt/hasanfs/synth_from_features/run_from_features.sh")
-    ap.add_argument("--prep-script", default="/mnt/hasanfs/synth_from_features/run_prep.sh")
-    ap.add_argument("--ior", default="/mnt/hasanfs/bin/ior")
-    ap.add_argument("--mdtest", default="/mnt/hasanfs/bin/mdtest")
-    ap.add_argument("--micro-harness", dest="micro_harness", default="/mnt/hasanfs/bin/mpi_synthio")
-    ap.add_argument("--out-root", default="/mnt/hasanfs/synth_from_features")
-    ap.add_argument("--total-ranks", type=int, default=60)
-    ap.add_argument("--total-bytes", type=float, default=64*1024*1024*1024)
-    ap.add_argument("--tsize-small", default="64k")
-    ap.add_argument("--tsize-medium", default="1m")
-    ap.add_argument("--tsize-large", default="128m")
-    ap.add_argument("--mdtest-n", type=int, default=100)
-    ap.add_argument("--mdtest-flags", default="-F -C -T -r")
-    ap.add_argument("--harness-flags", default="")
-    ap.add_argument("--single-mpmd-job", type=int, default=0, help="If 1, emit all phases under a SINGLE mpiexec MPMD (Darshan on).")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--features", required=True, help="path to one features.json")
+    ap.add_argument("--total-ranks", type=int, required=True)
+    ap.add_argument("--cap-per-file-gib", type=float, default=None,
+                    help="Hard cap (GiB) for each read-target file (per layout+bin).")
+    ap.add_argument("--cap-total-gib", type=float, default=None,
+                    help="Hard cap (GiB) on the sum across all read-target files.")
     args = ap.parse_args()
 
-    os.makedirs(args.out_root, exist_ok=True)
-    with open(args.features,'r') as f:
-        F = json.load(f)
+    with open(args.features) as jf:
+        feat = json.load(jf)
 
-    # Splits
-    frac_io   = clamp01(F.get("pct_io_access", 1.0))
-    sharing = norm({"shared": pct("pct_bytes_shared_files", F, F.get("pct_shared_files", 0.5)),
-                    "fpp":    pct("pct_bytes_unique_files", F, F.get("pct_unique_files", 0.5))})
-    modesB = norm({
-        "ro": pct("pct_bytes_read_only_files", F, F.get("pct_read_only_files", 0.33)),
-        "rw": pct("pct_bytes_read_write_files", F, F.get("pct_read_write_files", 0.34)),
-        "wo": pct("pct_bytes_write_only_files", F, F.get("pct_write_only_files", 0.33)),
-    })
-    read_bins  = norm({"small": pct("pct_read_0_100K", F, 0.0),
-                       "medium": pct("pct_read_100K_10M", F, 0.0),
-                       "large": pct("pct_read_10M_1G_PLUS", F, 0.0)})
-    write_bins = norm({"small": pct("pct_write_0_100K", F, 0.0),
-                       "medium": pct("pct_write_100K_10M", F, 0.0),
-                       "large": pct("pct_write_10M_1G_PLUS", F, 0.0)})
-    seq_reads  = norm({"sequential": pct("pct_seq_reads",  F, 1.0),
-                       "random": 1.0 - pct("pct_seq_reads",  F, 1.0)})
-    seq_writes = norm({"sequential": pct("pct_seq_writes", F, 1.0),
-                       "random": 1.0 - pct("pct_seq_writes", F, 1.0)})
-
-    canon = {"small": args.tsize_small, "medium": args.tsize_medium, "large": args.tsize_large}
-
-    data_bytes_total = args.total_bytes * frac_io
-    subjobs = plan_ior_subjobs(F, data_bytes_total, canon, sharing, modesB, read_bins, write_bins, seq_reads, seq_writes, args.out_root)
-
-    # Per-subjob op counts if run with all ranks
-    R = args.total_ranks
-    ops_ior = []
-    prb_ior = []
-    for sj in subjobs:
-        tsz = parse_size_token(sj["tsize"])
-        chunks_per_rank = max(1, int(math.ceil(sj["bytes"] / (R * tsz))))
-        prb = round_bytes(chunks_per_rank * tsz, 4096)
-        prb_ior.append(prb)
-        ops_ior.append(R * chunks_per_rank)
-    O_i = sum(ops_ior)
-    Oi_r, Oi_w, Si_r, Si_w, Ci_r, Ci_w = sum_read_write_ops(subjobs, ops_ior)
-
-    # OP targets
-    p_file_ua = pct("pct_file_not_aligned", F, 0.0)
-    p_mem_ua  = pct("pct_mem_not_aligned",  F, 0.0)
-    p_rws     = pct("pct_rw_switches",      F, 0.0)
-    pW        = pct("pct_writes", F, 1.0 - pct("pct_reads", F, 0.5))
-    pR        = 1.0 - pW
-    p_seq_r   = pct("pct_seq_reads",   F, 1.0)
-    p_seq_w   = pct("pct_seq_writes",  F, 1.0)
-    p_con_r   = pct("pct_consec_reads",  F, min(p_seq_r, 1.0))
-    p_con_w   = pct("pct_consec_writes", F, min(p_seq_w, 1.0))
-
-    def min_Oh_for_ratio(target, I_count, Oi_type, w_share):
-        if target <= 0.0: return 0
-        if w_share <= 0.0: return int(1e9)
-        if target >= 1.0:
-            return 0 if I_count >= Oi_type else int(1e9)
-        num = target * Oi_type - I_count
-        den = (1.0 - target) * w_share
-        if num <= 0: return 0
-        return int(math.ceil(num / den))
-
-    Oh_file = 0 if p_file_ua <= 0 else int(math.ceil(O_i * p_file_ua / (1.0 - p_file_ua)))
-    Oh_mem  = 0 if p_mem_ua  <= 0 else int(math.ceil(O_i * p_mem_ua  / (1.0 - p_mem_ua)))
-    Oh_rws  = 0 if p_rws     <= 0 else int(math.ceil(O_i * p_rws     / (1.0 - p_rws)))
-    Oh_seq_r = min_Oh_for_ratio(p_seq_r, Si_r, Oi_r, pR)
-    Oh_seq_w = min_Oh_for_ratio(p_seq_w, Si_w, Oi_w, pW)
-    Oh_con_r = min_Oh_for_ratio(p_con_r, Ci_r, Oi_r, pR)
-    Oh_con_w = min_Oh_for_ratio(p_con_w, Ci_w, Oi_w, pW)
-    O_h = max(Oh_file, Oh_mem, Oh_rws, Oh_seq_r, Oh_seq_w, Oh_con_r, Oh_con_w)
-
-    def q_global(p): return 0.0 if p<=0 else min(1.0, p * (O_i + O_h) / max(1, O_h))
-    q_file = q_global(p_file_ua)
-    q_mem  = q_global(p_mem_ua)
-    q_rws  = q_global(p_rws)
-
-    def q_type(target, I_count, Oi_type, w_share):
-        if target <= 0.0 or w_share <= 0: return 0.0
-        num = target * (Oi_type + w_share * O_h) - I_count
-        den = w_share * O_h
-        if den <= 0: return 0.0
-        return max(0.0, min(1.0, num / den))
-
-    q_seq_r = q_type(p_seq_r, Si_r, Oi_r, pR)
-    q_seq_w = q_type(p_seq_w, Si_w, Oi_w, pW)
-    q_con_r = q_type(p_con_r, Ci_r, Oi_r, pR)
-    q_con_w = q_type(p_con_w, Ci_w, Oi_w, pW)
-    q_con_r = min(q_con_r, q_seq_r)
-    q_con_w = min(q_con_w, q_seq_w)
-
-    # Distribute harness ops across subjobs
-    if O_h > 0 and sum(ops_ior) > 0:
-        raw = [O_h * w / sum(ops_ior) for w in ops_ior]
-        O_h_j = [int(math.floor(x)) for x in raw]
-        used = sum(O_h_j); rem = O_h - used
-        fr = sorted(list(enumerate([x - math.floor(x) for x in raw])), key=lambda kv: kv[1], reverse=True)
-        i=0
-        while rem>0 and i < len(fr):
-            O_h_j[fr[i][0]] += 1; rem -= 1; i += 1
-    else:
-        O_h_j = [0]*len(subjobs)
-
-    prb_h = []
-    for sj, Oh in zip(subjobs, O_h_j):
-        tsz = parse_size_token(sj["tsize"])
-        if Oh <= 0: prb_h.append(0); continue
-        ops_per_rank = max(1, int(math.ceil(Oh / R)))
-        prb_h.append(round_bytes(ops_per_rank * tsz, 4096))
-
-    # ------------- emit PREP script (sequential, NO Darshan) -------------
-    prep_lines = ["#!/usr/bin/env bash", "set -euo pipefail", ""]
-    mpiprep = build_mpiexec_prefix(with_darshan=False)
-    md_dir = os.path.join(args.out_root, "mdtree")
-    prep_lines.append(f'mkdir -p "{md_dir}"')
-
-    # For every READ subjob, create the file using IOR write so aggregate size matches read phase.
-    # IMPORTANT: prep always writes SEQUENTIAL (no -z), even if that subjob is "random" later.
-    for sj, prb in zip(subjobs, prb_ior):
-        if sj["mode"] != "r":
-            continue
-        prep_lines.append(f'mkdir -p "$(dirname {sj["out"]})"')
-
-        layout = "shared" if sj["layout"] == "shared" else "fpp"
-
-        # Force sequential pattern for prep (no -z). We'll pass pattern="sequential" here so build_ior_cmd adds -c for shared.
-        ior_prep_cmd = build_ior_cmd(
-            args.ior, mode="w",
-            layout=layout,
-            pattern="sequential",     # <-- force sequential for prep
-            tsize=sj["tsize"],
-            per_rank_b=prb,
-            out_path=sj["out"]
-        )
-        prep_lines.append(f"{mpiprep} -n {R} {ior_prep_cmd}")
-
-    with open(args.prep_script, "w") as f:
-        f.write("\n".join(prep_lines) + "\n")
-    os.chmod(args.prep_script, 0o755)
-
-    # ------------- emit RUN script (either all-in-one MPMD or sequential) -------------
-    lines = ["#!/usr/bin/env bash", "set -euo pipefail", ""]
-    mpirun = build_mpiexec_prefix(with_darshan=True)
-
-    if args.single_mpmd_job:
-        parts = []
-        # IOR phases
-        for sj, prb in zip(subjobs, prb_ior):
-            cmd = build_ior_cmd(
-                args.ior,
-                sj["mode"],
-                "shared" if sj["layout"] == "shared" else "fpp",
-                sj["pattern"],
-                sj["tsize"],
-                prb,
-                sj["out"]
-            )
-            parts.append(f'-n {R} {cmd}')
-        # mdtest
-        md_cmd = build_mdtest_cmd(args.mdtest, args.mdtest_n, md_dir, flags=args.mdtest_flags)
-        parts.append(f'-n {R} {md_cmd}')
-        # harness
-        for sj, prb in zip(subjobs, prb_h):
-            if prb <= 0: continue
-            p_rand = 1.0 if sj["pattern"]=="random" else 0.0
-            cmdh = build_harness_cmd(args.micro_harness, sj["out"],
-                                     layout=("shared" if sj["layout"]=="shared" else "fpp"),
-                                     tsize=sj["tsize"], per_rank_b=prb,
-                                     p_write=pW, p_rand=p_rand,
-                                     p_file_ua=q_file, p_mem_ua=q_mem, p_rws=q_rws,
-                                     p_seq_r=q_seq_r, p_seq_w=q_seq_w, p_con_r=q_con_r, p_con_w=q_con_w,
-                                     extra_flags=args.harness_flags)
-            parts.append(f'-n {R} {cmdh}')
-        lines.append(f'{mpirun} ' + "  :  ".join(parts))
-    else:
-        # sequential (one mpiexec per phase)
-        for sj, prb in zip(subjobs, prb_ior):
-            cmd = build_ior_cmd(
-                args.ior,
-                sj["mode"],
-                "shared" if sj["layout"] == "shared" else "fpp",
-                sj["pattern"],
-                sj["tsize"],
-                prb,
-                sj["out"]
-            )
-            lines.append(f'{mpirun} -n {R} {cmd}  # IOR {sj["layout"]} {sj["pattern"]} {sj["mode"]} {sj["bin"]}')
-        md_cmd = build_mdtest_cmd(args.mdtest, args.mdtest_n, md_dir, flags=args.mdtest_flags)
-        lines.append(f'{mpirun} -n {R} {md_cmd}  # metadata')
-        for sj, prb in zip(subjobs, prb_h):
-            if prb <= 0: continue
-            p_rand = 1.0 if sj["pattern"]=="random" else 0.0
-            cmdh = build_harness_cmd(args.micro_harness, sj["out"],
-                                     layout=("shared" if sj["layout"]=="shared" else "fpp"),
-                                     tsize=sj["tsize"], per_rank_b=prb,
-                                     p_write=pW, p_rand=p_rand,
-                                     p_file_ua=q_file, p_mem_ua=q_mem, p_rws=q_rws,
-                                     p_seq_r=q_seq_r, p_seq_w=q_seq_w, p_con_r=q_con_r, p_con_w=q_con_w,
-                                     extra_flags=args.harness_flags)
-            lines.append(f'{mpirun} -n {R} {cmdh}  # HARNESS follows {sj["layout"]} {sj["pattern"]} {sj["bin"]}')
-
-    with open(args.out_script, "w") as f:
-        f.write("\n".join(lines) + "\n")
-    os.chmod(args.out_script, 0o755)
-
-    # Notes
-    notes = []
-    notes.append(f"Prep script: {args.prep_script}  (NO Darshan)")
-    notes.append(f"Run script : {args.out_script}   (Darshan enabled via LD_PRELOAD)")
-    notes.append(f"Data bytes target: {human_bytes(data_bytes_total)}")
-    notes.append(f"IOR subjobs: {len(subjobs)}; est IOR ops: {O_i}")
-    notes.append(f"Targets: fileUA={p_file_ua:.3f}, memUA={p_mem_ua:.3f}, rwSwitch={p_rws:.3f}, "
-                 f"seqR={p_seq_r:.3f}, seqW={p_seq_w:.3f}, consecR={p_con_r:.3f}, consecW={p_con_w:.3f}")
-    notes.append(f"Chosen O_h={O_h} → q_file={q_file:.3f}, q_mem={q_mem:.3f}, q_rws={q_rws:.3f}, "
-                 f"q_seq_r={q_seq_r:.3f}, q_seq_w={q_seq_w:.3f}, q_con_r={q_con_r:.3f}, q_con_w={q_con_w:.3f}")
-    with open(args.out_script + ".notes.txt","w") as nf:
-        nf.write("\n".join(notes) + "\n")
-
-    print("Wrote", args.prep_script)
-    print("Wrote", args.out_script)
-    print("Wrote", args.out_script + ".notes.txt")
+    plan_from_features(
+        feat,
+        total_ranks=args.total_ranks,
+        cap_per_file_gib=args.cap_per_file_gib,
+        cap_total_gib=args.cap_total_gib
+    )
+    print(f"Wrote {PREP_SH}, {RUN_SH}, and {NOTES_TXT} to {OUT_ROOT}")
 
 if __name__ == "__main__":
     main()

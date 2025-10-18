@@ -1,12 +1,12 @@
-
-CC=mpicc
-CFLAGS=-O3 -Wall -Wextra
-LDFLAGS=
+CC      = mpicc
+CFLAGS  = -O3 -Wall -Wextra
+LDFLAGS =
+LDLIBS  = -lm
 
 all: mpi_synthio
 
 mpi_synthio: mpi_synthio.c
-	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LDLIBS)
 
 clean:
 	rm -f mpi_synthio

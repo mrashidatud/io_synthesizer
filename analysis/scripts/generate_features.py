@@ -3,29 +3,33 @@
 Generate machine-learning features from the Darshan summary CSV, with aggregation by jobid.
 
 Reads darshan_summary.csv in the root log directory,
-aggregates all counters by jobid (summing numeric columns),
-applies filter on aggregated total_bytes,
-computes all POSIX-based features as specified,
-and writes output to darshan_features_updated.csv.
+filters rows by total_bytes, computes POSIX-based features,
+and writes an array of JSON feature objects to darshan_features_updated.json.
+
+Notes:
+- The filtered intermediate CSV (darshan_summary_filtered.csv) is still written for QC.
+- The JSON output mirrors your "features.json" style:
+  { filename, jobid, nprocs, pct_* feature fields, ... }
 """
 import os
+import json
 import pandas as pd
 import numpy as np
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────────
-root_dir   = "/mnt/hasanfs/repos/io_synthesizer/analysis/outputs"
-input_csv  = os.path.join(root_dir, "darshan_summary.csv")
-filtered_csv  = os.path.join(root_dir, "darshan_summary_filtered.csv")
-output_csv = os.path.join(root_dir, "darshan_features_updated.csv")
+root_dir     = "/mnt/hasanfs/repos/io_synthesizer/analysis/outputs"
+input_csv    = os.path.join(root_dir, "darshan_summary.csv")
+filtered_csv = os.path.join(root_dir, "darshan_summary_filtered.csv")
+output_json  = os.path.join(root_dir, "darshan_features_updated.json")
 # filter threshold (bytes)
-threshold  = 100 * 1024 * 1024  # 100 MB
+threshold    = 100 * 1024 * 1024  # 100 MB
 # ────────────────────────────────────────────────────────────────────────────────
 
 # 1) Load raw data
 df_raw = pd.read_csv(
     input_csv,
-    engine='python',         # switch to the Python parser
-    on_bad_lines='skip'      # drop any line with the wrong number of fields
+    engine='python',
+    on_bad_lines='skip'
 )
 initial_count = len(df_raw)
 print(f"Loaded {initial_count} rows from {input_csv}")
@@ -35,7 +39,6 @@ df_raw['total_bytes'] = df_raw.get('POSIX_BYTES_READ', 0) + df_raw.get('POSIX_BY
 stats = df_raw[df_raw['total_bytes'] >= threshold].reset_index(drop=True)
 processed_count = len(stats)
 print(f"Filtered to {processed_count} rows with total_bytes >= {threshold}")
-# report counts before and after filtering
 print(f"Input samples: {initial_count}, Processed samples: {processed_count}")
 stats.to_csv(filtered_csv, index=False)
 
@@ -59,7 +62,7 @@ meta_groups = {
     'stat': ['POSIX_STATS'],
     # repositioning file pointers
     'seek': ['POSIX_SEEKS'],
-    # explicit on‐disk flushes
+    # explicit on-disk flushes
     'sync': ['POSIX_FSYNCS', 'POSIX_FDSYNCS'],
 }
 
@@ -82,19 +85,19 @@ total_bytes = stats['total_bytes']
 feats['pct_file_not_aligned'] = safe_div(get_series('POSIX_FILE_NOT_ALIGNED'), total_acc)
 feats['pct_mem_not_aligned']  = safe_div(get_series('POSIX_MEM_NOT_ALIGNED'), total_acc)
 # read/write percentages
-feats['pct_reads']        = safe_div(get_series('POSIX_READS'), total_acc)
-feats['pct_writes']       = safe_div(get_series('POSIX_WRITES'), total_acc)
-feats['pct_consec_reads'] = safe_div(get_series('POSIX_CONSEC_READS'), get_series('POSIX_READS'))
-feats['pct_consec_writes']= safe_div(get_series('POSIX_CONSEC_WRITES'), get_series('POSIX_WRITES'))
-feats['pct_seq_reads']    = safe_div(get_series('POSIX_SEQ_READS'), get_series('POSIX_READS'))
-feats['pct_seq_writes']   = safe_div(get_series('POSIX_SEQ_WRITES'), get_series('POSIX_WRITES'))
-feats['pct_rw_switches'] = safe_div(get_series('POSIX_RW_SWITCHES'), total_acc)
+feats['pct_reads']         = safe_div(get_series('POSIX_READS'), total_acc)
+feats['pct_writes']        = safe_div(get_series('POSIX_WRITES'), total_acc)
+feats['pct_consec_reads']  = safe_div(get_series('POSIX_CONSEC_READS'), get_series('POSIX_READS'))
+feats['pct_consec_writes'] = safe_div(get_series('POSIX_CONSEC_WRITES'), get_series('POSIX_WRITES'))
+feats['pct_seq_reads']     = safe_div(get_series('POSIX_SEQ_READS'), get_series('POSIX_READS'))
+feats['pct_seq_writes']    = safe_div(get_series('POSIX_SEQ_WRITES'), get_series('POSIX_WRITES'))
+feats['pct_rw_switches']   = safe_div(get_series('POSIX_RW_SWITCHES'), total_acc)
 # byte traffic percentages
-feats['pct_byte_reads']  = safe_div(get_series('POSIX_BYTES_READ'), total_bytes)
-feats['pct_byte_writes'] = safe_div(get_series('POSIX_BYTES_WRITTEN'), total_bytes)
+feats['pct_byte_reads']    = safe_div(get_series('POSIX_BYTES_READ'), total_bytes)
+feats['pct_byte_writes']   = safe_div(get_series('POSIX_BYTES_WRITTEN'), total_bytes)
 # IO vs metadata operations
 ops_total = total_acc + meta_count
-feats['pct_io_access']   = safe_div(total_acc, ops_total)
+feats['pct_io_access']     = safe_div(total_acc, ops_total)
 for cat, cnt in meta_counts.items():
     feats[f'pct_meta_{cat}_access'] = safe_div(cnt, ops_total)
 
@@ -109,6 +112,7 @@ sum_read_10M_1G_PLUS = sum(get_series(c) for c in read_bins_10M_1G_PLUS)
 feats['pct_read_0_100K']      = safe_div(sum_read_0_100K, get_series('POSIX_READS'))
 feats['pct_read_100K_10M']    = safe_div(sum_read_100K_10M, get_series('POSIX_READS'))
 feats['pct_read_10M_1G_PLUS'] = safe_div(sum_read_10M_1G_PLUS, get_series('POSIX_READS'))
+
 # Write size bins
 write_bins_0_100K      = ['POSIX_SIZE_WRITE_0_100','POSIX_SIZE_WRITE_100_1K','POSIX_SIZE_WRITE_1K_10K','POSIX_SIZE_WRITE_10K_100K']
 write_bins_100K_10M    = ['POSIX_SIZE_WRITE_100K_1M','POSIX_SIZE_WRITE_1M_4M','POSIX_SIZE_WRITE_4M_10M']
@@ -120,13 +124,11 @@ feats['pct_write_0_100K']      = safe_div(sum_write_0_100K, get_series('POSIX_WR
 feats['pct_write_100K_10M']    = safe_div(sum_write_100K_10M, get_series('POSIX_WRITES'))
 feats['pct_write_10M_1G_PLUS'] = safe_div(sum_write_10M_1G_PLUS, get_series('POSIX_WRITES'))
 
-# ─── POSIX file‐type features ─────────────────────────────────────────────────
-
+# ─── POSIX file-type features ─────────────────────────────────────────────────
 # group 1: shared vs unique
 ft_group1   = ['shared', 'unique']
 file_sum_g1 = sum(get_series(f'POSIX_file_type_{ft}_file_count')   for ft in ft_group1).clip(lower=0)
 byte_sum_g1 = sum(get_series(f'POSIX_file_type_{ft}_total_bytes') for ft in ft_group1).clip(lower=0)
-
 for ft in ft_group1:
     feats[f'pct_{ft}_files']       = safe_div(get_series(f'POSIX_file_type_{ft}_file_count'), file_sum_g1)
     feats[f'pct_bytes_{ft}_files'] = safe_div(get_series(f'POSIX_file_type_{ft}_total_bytes'), byte_sum_g1)
@@ -135,15 +137,28 @@ for ft in ft_group1:
 ft_group2   = ['read_only', 'read_write', 'write_only']
 file_sum_g2 = sum(get_series(f'POSIX_file_type_{ft}_file_count')   for ft in ft_group2).clip(lower=0)
 byte_sum_g2 = sum(get_series(f'POSIX_file_type_{ft}_total_bytes') for ft in ft_group2).clip(lower=0)
-
 for ft in ft_group2:
     feats[f'pct_{ft}_files']       = safe_div(get_series(f'POSIX_file_type_{ft}_file_count'), file_sum_g2)
     feats[f'pct_bytes_{ft}_files'] = safe_div(get_series(f'POSIX_file_type_{ft}_total_bytes'), byte_sum_g2)
 
-# metadata: only jobid
-out = pd.concat([stats[['filename','jobid','nprocs']].reset_index(drop=True), feats.reset_index(drop=True)], axis=1)
+# ─── Assemble output objects ──────────────────────────────────────────────────
+out = pd.concat(
+    [stats[['filename','jobid','nprocs']].reset_index(drop=True),
+     feats.reset_index(drop=True)],
+    axis=1
+)
 
-# round and save
+# round to 2 decimals for stability
 out = out.round(2)
-out.to_csv(output_csv, index=False)
-print(f"Wrote features for {len(out)} jobs to {output_csv}")
+
+# Replace NaNs with 0 for JSON compatibility
+out = out.fillna(0)
+
+# Convert each row to a dict “features.json”-style
+records = out.to_dict(orient='records')
+
+# Write a single JSON array file
+with open(output_json, "w") as jf:
+    json.dump(records, jf, indent=2)
+
+print(f"Wrote features for {len(records)} jobs to {output_json}")

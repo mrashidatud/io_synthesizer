@@ -1,29 +1,29 @@
 # darshan log version: 3.41
 # compression method: ZLIB
-# exe: /mnt/hasanfs/bin/ior -a MPIIO -k -r -c -b 309264384 -t 64k -o /mnt/hasanfs/synth_from_features/ior_shared_sequential_r_small.dat
+# exe: /mnt/hasanfs/bin/ior -k -a MPIIO -c -r -b 4587520 -t 65536 -o /mnt/hasanfs/synth_from_features/ior_shared_small.dat
 # uid: 0
-# jobid: 230553
-# start_time: 1758563353
-# start_time_asci: Mon Sep 22 11:49:13 2025
-# end_time: 1758563393
-# end_time_asci: Mon Sep 22 11:49:53 2025
-# nprocs: 10
-# run time: 39.5193
+# jobid: 113684
+# start_time: 1760476164
+# start_time_asci: Tue Oct 14 15:09:24 2025
+# end_time: 1760476492
+# end_time_asci: Tue Oct 14 15:14:52 2025
+# nprocs: 16
+# run time: 327.8584
 # metadata: lib_ver = 3.4.7
 # metadata: h = romio_no_indep_rw=true;cb_nodes=4
 
 # log file regions
 # -------------------------------------------------------
 # header: 1328 bytes (uncompressed)
-# job data: 350 bytes (compressed)
-# record table: 12952 bytes (compressed)
+# job data: 337 bytes (compressed)
+# record table: 20654 bytes (compressed)
 # NULL module: 0 bytes (compressed), ver=0
-# POSIX module: 32518 bytes (compressed), ver=4
-# MPI-IO module: 775 bytes (compressed), ver=3
-# LUSTRE module: 11209 bytes (compressed), ver=2
-# STDIO module: 192 bytes (compressed), ver=2
-# APMPI module: 8117 bytes (compressed), ver=1
-# HEATMAP module: 8291 bytes (compressed), ver=1
+# POSIX module: 52406 bytes (compressed), ver=4
+# MPI-IO module: 379 bytes (compressed), ver=3
+# LUSTRE module: 17591 bytes (compressed), ver=2
+# STDIO module: 148 bytes (compressed), ver=2
+# APMPI module: 6968 bytes (compressed), ver=1
+# HEATMAP module: 24098 bytes (compressed), ver=1
 
 # mounted file systems (mount point and fs type)
 # -------------------------------------------------------
@@ -91,88 +91,88 @@
 # WARNING: POSIX counters related to file offsets may be incorrect if a file is simultaneously accessed by both POSIX and STDIO (e.g., using fileno())
 # 	- Affected counters include: MAX_BYTE_{READ|WRITTEN}, CONSEC_{READS|WRITES}, SEQ_{READS|WRITES}, {MEM|FILE}_NOT_ALIGNED, STRIDE*_STRIDE
 
-total_POSIX_OPENS: 1088
+total_POSIX_OPENS: 29218
 total_POSIX_FILENOS: 0
 total_POSIX_DUPS: 0
-total_POSIX_READS: 207784
-total_POSIX_WRITES: 28336
-total_POSIX_SEEKS: 8
-total_POSIX_STATS: 1000
+total_POSIX_READS: 75998
+total_POSIX_WRITES: 0
+total_POSIX_SEEKS: 8964
+total_POSIX_STATS: 1600
 total_POSIX_MMAPS: -1
-total_POSIX_FSYNCS: 8
+total_POSIX_FSYNCS: 0
 total_POSIX_FDSYNCS: 0
 total_POSIX_RENAME_SOURCES: 0
 total_POSIX_RENAME_TARGETS: 0
 total_POSIX_RENAMED_FROM: 0
 total_POSIX_MODE: 0
-total_POSIX_BYTES_READ: 32398639104
-total_POSIX_BYTES_WRITTEN: 4540071936
-total_POSIX_MAX_BYTE_READ: 4026531839
-total_POSIX_MAX_BYTE_WRITTEN: 1342177290
-total_POSIX_CONSEC_READS: 47217
+total_POSIX_BYTES_READ: 2550685031699
+total_POSIX_BYTES_WRITTEN: 0
+total_POSIX_MAX_BYTE_READ: 309102316962
+total_POSIX_MAX_BYTE_WRITTEN: 0
+total_POSIX_CONSEC_READS: 2238
 total_POSIX_CONSEC_WRITES: 0
-total_POSIX_SEQ_READS: 155541
-total_POSIX_SEQ_WRITES: 28336
+total_POSIX_SEQ_READS: 41892
+total_POSIX_SEQ_WRITES: 0
 total_POSIX_RW_SWITCHES: 0
-total_POSIX_MEM_NOT_ALIGNED: 94532
+total_POSIX_MEM_NOT_ALIGNED: 48110
 total_POSIX_MEM_ALIGNMENT: 8
-total_POSIX_FILE_NOT_ALIGNED: 230160
+total_POSIX_FILE_NOT_ALIGNED: 74768
 total_POSIX_FILE_ALIGNMENT: 1048576
 total_POSIX_MAX_READ_TIME_SIZE: 134217728
-total_POSIX_MAX_WRITE_TIME_SIZE: 134217728
-total_POSIX_SIZE_READ_0_100: 0
+total_POSIX_MAX_WRITE_TIME_SIZE: 0
+total_POSIX_SIZE_READ_0_100: 37996
 total_POSIX_SIZE_READ_100_1K: 0
 total_POSIX_SIZE_READ_1K_10K: 0
-total_POSIX_SIZE_READ_10K_100K: 207644
+total_POSIX_SIZE_READ_10K_100K: 19001
 total_POSIX_SIZE_READ_100K_1M: 0
 total_POSIX_SIZE_READ_1M_4M: 0
 total_POSIX_SIZE_READ_4M_10M: 0
-total_POSIX_SIZE_READ_10M_100M: 0
-total_POSIX_SIZE_READ_100M_1G: 140
+total_POSIX_SIZE_READ_10M_100M: 10
+total_POSIX_SIZE_READ_100M_1G: 18991
 total_POSIX_SIZE_READ_1G_PLUS: 0
 total_POSIX_SIZE_WRITE_0_100: 0
 total_POSIX_SIZE_WRITE_100_1K: 0
 total_POSIX_SIZE_WRITE_1K_10K: 0
-total_POSIX_SIZE_WRITE_10K_100K: 28316
+total_POSIX_SIZE_WRITE_10K_100K: 0
 total_POSIX_SIZE_WRITE_100K_1M: 0
 total_POSIX_SIZE_WRITE_1M_4M: 0
 total_POSIX_SIZE_WRITE_4M_10M: 0
 total_POSIX_SIZE_WRITE_10M_100M: 0
-total_POSIX_SIZE_WRITE_100M_1G: 20
+total_POSIX_SIZE_WRITE_100M_1G: 0
 total_POSIX_SIZE_WRITE_1G_PLUS: 0
-total_POSIX_STRIDE1_STRIDE: 65537
-total_POSIX_STRIDE2_STRIDE: 35
-total_POSIX_STRIDE3_STRIDE: 126287872
-total_POSIX_STRIDE4_STRIDE: 2673082368
-total_POSIX_STRIDE1_COUNT: 12
-total_POSIX_STRIDE2_COUNT: 8
-total_POSIX_STRIDE3_COUNT: 3
-total_POSIX_STRIDE4_COUNT: 2
-total_POSIX_ACCESS1_ACCESS: 65536
-total_POSIX_ACCESS2_ACCESS: 134217728
-total_POSIX_ACCESS3_ACCESS: 0
-total_POSIX_ACCESS4_ACCESS: 0
-total_POSIX_ACCESS1_COUNT: 235960
-total_POSIX_ACCESS2_COUNT: 160
-total_POSIX_ACCESS3_COUNT: 0
-total_POSIX_ACCESS4_COUNT: 0
+total_POSIX_STRIDE1_STRIDE: 134217729
+total_POSIX_STRIDE2_STRIDE: 65537
+total_POSIX_STRIDE3_STRIDE: 402653185
+total_POSIX_STRIDE4_STRIDE: 196609
+total_POSIX_STRIDE1_COUNT: 569
+total_POSIX_STRIDE2_COUNT: 569
+total_POSIX_STRIDE3_COUNT: 525
+total_POSIX_STRIDE4_COUNT: 525
+total_POSIX_ACCESS1_ACCESS: 134217728
+total_POSIX_ACCESS2_ACCESS: 65536
+total_POSIX_ACCESS3_ACCESS: 131194262
+total_POSIX_ACCESS4_ACCESS: 121870998
+total_POSIX_ACCESS1_COUNT: 18986
+total_POSIX_ACCESS2_COUNT: 18986
+total_POSIX_ACCESS3_COUNT: 1
+total_POSIX_ACCESS4_COUNT: 1
 total_POSIX_FASTEST_RANK: -1
 total_POSIX_FASTEST_RANK_BYTES: -1
 total_POSIX_SLOWEST_RANK: -1
 total_POSIX_SLOWEST_RANK_BYTES: -1
-total_POSIX_F_OPEN_START_TIMESTAMP: 0.003606
-total_POSIX_F_READ_START_TIMESTAMP: 0.005346
-total_POSIX_F_WRITE_START_TIMESTAMP: 0.005440
-total_POSIX_F_CLOSE_START_TIMESTAMP: 0.004140
-total_POSIX_F_OPEN_END_TIMESTAMP: 6.521893
-total_POSIX_F_READ_END_TIMESTAMP: 6.624350
-total_POSIX_F_WRITE_END_TIMESTAMP: 7.747017
-total_POSIX_F_CLOSE_END_TIMESTAMP: 7.910907
-total_POSIX_F_READ_TIME: 84.823523
-total_POSIX_F_WRITE_TIME: 19.919438
-total_POSIX_F_META_TIME: 0.577576
-total_POSIX_F_MAX_READ_TIME: 0.857299
-total_POSIX_F_MAX_WRITE_TIME: 0.545191
+total_POSIX_F_OPEN_START_TIMESTAMP: 0.003253
+total_POSIX_F_READ_START_TIMESTAMP: 0.008036
+total_POSIX_F_WRITE_START_TIMESTAMP: 0.000000
+total_POSIX_F_CLOSE_START_TIMESTAMP: 0.040121
+total_POSIX_F_OPEN_END_TIMESTAMP: 29.003401
+total_POSIX_F_READ_END_TIMESTAMP: 291.501610
+total_POSIX_F_WRITE_END_TIMESTAMP: 0.000000
+total_POSIX_F_CLOSE_END_TIMESTAMP: 291.506810
+total_POSIX_F_READ_TIME: 2574.984903
+total_POSIX_F_WRITE_TIME: 0.000000
+total_POSIX_F_META_TIME: 3.476999
+total_POSIX_F_MAX_READ_TIME: 5.696625
+total_POSIX_F_MAX_WRITE_TIME: 0.000000
 total_POSIX_F_FASTEST_RANK_TIME: 0.000000
 total_POSIX_F_SLOWEST_RANK_TIME: 0.000000
 total_POSIX_F_VARIANCE_RANK_TIME: 0.000000
@@ -191,32 +191,32 @@ total_POSIX_F_VARIANCE_RANK_BYTES: 0.000000
 # <max_byte_offset> maximum byte offset accessed for a file of this type
 
 # <file_type> <file_count> <total_bytes> <max_byte_offset>
-# total: 1004 36938711040 4026531839
-# read_only: 0 0 0
+# total: 1602 2550685031699 309102316962
+# read_only: 2 2550685031699 309102316962
 # write_only: 0 0 0
-# read_write: 4 36938711040 4026531839
-# unique: 1000 0 0
-# shared: 4 36938711040 4026531839
+# read_write: 0 0 0
+# unique: 1600 0 0
+# shared: 2 2550685031699 309102316962
 
 # performance
 # -----------
-# total_bytes: 36938711040
+# total_bytes: 2550685031699
 #
 # I/O timing for unique files (seconds):
 # ...........................
-# unique files: slowest_rank_io_time: 0.066811
-# unique files: slowest_rank_meta_only_time: 0.066811
+# unique files: slowest_rank_io_time: 0.200468
+# unique files: slowest_rank_meta_only_time: 0.200468
 # unique files: slowest_rank_rw_only_time: 0.000000
-# unique files: slowest_rank: 4
+# unique files: slowest_rank: 9
 #
 # I/O timing for shared files (seconds):
 # ...........................
-# shared files: time_by_slowest: 17.292121
+# shared files: time_by_slowest: 172.136904
 #
 # Aggregate performance, including both shared and unique files:
 # ...........................
-# agg_time_by_slowest: 17.358931 # seconds
-# agg_perf_by_slowest: 2029.358800 # MiB/s
+# agg_time_by_slowest: 172.337372 # seconds
+# agg_perf_by_slowest: 14114.888614 # MiB/s
 
 # *******************************************************
 # MPI-IO module data
@@ -247,70 +247,70 @@ total_POSIX_F_VARIANCE_RANK_BYTES: 0.000000
 #   MPIIO_F_*_RANK_TIME: fastest and slowest I/O time for a single rank (for shared files).
 #   MPIIO_F_VARIANCE_RANK_*: variance of total I/O time and bytes moved for all ranks (for shared files).
 
-total_MPIIO_INDEP_OPENS: 4
-total_MPIIO_COLL_OPENS: 80
-total_MPIIO_INDEP_READS: 113344
-total_MPIIO_INDEP_WRITES: 28336
+total_MPIIO_INDEP_OPENS: 2
+total_MPIIO_COLL_OPENS: 27616
+total_MPIIO_INDEP_READS: 73728
+total_MPIIO_INDEP_WRITES: 0
 total_MPIIO_COLL_READS: 0
 total_MPIIO_COLL_WRITES: 0
 total_MPIIO_SPLIT_READS: 0
 total_MPIIO_SPLIT_WRITES: 0
 total_MPIIO_NB_READS: 0
 total_MPIIO_NB_WRITES: 0
-total_MPIIO_SYNCS: 40
-total_MPIIO_HINTS: 44
+total_MPIIO_SYNCS: 8960
+total_MPIIO_HINTS: 34
 total_MPIIO_VIEWS: 0
-total_MPIIO_MODE: 9
-total_MPIIO_BYTES_READ: 18160287744
-total_MPIIO_BYTES_WRITTEN: 4540071936
+total_MPIIO_MODE: 8
+total_MPIIO_BYTES_READ: 4950218244096
+total_MPIIO_BYTES_WRITTEN: 0
 total_MPIIO_RW_SWITCHES: 0
 total_MPIIO_MAX_READ_TIME_SIZE: 134217728
-total_MPIIO_MAX_WRITE_TIME_SIZE: 134217728
+total_MPIIO_MAX_WRITE_TIME_SIZE: 0
 total_MPIIO_SIZE_READ_AGG_0_100: 0
 total_MPIIO_SIZE_READ_AGG_100_1K: 0
 total_MPIIO_SIZE_READ_AGG_1K_10K: 0
-total_MPIIO_SIZE_READ_AGG_10K_100K: 113264
+total_MPIIO_SIZE_READ_AGG_10K_100K: 36864
 total_MPIIO_SIZE_READ_AGG_100K_1M: 0
 total_MPIIO_SIZE_READ_AGG_1M_4M: 0
 total_MPIIO_SIZE_READ_AGG_4M_10M: 0
 total_MPIIO_SIZE_READ_AGG_10M_100M: 0
-total_MPIIO_SIZE_READ_AGG_100M_1G: 80
+total_MPIIO_SIZE_READ_AGG_100M_1G: 36864
 total_MPIIO_SIZE_READ_AGG_1G_PLUS: 0
 total_MPIIO_SIZE_WRITE_AGG_0_100: 0
 total_MPIIO_SIZE_WRITE_AGG_100_1K: 0
 total_MPIIO_SIZE_WRITE_AGG_1K_10K: 0
-total_MPIIO_SIZE_WRITE_AGG_10K_100K: 28316
+total_MPIIO_SIZE_WRITE_AGG_10K_100K: 0
 total_MPIIO_SIZE_WRITE_AGG_100K_1M: 0
 total_MPIIO_SIZE_WRITE_AGG_1M_4M: 0
 total_MPIIO_SIZE_WRITE_AGG_4M_10M: 0
 total_MPIIO_SIZE_WRITE_AGG_10M_100M: 0
-total_MPIIO_SIZE_WRITE_AGG_100M_1G: 20
+total_MPIIO_SIZE_WRITE_AGG_100M_1G: 0
 total_MPIIO_SIZE_WRITE_AGG_1G_PLUS: 0
-total_MPIIO_ACCESS1_ACCESS: 65536
-total_MPIIO_ACCESS2_ACCESS: 134217728
+total_MPIIO_ACCESS1_ACCESS: 134217728
+total_MPIIO_ACCESS2_ACCESS: 65536
 total_MPIIO_ACCESS3_ACCESS: 0
 total_MPIIO_ACCESS4_ACCESS: 0
-total_MPIIO_ACCESS1_COUNT: 141580
-total_MPIIO_ACCESS2_COUNT: 100
+total_MPIIO_ACCESS1_COUNT: 36864
+total_MPIIO_ACCESS2_COUNT: 36864
 total_MPIIO_ACCESS3_COUNT: 0
 total_MPIIO_ACCESS4_COUNT: 0
 total_MPIIO_FASTEST_RANK: -1
 total_MPIIO_FASTEST_RANK_BYTES: -1
 total_MPIIO_SLOWEST_RANK: -1
 total_MPIIO_SLOWEST_RANK_BYTES: -1
-total_MPIIO_F_OPEN_START_TIMESTAMP: 0.000729
-total_MPIIO_F_READ_START_TIMESTAMP: 0.005342
-total_MPIIO_F_WRITE_START_TIMESTAMP: 0.005435
-total_MPIIO_F_CLOSE_START_TIMESTAMP: 0.092462
-total_MPIIO_F_OPEN_END_TIMESTAMP: 6.521905
-total_MPIIO_F_READ_END_TIMESTAMP: 6.624350
-total_MPIIO_F_WRITE_END_TIMESTAMP: 7.747017
-total_MPIIO_F_CLOSE_END_TIMESTAMP: 7.910991
-total_MPIIO_F_READ_TIME: 54.302800
-total_MPIIO_F_WRITE_TIME: 19.932131
-total_MPIIO_F_META_TIME: 175.925330
-total_MPIIO_F_MAX_READ_TIME: 0.857310
-total_MPIIO_F_MAX_WRITE_TIME: 0.545202
+total_MPIIO_F_OPEN_START_TIMESTAMP: 0.000814
+total_MPIIO_F_READ_START_TIMESTAMP: 0.597793
+total_MPIIO_F_WRITE_START_TIMESTAMP: 0.000000
+total_MPIIO_F_CLOSE_START_TIMESTAMP: 0.021484
+total_MPIIO_F_OPEN_END_TIMESTAMP: 145.596824
+total_MPIIO_F_READ_END_TIMESTAMP: 291.501611
+total_MPIIO_F_WRITE_END_TIMESTAMP: 0.000000
+total_MPIIO_F_CLOSE_END_TIMESTAMP: 291.507185
+total_MPIIO_F_READ_TIME: 2278.931984
+total_MPIIO_F_WRITE_TIME: 0.000226
+total_MPIIO_F_META_TIME: 2402.377187
+total_MPIIO_F_MAX_READ_TIME: 1.682432
+total_MPIIO_F_MAX_WRITE_TIME: 0.000000
 total_MPIIO_F_FASTEST_RANK_TIME: 0.000000
 total_MPIIO_F_SLOWEST_RANK_TIME: 0.000000
 total_MPIIO_F_VARIANCE_RANK_TIME: 0.000000
@@ -329,16 +329,16 @@ total_MPIIO_F_VARIANCE_RANK_BYTES: 0.000000
 # <max_byte_offset> maximum byte offset accessed for a file of this type
 
 # <file_type> <file_count> <total_bytes> <max_byte_offset>
-# total: 4 22700359680 -1
-# read_only: 0 0 0
+# total: 2 4950218244096 -1
+# read_only: 2 4950218244096 -1
 # write_only: 0 0 0
-# read_write: 4 22700359680 -1
+# read_write: 0 0 0
 # unique: 0 0 0
-# shared: 4 22700359680 -1
+# shared: 2 4950218244096 -1
 
 # performance
 # -----------
-# total_bytes: 22700359680
+# total_bytes: 4950218244096
 #
 # I/O timing for unique files (seconds):
 # ...........................
@@ -349,12 +349,12 @@ total_MPIIO_F_VARIANCE_RANK_BYTES: 0.000000
 #
 # I/O timing for shared files (seconds):
 # ...........................
-# shared files: time_by_slowest: 26.598605
+# shared files: time_by_slowest: 292.659516
 #
 # Aggregate performance, including both shared and unique files:
 # ...........................
-# agg_time_by_slowest: 26.598605 # seconds
-# agg_perf_by_slowest: 813.905476 # MiB/s
+# agg_time_by_slowest: 292.659516 # seconds
+# agg_perf_by_slowest: 16131.018293 # MiB/s
 
 # *******************************************************
 # STDIO module data
@@ -377,33 +377,33 @@ total_MPIIO_F_VARIANCE_RANK_BYTES: 0.000000
 # WARNING: STDIO counters related to file offsets may be incorrect if a file is simultaneously accessed by both STDIO and POSIX (e.g., using fdopen())
 # 	- Affected counters include: MAX_BYTE_{READ|WRITTEN}
 
-total_STDIO_OPENS: 14
+total_STDIO_OPENS: 18
 total_STDIO_FDOPENS: 0
 total_STDIO_READS: 0
-total_STDIO_WRITES: 436
+total_STDIO_WRITES: 254
 total_STDIO_SEEKS: 0
-total_STDIO_FLUSHES: 61
-total_STDIO_BYTES_WRITTEN: 9432
+total_STDIO_FLUSHES: 59
+total_STDIO_BYTES_WRITTEN: 5249
 total_STDIO_BYTES_READ: 0
 total_STDIO_MAX_BYTE_READ: 0
-total_STDIO_MAX_BYTE_WRITTEN: 2073
-total_STDIO_FASTEST_RANK: 7
+total_STDIO_MAX_BYTE_WRITTEN: 2036
+total_STDIO_FASTEST_RANK: 3
 total_STDIO_FASTEST_RANK_BYTES: 0
 total_STDIO_SLOWEST_RANK: 0
-total_STDIO_SLOWEST_RANK_BYTES: 2054
+total_STDIO_SLOWEST_RANK_BYTES: 2037
 total_STDIO_F_META_TIME: 0.000000
-total_STDIO_F_WRITE_TIME: 0.000354
+total_STDIO_F_WRITE_TIME: 0.000234
 total_STDIO_F_READ_TIME: 0.000000
 total_STDIO_F_OPEN_START_TIMESTAMP: 0.000000
 total_STDIO_F_CLOSE_START_TIMESTAMP: 0.000000
-total_STDIO_F_WRITE_START_TIMESTAMP: 0.004022
+total_STDIO_F_WRITE_START_TIMESTAMP: 0.003387
 total_STDIO_F_READ_START_TIMESTAMP: 0.000000
 total_STDIO_F_OPEN_END_TIMESTAMP: 0.000000
 total_STDIO_F_CLOSE_END_TIMESTAMP: 0.000000
-total_STDIO_F_WRITE_END_TIMESTAMP: 6.523175
+total_STDIO_F_WRITE_END_TIMESTAMP: 29.005189
 total_STDIO_F_READ_END_TIMESTAMP: 0.000000
 total_STDIO_F_FASTEST_RANK_TIME: 0.000000
-total_STDIO_F_SLOWEST_RANK_TIME: 0.000085
+total_STDIO_F_SLOWEST_RANK_TIME: 0.000086
 total_STDIO_F_VARIANCE_RANK_TIME: 0.000000
 total_STDIO_F_VARIANCE_RANK_BYTES: 0.000000
 
@@ -420,29 +420,29 @@ total_STDIO_F_VARIANCE_RANK_BYTES: 0.000000
 # <max_byte_offset> maximum byte offset accessed for a file of this type
 
 # <file_type> <file_count> <total_bytes> <max_byte_offset>
-# total: 1 9432 2073
+# total: 1 5249 2036
 # read_only: 0 0 0
-# write_only: 1 9432 2073
+# write_only: 1 5249 2036
 # read_write: 0 0 0
 # unique: 0 0 0
-# shared: 1 9432 2073
+# shared: 1 5249 2036
 
 # performance
 # -----------
-# total_bytes: 9432
+# total_bytes: 5249
 #
 # I/O timing for unique files (seconds):
 # ...........................
-# unique files: slowest_rank_io_time: 0.000299
+# unique files: slowest_rank_io_time: 0.000167
 # unique files: slowest_rank_meta_only_time: 0.000000
-# unique files: slowest_rank_rw_only_time: 0.000299
+# unique files: slowest_rank_rw_only_time: 0.000167
 # unique files: slowest_rank: 0
 #
 # I/O timing for shared files (seconds):
 # ...........................
-# shared files: time_by_slowest: 0.000052
+# shared files: time_by_slowest: 0.000059
 #
 # Aggregate performance, including both shared and unique files:
 # ...........................
-# agg_time_by_slowest: 0.000350 # seconds
-# agg_perf_by_slowest: 25.665306 # MiB/s
+# agg_time_by_slowest: 0.000226 # seconds
+# agg_perf_by_slowest: 22.194503 # MiB/s

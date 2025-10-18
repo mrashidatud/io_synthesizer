@@ -1,381 +1,305 @@
-/* =============================================================================
- * MPI Synth I/O Harness (mpi_synthio.c)
- *
- * What this does
- *  - Tiny MPI-IO program that generates I/O operations with precise, per-op
- *    probabilities so Darshan-style OP-LEVEL metrics are matched globally when
- *    combined with IOR output.
- *  - You point it at the SAME files and transfer sizes the synthesizer used for
- *    IOR, and it will:
- *      • alternate read/write via a Markov switch     (--rw-switch-prob)
- *      • choose READ vs WRITE fraction                (--p-write)
- *      • choose sequential vs non-seq per type       (--p-seq-read / --p-seq-write)
- *      • choose consecutive subset per type          (--p-consec-read / --p-consec-write)
- *      • introduce file/memory misalignment          (--p-unaligned-file / --p-unaligned-mem)
- *      • honor layout: shared file or FPP            (--layout shared|fpp)
- *      • perform exactly ceil(-B / -t) ops per rank  (-B bytes per rank, -t transfer size)
- *
- * Key flags (all are 0..1 probabilities unless noted)
- *  -o <path>                  : target file (shared) or per-rank base path (FPP)
- * -t <size>                   : transfer size per operation (e.g., 64k, 1m)
- * -B <bytes>                  : total bytes per rank (ops = ceil(B/t))
- * --layout shared|fpp         : shared file vs file-per-process
- * --p-write <p>               : fraction of ops that are WRITES (else READS)
- * --rw-switch-prob <p>        : probability to flip R↔W after each op
- * --p-seq-read <p>            : for READ ops, fraction that are SEQUENTIAL
- * --p-seq-write <p>           : for WRITE ops, fraction that are SEQUENTIAL
- * --p-consec-read <p>         : for READ ops, fraction that are CONSECUTIVE
- * --p-consec-write <p>        : for WRITE ops, fraction that are CONSECUTIVE
- *                               (the harness enforces CONSECUTIVE ⊂ SEQUENTIAL)
- * --p-unaligned-file <p>      : fraction of ops with misaligned FILE offsets
- * --p-unaligned-mem  <p>      : fraction of ops with misaligned MEMORY buffers
- * --think-us <usec>           : optional: sleep this many microseconds per op
- *
- * Darshan semantics matched
- *  - POSIX_SEQ_READS/WRITES   : next offset > previous end for that op type
- *  - POSIX_CONSEC_READS/WRITES: next offset == previous end for that op type
- *
- * Install location (expected by the synthesizer):
- *  - /mnt/hasanfs/bin/mpi_synthio
+/*
+ * mpi_synthio.c — MPI micro-harness to “correct” global op mix produced by IOR/mdtest:
+ *   - honors global probabilities:
+ *       --p-write, --p-rand
+ *       --p-seq-read, --p-seq-write
+ *       --p-consec-read, --p-consec-write  (consecutive ⊆ sequential)
+ *       --p-unaligned-file, --p-unaligned-mem
+ *       --rw-switch-prob
+ *   - honors byte budget:   -B <total_bytes>
+ *   - honors transfer size: -t <bytes>
+ *   - operates on ONE existing path (-o) in shared layout; no stray files
+ *   - emits metadata ops on the target path (no extra “unique” files):
+ *       --meta-open N --meta-stat N --meta-seek N --meta-sync N
  *
  * Build:
- *   mpicc -O3 -Wall -Wextra -o mpi_synthio mpi_synthio.c
- *
- * Example:
- *   mpiexec -n 64 /mnt/hasanfs/bin/mpi_synthio \
- *     -o /fs/bench/ior_shared_sequential_r_small.dat --layout shared \
- *     -t 64k -B 24m \
- *     --p-write 0.20 --rw-switch-prob 0.00 \
- *     --p-seq-read 0.50 --p-seq-write 1.00 \
- *     --p-consec-read 0.50 --p-consec-write 0.00 \
- *     --p-unaligned-file 0.60 --p-unaligned-mem 0.40
- * =============================================================================
+ *   mpicc -O3 -Wall -Wextra -o mpi_synthio mpi_synthio.c -lm
  */
 
+#define _POSIX_C_SOURCE 200809L
 #include <mpi.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 #include <stdint.h>
-#include <ctype.h>
-#include <limits.h>   // for UINT_MAX
+#include <getopt.h>
 #include <errno.h>
+#include <limits.h>
+#include <time.h>
+#include <math.h>
 
-#ifndef MPIIO_ALIGN
-#define MPIIO_ALIGN 4096LL
-#endif
+static inline double frand01(void) { return rand() / (double)RAND_MAX; }
 
-static void die(int rc, const char* msg) {
-  fprintf(stderr, "%s\n", msg);
-  MPI_Abort(MPI_COMM_WORLD, rc);
-}
-
-static void die_mpi(int rc, const char* where) {
-  char err[MPI_MAX_ERROR_STRING]; int len=0;
-  MPI_Error_string(rc, err, &len);
-  fprintf(stderr, "[rank ?] %s failed: %.*s\n", where, len, err);
-  MPI_Abort(MPI_COMM_WORLD, rc);
-}
-
-static long long parse_size(const char* s) {
-  if (!s || !*s) return -1;
-  char *end = NULL;
-  double val = strtod(s, &end);
-  if (end == s) return -1;
-  while (*end && isspace((unsigned char)*end)) ++end;
-  long long mul = 1;
-  if (*end) {
-    if (end[0] == 'k' || end[0] == 'K') mul = 1024LL;
-    else if (end[0] == 'm' || end[0] == 'M') mul = 1024LL*1024LL;
-    else if (end[0] == 'g' || end[0] == 'G') mul = 1024LL*1024LL*1024LL;
-    else if (end[0] == 'b' || end[0] == 'B') mul = 1LL;
-    else return -1;
-  }
-  long long out = (long long)(val * (double)mul);
-  return out < 0 ? -1 : out;
-}
-
-static inline double urand(unsigned *state){
-  // xorshift32; returns uniform in [0,1]
-  unsigned x = *state;
-  x ^= x << 13; x ^= x >> 17; x ^= x << 5;
-  *state = x ? x : 1u;
-  return (double)x / (double)UINT_MAX;
-}
-
-static void usage(int rc) {
-  if (rc == 0) {
-    fprintf(stdout,
-      "mpi_synthio - synthetic MPI-IO harness\n"
-      "Required:\n"
-      "  -o <path>                target path (shared) or base path (FPP)\n"
-      "  -t <size>                transfer size per op (e.g., 64k, 1m)\n"
-      "  -B <bytes>               bytes per RANK (ops = ceil(B/t))\n"
-      "Options:\n"
-      "  --layout shared|fpp      default: shared\n"
-      "  --p-write <p>            fraction of ops that are WRITES (default 0.5)\n"
-      "  --rw-switch-prob <p>     Markov switch prob R↔W after each op (default 0.0)\n"
-      "  --p-seq-read <p>         fraction of READ ops that are sequential\n"
-      "  --p-seq-write <p>        fraction of WRITE ops that are sequential\n"
-      "  --p-consec-read <p>      fraction of READ ops that are consecutive (⊂ sequential)\n"
-      "  --p-consec-write <p>     fraction of WRITE ops that are consecutive (⊂ sequential)\n"
-      "  --p-unaligned-file <p>   prob of misaligned FILE offsets (default 0.0)\n"
-      "  --p-unaligned-mem  <p>   prob of misaligned MEM buffers (default 0.0)\n"
-      "  --think-us <usec>        sleep per op (default 0)\n"
-      "\n"
-    );
-  } else {
-    fprintf(stderr, "Try --help\n");
-  }
-}
-
-int main(int argc, char** argv) {
-  MPI_Init(&argc, &argv);
-  int rank=0, nprocs=1;
-  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-  MPI_Comm_size(MPI_COMM_WORLD, &nprocs);
-
-  // Defaults
-  const char* out_path = NULL;
-  long long tsize = -1;
-  long long B = -1;
-  long long think_us = 0;
-  long long alignQ = MPIIO_ALIGN;
-  int layout_shared = 1; // 1=shared, 0=fpp
-
-  // Probabilities (operation-level)
-  double p_write = 0.5;      // fraction of ops that are writes
-  double p_rand  = 0.0;      // kept for compatibility; not used for seq/consec logic
-  double p_unaligned_file = 0.0;
-  double p_unaligned_mem  = 0.0;
-  double rw_switch_prob = 0.0;
-
-  // Separate sequential vs consecutive targets per op type (Darshan semantics)
-  double p_seq_read = 1.0;      // fraction of READ ops that are sequential (offset > last_read_end)
-  double p_seq_write = 1.0;     // fraction of WRITE ops that are sequential
-  double p_consec_read = 1.0;   // fraction of READ ops that are consecutive (offset == last_read_end)
-  double p_consec_write = 1.0;  // fraction of WRITE ops that are consecutive
-
-  // Parse args
-  for (int i=1; i<argc; ++i){
-    if (!strcmp(argv[i],"--help") || !strcmp(argv[i],"-h")) { usage(0); MPI_Finalize(); return 0; }
-    else if (!strcmp(argv[i], "-o") && i+1<argc) out_path = argv[++i];
-    else if (!strcmp(argv[i], "-t") && i+1<argc) tsize = parse_size(argv[++i]);
-    else if (!strcmp(argv[i], "-B") && i+1<argc) B     = parse_size(argv[++i]);
-    else if (!strcmp(argv[i], "--layout") && i+1<argc) {
-      ++i;
-      if (!strcasecmp(argv[i],"shared")) layout_shared = 1;
-      else if (!strcasecmp(argv[i],"fpp")) layout_shared = 0;
-      else die(2, "invalid --layout (use shared|fpp)");
-    }
-    else if (!strcmp(argv[i], "--p-write") && i+1<argc) p_write = atof(argv[++i]);
-    else if (!strcmp(argv[i], "--p-rand")  && i+1<argc) p_rand  = atof(argv[++i]);
-    else if (!strcmp(argv[i], "--p-unaligned-file") && i+1<argc) p_unaligned_file = atof(argv[++i]);
-    else if (!strcmp(argv[i], "--p-unaligned-mem")  && i+1<argc) p_unaligned_mem  = atof(argv[++i]);
-    else if (!strcmp(argv[i], "--rw-switch-prob")   && i+1<argc) rw_switch_prob   = atof(argv[++i]);
-
-    else if (!strcmp(argv[i], "--p-seq-read")    && i+1<argc) p_seq_read    = atof(argv[++i]);
-    else if (!strcmp(argv[i], "--p-seq-write")   && i+1<argc) p_seq_write   = atof(argv[++i]);
-    else if (!strcmp(argv[i], "--p-consec-read") && i+1<argc) p_consec_read = atof(argv[++i]);
-    else if (!strcmp(argv[i], "--p-consec-write")&& i+1<argc) p_consec_write= atof(argv[++i]);
-
-    else if (!strcmp(argv[i], "--think-us") && i+1<argc) think_us = parse_size(argv[++i]);
-    else {
-      if (rank==0) fprintf(stderr, "Unknown/invalid arg: %s\n", argv[i]);
-      usage(1);
-      MPI_Finalize(); return 1;
-    }
-  }
-
-  if (!out_path || tsize <= 0 || B <= 0) {
-    if (rank==0) fprintf(stderr, "Missing required -o / -t / -B\n");
-    usage(1);
-    MPI_Finalize(); return 1;
-  }
-
-  // Clamp probabilities to [0,1]
-  if (p_write < 0) p_write = 0; 
-  if (p_write > 1) p_write = 1;
-
-  if (p_rand  < 0) p_rand  = 0; 
-  if (p_rand  > 1) p_rand  = 1;
-
-  if (p_unaligned_file < 0) p_unaligned_file = 0; 
-  if (p_unaligned_file > 1) p_unaligned_file = 1;
-
-  if (p_unaligned_mem  < 0) p_unaligned_mem  = 0; 
-  if (p_unaligned_mem  > 1) p_unaligned_mem  = 1;
-
-  if (rw_switch_prob < 0) rw_switch_prob = 0; 
-  if (rw_switch_prob > 1) rw_switch_prob = 1;
-
-  if (p_seq_read   < 0) p_seq_read = 0;   
-  if (p_seq_read   > 1) p_seq_read = 1;
-
-  if (p_seq_write  < 0) p_seq_write = 0;  
-  if (p_seq_write  > 1) p_seq_write = 1;
-
-  if (p_consec_read < 0) p_consec_read = 0; 
-  if (p_consec_read > 1) p_consec_read = 1;
-
-  if (p_consec_write < 0) p_consec_write = 0; 
-  if (p_consec_write > 1) p_consec_write = 1;
-
-  // Enforce: consecutive ⊂ sequential (per type) via conditional probabilities
-  double pc_r_given_seq = 0.0;
-  double pc_w_given_seq = 0.0;
-  if (p_seq_read  > 0) pc_r_given_seq = p_consec_read  / p_seq_read;
-  if (p_seq_write > 0) pc_w_given_seq = p_consec_write / p_seq_write;
-  if (pc_r_given_seq > 1.0) pc_r_given_seq = 1.0;
-  if (pc_w_given_seq > 1.0) pc_w_given_seq = 1.0;
-  if (pc_r_given_seq < 0.0) pc_r_given_seq = 0.0;
-  if (pc_w_given_seq < 0.0) pc_w_given_seq = 0.0;
-
-  // Determine operations per rank
-  long long nops = (B + tsize - 1) / tsize;  // ceil
-  if (nops <= 0) nops = 1;
-
-  // Build per-rank path for FPP
+typedef struct {
   char path[4096];
-  if (!layout_shared) {
-    snprintf(path, sizeof(path), "%s.rank%06d", out_path, rank);
+  long long total_bytes;
+  long long xfer;
+  int shared_layout; // unused (always shared), kept for compatibility
+  double p_write;
+  double p_rand;
+  double p_seq_read, p_seq_write;
+  double p_consec_read, p_consec_write;
+  double p_file_ua, p_mem_ua;
+  double rw_switch_prob;
+  long meta_open, meta_stat, meta_seek, meta_sync;
+  unsigned seed;
+} cfg_t;
+
+static void usage(const char *p){
+  if (!p) p = "mpi_synthio";
+  fprintf(stderr,
+  "Usage: %s -o <file> -t <xfer> -B <bytes> [options]\n"
+  "  --layout shared         (default)\n"
+  "  --p-write <0..1>\n"
+  "  --p-rand  <0..1>\n"
+  "  --p-seq-read  <0..1>   --p-seq-write  <0..1>\n"
+  "  --p-consec-read<0..1>  --p-consec-write<0..1>  (<= corresponding seq)\n"
+  "  --p-unaligned-file <0..1>  --p-unaligned-mem <0..1>\n"
+  "  --rw-switch-prob <0..1>\n"
+  "  --meta-open N --meta-stat N --meta-seek N --meta-sync N\n"
+  "  --seed N\n",
+  p);
+}
+
+/* Choose offset based on seq/consec/random and alignment knobs.
+ * last_end is updated by the caller after the I/O is issued.
+ */
+static MPI_Offset choose_offset_c(
+    int is_write, int is_seq, int is_consec,
+    long long last_end, long long max_off,
+    long long file_size, long long xfer,
+    double p_rand, double p_file_ua)
+{
+  (void)is_write; // same logic for R/W positioning here
+  long long off;
+
+  if (p_rand > 0.0 && frand01() < p_rand) {
+    off = (long long)(frand01() * (double)(max_off > 0 ? max_off : 0));
+  } else if (is_seq) {
+    if (is_consec) {
+      off = last_end;
+    } else {
+      // ensure strictly higher offset than previous end: skip at least one xfer to avoid "consecutive"
+      off = last_end + xfer + xfer;
+    }
+    if (max_off > 0) {
+      if (off > max_off) off = off % (max_off + 1);
+    } else {
+      off = 0;
+    }
   } else {
-    snprintf(path, sizeof(path), "%s", out_path);
+    off = (long long)(frand01() * (double)(max_off > 0 ? max_off : 0));
   }
 
-  // Open file
+  // file alignment or slight unalignment (+1)
+  if (frand01() < p_file_ua) {
+    if (off + xfer + 1 <= file_size) off += 1;
+  } else {
+    // align to 4K
+    const long long A = 4096LL;
+    if (off > 0) off = (off / A) * A;
+    if (off + xfer > file_size) {
+      off = (file_size > xfer) ? (file_size - xfer) : 0;
+      if (off > 0) off = (off / A) * A;
+    }
+  }
+  if (off < 0) off = 0;
+  if (off + xfer > file_size && file_size >= xfer) off = file_size - xfer;
+  return (MPI_Offset)off;
+}
+
+int main(int argc, char **argv){
+  MPI_Init(&argc, &argv);
+  int rank, nproc;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  MPI_Comm_size(MPI_COMM_WORLD, &nproc);
+
+  cfg_t C;
+  memset(&C, 0, sizeof(C));
+  C.shared_layout = 1;
+  C.xfer = 64*1024;
+  C.total_bytes = 0;
+  C.p_write = 0.0;
+  C.p_rand = 0.0;
+  C.p_seq_read = C.p_seq_write = 1.0;
+  C.p_consec_read = C.p_consec_write = 1.0;
+  C.p_file_ua = 0.0; C.p_mem_ua = 0.0;
+  C.rw_switch_prob = 0.0;
+  C.seed = 1;
+
+  static struct option opts[] = {
+    {"layout", required_argument, 0, 1},
+    {"o", required_argument, 0, 'o'},
+    {"t", required_argument, 0, 't'},
+    {"B", required_argument, 0, 'B'},
+    {"p-write", required_argument, 0, 2},
+    {"p-rand", required_argument, 0, 3},
+    {"p-seq-read", required_argument, 0, 4},
+    {"p-seq-write", required_argument, 0, 5},
+    {"p-consec-read", required_argument, 0, 6},
+    {"p-consec-write", required_argument, 0, 7},
+    {"p-unaligned-file", required_argument, 0, 8},
+    {"p-unaligned-mem", required_argument, 0, 9},
+    {"rw-switch-prob", required_argument, 0, 10},
+    {"meta-open", required_argument, 0, 11},
+    {"meta-stat", required_argument, 0, 12},
+    {"meta-seek", required_argument, 0, 13},
+    {"meta-sync", required_argument, 0, 14},
+    {"seed", required_argument, 0, 15},
+    {0,0,0,0}
+  };
+
+  int c, idx = 0;
+  while ((c = getopt_long(argc, argv, "o:t:B:", opts, &idx)) != -1){
+    switch (c){
+      case 'o': strncpy(C.path, optarg, sizeof(C.path)-1); break;
+      case 't': C.xfer = atoll(optarg); break;
+      case 'B': C.total_bytes = atoll(optarg); break;
+      case 1:   /* --layout */ if (!strcmp(optarg,"shared")) C.shared_layout=1; else C.shared_layout=1; break;
+      case 2:   C.p_write = atof(optarg); break;
+      case 3:   C.p_rand  = atof(optarg); break;
+      case 4:   C.p_seq_read = atof(optarg); break;
+      case 5:   C.p_seq_write= atof(optarg); break;
+      case 6:   C.p_consec_read = atof(optarg); break;
+      case 7:   C.p_consec_write= atof(optarg); break;
+      case 8:   C.p_file_ua = atof(optarg); break;
+      case 9:   C.p_mem_ua  = atof(optarg); break;
+      case 10:  C.rw_switch_prob = atof(optarg); break;
+      case 11:  C.meta_open = atol(optarg); break;
+      case 12:  C.meta_stat = atol(optarg); break;
+      case 13:  C.meta_seek = atol(optarg); break;
+      case 14:  C.meta_sync = atol(optarg); break;
+      case 15:  C.seed = (unsigned)atoi(optarg); break;
+      default: if (rank==0) usage(argv[0]); MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+  }
+
+  if (C.path[0] == '\0' || C.xfer <= 0 || C.total_bytes <= 0){
+    if (rank==0) usage(argv[0]);
+    MPI_Abort(MPI_COMM_WORLD, 1);
+  }
+
+  if (C.p_write < 0) { C.p_write = 0; }
+  if (C.p_write > 1) { C.p_write = 1; }
+  if (C.p_rand  < 0) { C.p_rand  = 0; }
+  if (C.p_rand  > 1) { C.p_rand  = 1; }
+  if (C.p_file_ua < 0) { C.p_file_ua = 0; }
+  if (C.p_file_ua > 1) { C.p_file_ua = 1; }
+  if (C.p_mem_ua  < 0) { C.p_mem_ua  = 0; }
+  if (C.p_mem_ua  > 1) { C.p_mem_ua  = 1; }
+  if (C.rw_switch_prob < 0) { C.rw_switch_prob = 0; }
+  if (C.rw_switch_prob > 1) { C.rw_switch_prob = 1; }
+
+  if (C.p_consec_read > C.p_seq_read)   C.p_consec_read  = C.p_seq_read;
+  if (C.p_consec_write > C.p_seq_write) C.p_consec_write = C.p_seq_write;
+
+  srand(C.seed + rank);
+
+  // bytes -> ops
+  long long total_ops = C.total_bytes / C.xfer;
+  if (total_ops <= 0) total_ops = 1;
+
+  long long write_ops = (long long) llround((double)total_ops * C.p_write);
+  if (write_ops < 0) write_ops = 0;
+  if (write_ops > total_ops) write_ops = total_ops;
+
+  // Metadata ops per rank (even spread)
+  long o_open = C.meta_open / nproc + ((rank < (C.meta_open % nproc)) ? 1:0);
+  long o_stat = C.meta_stat / nproc + ((rank < (C.meta_stat % nproc)) ? 1:0);
+  long o_seek = C.meta_seek / nproc + ((rank < (C.meta_seek % nproc)) ? 1:0);
+  long o_sync = C.meta_sync / nproc + ((rank < (C.meta_sync % nproc)) ? 1:0);
+
+  // open the target file once to perform metadata on it
   MPI_File fh;
-  int amode = MPI_MODE_CREATE | MPI_MODE_RDWR;
-  int rc = MPI_File_open(MPI_COMM_WORLD, path, amode, MPI_INFO_NULL, &fh);
-  // 1) after MPI_File_open(...)
-  if (rc != MPI_SUCCESS) {
-    int rnk=0; MPI_Comm_rank(MPI_COMM_WORLD, &rnk);
-    fprintf(stderr, "[rank %d] MPI_File_open failed for %s\n", rnk, path);
-    die_mpi(rc, "MPI_File_open");
-  }
-
-  // Allocate buffer (page-align base)
-  size_t alloc = (size_t)(tsize + 4096);
-  unsigned char *raw = (unsigned char*)malloc(alloc);
-  if (!raw) {
-    if (rank==0) fprintf(stderr, "malloc failed\n");
+  int mrc = MPI_File_open(MPI_COMM_WORLD, C.path, MPI_MODE_RDWR, MPI_INFO_NULL, &fh);
+  if (mrc != MPI_SUCCESS){
+    if (rank==0) fprintf(stderr, "MPI_File_open failed for %s\n", C.path);
     MPI_Abort(MPI_COMM_WORLD, 2);
   }
-  uintptr_t p = (uintptr_t)raw;
-  uintptr_t aligned = (p + 4095) & ~((uintptr_t)4095);
-  unsigned char *buf0 = (unsigned char*)aligned;
 
-  // RNG seed
-  unsigned seed = 777u ^ (unsigned)(rank * 2654435761u);
-
-  // Track last-end offsets for read/write separately
-  long long last_end_r = 0; // previous read end offset
-  long long last_end_w = 0; // previous write end offset
-
-  // Initialize starting op type by p_write
-  int is_write = (urand(&seed) < p_write) ? 1 : 0;
-
-  for (long long op = 0; op < nops; ++op) {
-    // Markov switch for R/W
-    if (urand(&seed) < rw_switch_prob) {
-      is_write = !is_write;
-    } else {
-      // otherwise keep current is_write
-    }
-
-    // For the chosen op type, decide sequential vs non-seq, and consecutive (subset)
-    int do_seq = 0, do_consec = 0;
-    if (is_write) {
-      do_seq = (urand(&seed) < p_seq_write);
-      if (do_seq) {
-        do_consec = (urand(&seed) < pc_w_given_seq);
-      }
-    } else {
-      do_seq = (urand(&seed) < p_seq_read);
-      if (do_seq) {
-        do_consec = (urand(&seed) < pc_r_given_seq);
-      }
-    }
-
-    // Choose file offset
-    long long off = 0;
-    if (do_seq) {
-      if (is_write) {
-        if (do_consec) {
-          off = last_end_w;              // consecutive write
-        } else {
-          off = last_end_w + tsize;      // sequential (gap > 0)
-        }
-      } else {
-        if (do_consec) {
-          off = last_end_r;              // consecutive read
-        } else {
-          off = last_end_r + tsize;      // sequential (gap > 0)
-        }
-      }
-    } else {
-      // Non-sequential: choose a random chunk within [0, nops)
-      long long idx = (long long)(urand(&seed) * (double)nops);
-      if (idx >= nops) idx = nops - 1;
-      if (idx < 0) idx = 0;
-      off = idx * tsize;
-    }
-
-    // Apply file alignment/misalignment
-    if (urand(&seed) < p_unaligned_file) {
-      long long mis = (alignQ > 1) ? ((op % (alignQ)) ? (op % alignQ) : 1) : 1;
-      off += mis; // break alignment
-    } else {
-      if (alignQ > 0) off = (off / alignQ) * alignQ; // align down
-    }
-
-    // Memory misalignment
-    unsigned char* buf = buf0;
-    if (urand(&seed) < p_unaligned_mem) {
-      buf = buf0 + 4; // typical small misalignment
-    }
-
-    // Perform IO
-    MPI_Offset moff = (MPI_Offset)off;
-    int rc2;
-    if (is_write) {
-      rc2 = MPI_File_write_at(fh, moff, buf, (int)tsize, MPI_BYTE, MPI_STATUS_IGNORE);
-      // 2) after MPI_File_write_at(...) (the write branch)
-      if (rc2 != MPI_SUCCESS) {
-        int rnk=0; MPI_Comm_rank(MPI_COMM_WORLD, &rnk);
-        fprintf(stderr, "[rank %d] write_at failed at op=%lld off=%lld t=%lld path=%s\n",
-                rnk, op, (long long)off, (long long)tsize, path);
-        die_mpi(rc2, "MPI_File_write_at");
-      }
-      last_end_w = off + tsize;
-    } else {
-      rc2 = MPI_File_read_at(fh, moff, buf, (int)tsize, MPI_BYTE, MPI_STATUS_IGNORE);
-      // 3) after MPI_File_read_at(...) (the read branch)
-      if (rc2 != MPI_SUCCESS) {
-        int rnk=0; MPI_Comm_rank(MPI_COMM_WORLD, &rnk);
-        fprintf(stderr, "[rank %d] read_at failed at op=%lld off=%lld t=%lld path=%s\n",
-                rnk, op, (long long)off, (long long)tsize, path);
-        die_mpi(rc2, "MPI_File_read_at");
-      }
-      last_end_r = off + tsize;
-    }
-
-    if (think_us > 0) {
-      usleep((useconds_t)think_us);
-    }
+  // stat (get size)
+  for (long i=0;i<o_stat;i++){
+    MPI_Offset sz=0;
+    MPI_File_get_size(fh, &sz);
+    (void)sz;
   }
-
-  // 4) after MPI_File_sync(...)
-  rc = MPI_File_sync(fh);
-  if (rc != MPI_SUCCESS) {
-    int rnk=0; MPI_Comm_rank(MPI_COMM_WORLD, &rnk);
-    fprintf(stderr, "[rank %d] MPI_File_sync failed for %s\n", rnk, path);
-    die_mpi(rc, "MPI_File_sync");
+  // seeks
+  for (long i=0;i<o_seek;i++){
+    MPI_Offset off = (MPI_Offset)((frand01()) * (double)((C.total_bytes > C.xfer) ? (C.total_bytes - C.xfer) : 0));
+    MPI_File_seek(fh, off, MPI_SEEK_SET);
+  }
+  // syncs
+  for (long i=0;i<o_sync;i++){
+    MPI_File_sync(fh);
   }
   MPI_File_close(&fh);
-  free(raw);
 
+  // perform open/close metadata ops (on same file) without creating new files
+  for (long i=0;i<o_open;i++){
+    MPI_File tmp;
+    int rc = MPI_File_open(MPI_COMM_WORLD, C.path, MPI_MODE_RDWR, MPI_INFO_NULL, &tmp);
+    if (rc==MPI_SUCCESS) MPI_File_close(&tmp);
+  }
+
+  // reopen for data IO
+  int rc = MPI_File_open(MPI_COMM_WORLD, C.path, MPI_MODE_RDWR, MPI_INFO_NULL, &fh);
+  if (rc != MPI_SUCCESS){
+    if (rank==0) fprintf(stderr, "MPI_File_open failed for %s\n", C.path);
+    MPI_Abort(MPI_COMM_WORLD, 2);
+  }
+
+  // buffer (aligned)
+  void *buf_base = NULL;
+  if (posix_memalign(&buf_base, 4096, (size_t)C.xfer) != 0){
+    if (rank==0) fprintf(stderr, "posix_memalign failed\n");
+    MPI_Abort(MPI_COMM_WORLD, 3);
+  }
+  unsigned char *buf = (unsigned char*)buf_base;
+
+  const long long file_size = C.total_bytes; // logical region
+  const long long max_off   = (file_size > C.xfer) ? (file_size - C.xfer) : 0;
+
+  // last end offsets per type (for seq/consec semantics)
+  long long r_last_end = 0;
+  long long w_last_end = 0;
+
+  // start mode
+  int cur_is_write = (frand01() < C.p_write);
+
+  for (long long k=0; k<total_ops; k++){
+    if (frand01() < C.rw_switch_prob) cur_is_write = !cur_is_write;
+
+    int do_seq = cur_is_write ? (frand01() < C.p_seq_write) : (frand01() < C.p_seq_read);
+    int do_con = cur_is_write ? (frand01() < C.p_consec_write) : (frand01() < C.p_consec_read);
+    if (do_con && !do_seq) do_seq = 1; // consec implies sequential
+
+    // memory alignment
+    unsigned char *ptr = buf;
+    if (frand01() < C.p_mem_ua) ptr = buf + 1;
+
+    long long last_end = cur_is_write ? w_last_end : r_last_end;
+    MPI_Offset off = choose_offset_c(
+      cur_is_write, do_seq, do_con, last_end,
+      max_off, file_size, C.xfer, C.p_rand, C.p_file_ua
+    );
+
+    MPI_Status st;
+    int err;
+    if (cur_is_write){
+      err = MPI_File_write_at(fh, off, ptr, (int)C.xfer, MPI_BYTE, &st);
+      w_last_end = (long long)off + C.xfer;
+    } else {
+      err = MPI_File_read_at(fh, off, ptr, (int)C.xfer, MPI_BYTE, &st);
+      r_last_end = (long long)off + C.xfer;
+    }
+    if (err != MPI_SUCCESS){
+      if (rank==0) fprintf(stderr, "I/O failed at op=%lld\n", k);
+      MPI_Abort(MPI_COMM_WORLD, 3);
+    }
+  }
+
+  MPI_File_close(&fh);
+  free(buf_base);
   MPI_Barrier(MPI_COMM_WORLD);
   MPI_Finalize();
   return 0;

@@ -1,6 +1,6 @@
-Prep script: /mnt/hasanfs/synth_from_features/run_prep.sh  (NO Darshan)
-Run script : /mnt/hasanfs/synth_from_features/run_from_features.sh   (Darshan enabled via LD_PRELOAD)
-Data bytes target: 11.52 GiB
-IOR subjobs: 4; est IOR ops: 94440
+Mode: sequential prep; random read runs are independent
+Total bytes target (all ranks): 64.00 GiB
+IOR read subjobs: 4; per-job bytes ≈ 16.00 GiB
 Targets: fileUA=0.600, memUA=0.400, rwSwitch=0.000, seqR=0.500, seqW=1.000, consecR=0.500, consecW=0.000
-Chosen O_h=141660 → q_file=1.000, q_mem=0.667, q_rws=0.000, q_seq_r=0.500, q_seq_w=1.000, q_con_r=0.500, q_con_w=0.000
+HARNESS ops/rank=131072, switches/rank=0
+Meta (global): open=225444, stat=36700, seek=94372, sync=73400
