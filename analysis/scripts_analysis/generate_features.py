@@ -17,7 +17,7 @@ import pandas as pd
 import numpy as np
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────────
-root_dir     = "/mnt/hasanfs/repos/io_synthesizer/analysis/outputs"
+root_dir     = "/mnt/hasanfs/io_synthesizer/analysis/outputs_analysis"
 input_csv    = os.path.join(root_dir, "darshan_summary.csv")
 filtered_csv = os.path.join(root_dir, "darshan_summary_filtered.csv")
 output_json  = os.path.join(root_dir, "darshan_features_updated.json")

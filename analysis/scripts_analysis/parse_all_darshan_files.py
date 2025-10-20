@@ -1,8 +1,8 @@
 import os
 import subprocess
 
-root_dir = "/mnt/hasanfs/repos/io_synthesizer/analysis"
-log_file_path = os.path.join(root_dir, "outputs", "darshan_files_parse_log.txt")
+root_dir = "/mnt/hasanfs/io_synthesizer/analysis"
+log_file_path = os.path.join(root_dir, "outputs_analysis", "darshan_files_parse_log.txt")
 
 total_count = 0
 log_lines = []
