@@ -1,13 +1,32 @@
 /* mpi_synthio.c
- * Harness: deterministic Consec→SeqRemainder→Random per phase,
- *          with L→M→S order encoded by the planner via phase ordering.
  *
- * MPI-enabled so Darshan logs the job:
- *   - MPI_Init/MPI_Finalize present
- *   - Rank policy: only rank 0 replays I/O; others idle at barriers
+ * Harness: deterministic Consec → SeqRemainder → Random per phase,
+ *          with L→M→S order coming from the planner's CSV ordering.
+ *
+ * Goals this file enforces:
+ *   - Treat as an MPI job so Darshan records MPI context.
+ *   - DATA phases:
+ *       * Use pread()/pwrite() (NO lseek) so meta seeks are confined to META phase.
+ *       * Respect p_ua_file for large ops (>= 1 MiB) across BOTH consec and random
+ *         by choosing the requested fraction of aligned starts.
+ *       * Consecutive first (exactly adjacent), then seq remainder with gap = xfer,
+ *         then random (descending 32 MiB chunks; round-robin).
+ *       * Offsets always sampled from [0, file_size - xfer].
+ *   - META phase:
+ *       * open/stat/seek/sync counts come from CSV.
  *
  * Build:
  *   mpicc -O3 -Wall -Wextra -o mpi_synthio mpi_synthio.c -lm
+ *
+ * Run:
+ *   mpiexec -n <N> ./mpi_synthio --plan payload/plan.csv \
+ *           --io-api posix --meta-api posix --collective none
+ *
+ * Notes:
+ *   - Only rank 0 replays the plan; other ranks idle at barriers so Darshan
+ *     includes them in the job record cleanly.
+ *   - The planner controls phase ordering to realize L→M→S and the desired
+ *     seq/consec/random shares. We consume those proportions literally.
  */
 
 #define _GNU_SOURCE
@@ -34,7 +53,7 @@
 #define MEM_ALIGN 8
 #endif
 
-#define MAX_LINE 2048
+#define MAX_LINE  4096
 #define CHUNK_RANDOM (32*1024*1024)
 
 typedef enum { API_POSIX=0, API_MPIIO=1 } io_api_t;
@@ -59,19 +78,14 @@ typedef struct {
     uint32_t seed;
     char   flags[64];  /* "consec"|"seq"|"random"|"meta_only"|... */
     double p_rand_fwd_r, p_rand_fwd_w, p_consec_internal;
-    int    pre_seek_eof; /* 0/1 (optional column) */
+    int    pre_seek_eof; /* 0/1 (optional) */
 } phase_t;
 
 static int startswith(const char*s,const char*p){ return strncmp(s,p,strlen(p))==0; }
 
+/* Parse a CSV line that may contain the optional pre_seek_eof column. */
 static int parse_line(const char* line, phase_t* ph)
 {
-    /* CSV with optional trailing column pre_seek_eof
-       Columns:
-       type,path,total_bytes,xfer,p_write,p_rand,p_seq_r,p_consec_r,p_seq_w,p_consec_w,
-       p_ua_file,p_ua_mem,rw_switch,meta_open,meta_stat,meta_seek,meta_sync,seed,flags,
-       p_rand_fwd_r,p_rand_fwd_w,p_consec_internal,pre_seek_eof
-    */
     char buf[MAX_LINE];
     strncpy(buf,line,MAX_LINE-1); buf[MAX_LINE-1]=0;
 
@@ -134,19 +148,20 @@ static off_t clamp_range(off_t start, off_t file_size, uint64_t xfer)
     return start;
 }
 
-static ssize_t do_rw(int fd2, void* buf2, size_t len, int wr)
+static ssize_t do_prw(int fd2, void* buf2, size_t len, off_t off, int wr)
 {
     size_t left = len;
     while(left>0){
-        ssize_t rc = wr ? write(fd2, buf2, left) : read(fd2, buf2, left);
+        ssize_t rc = wr ? pwrite(fd2, buf2, left, off) : pread(fd2, buf2, left, off);
         if(rc<0){ return rc; }
         buf2 = (void*)((uintptr_t)buf2 + (size_t)rc);
+        off  += (off_t)rc;
         left -= (size_t)rc;
     }
     return (ssize_t)len;
 }
 
-static void do_posix_data(const phase_t* p)
+static void do_posix_data(const phase_t* p, int phase_idx)
 {
     int fd = open(p->path, p->p_write>0.0 ? O_RDWR|O_CREAT : O_RDONLY, 0644);
     if(fd<0){ perror("open"); return; }
@@ -160,7 +175,7 @@ static void do_posix_data(const phase_t* p)
     uint64_t Nops = p->total_bytes / p->xfer;
     int is_write = (p->p_write > 0.5);
 
-    /* counts encoded via p_*  */
+    /* Counts encoded via p_*  */
     uint64_t N_con = (uint64_t)llround((double)Nops * p->p_consec_r);
     uint64_t N_seq = 0;
     if(p->p_seq_r > p->p_consec_r) {
@@ -172,54 +187,55 @@ static void do_posix_data(const phase_t* p)
     }
     uint64_t N_rnd = Nops - N_con - N_seq;
 
-    /* how many large ops to align (xfer >= 1MiB)? */
-    uint64_t N_align = 0;
-    if(p->xfer >= LUSTRE_FILE_ALIGN){
-        double frac_unaligned = p->p_ua_file;
-        double frac_aligned   = 1.0 - frac_unaligned;
+    /* Large-op alignment control (applies to xfer >= 1 MiB) */
+    int large = (p->xfer >= LUSTRE_FILE_ALIGN) ? 1 : 0;
+    uint64_t N_align_total = 0;
+    if(large){
+        /* p_ua_file = fraction UNALIGNED → aligned fraction = 1 - p_ua_file */
+        double frac_aligned = 1.0 - p->p_ua_file;
         if(frac_aligned < 0) frac_aligned=0;
         if(frac_aligned > 1) frac_aligned=1;
-        N_align = (uint64_t)llround(frac_aligned * (double)Nops);
+        N_align_total = (uint64_t)llround(frac_aligned * (double)Nops);
     }
+    uint64_t align_left = N_align_total;
 
     /* Buffer & (mis)alignment */
+    /* (same policy as before: one draw per phase to match your earlier behavior) */
     int want_mis_mem = ((double)rand()/RAND_MAX) < p->p_ua_mem ? 1:0;
     buf_t b = alloc_buffer((size_t)p->xfer, want_mis_mem);
     if(!b.base){ perror("alloc_buffer"); close(fd); return; }
 
     /* ----- Consecutive ----- */
     off_t cur = 0;
-    uint64_t align_left = N_align;
     for(uint64_t i=0;i<N_con;i++){
-        off_t start;
-        if(align_left>0 && p->xfer >= LUSTRE_FILE_ALIGN){
-            start = (cur + (LUSTRE_FILE_ALIGN-1)) & ~(LUSTRE_FILE_ALIGN-1);
+        off_t start = cur;
+        if(large && align_left>0){
+            /* snap to alignment */
+            start = (start + (LUSTRE_FILE_ALIGN-1)) & ~(LUSTRE_FILE_ALIGN-1);
             align_left--;
-        } else {
-            start = cur;
         }
         start = clamp_range(start, fsz, p->xfer);
-        if(lseek(fd, start, SEEK_SET) < 0){ perror("lseek"); break; }
-        if(do_rw(fd, b.ptr, (size_t)p->xfer, is_write)<0){
-            perror(is_write?"write":"read"); break;
+        if(do_prw(fd, b.ptr, (size_t)p->xfer, start, is_write)<0){
+            perror(is_write?"pwrite":"pread"); break;
         }
         cur = start + (off_t)p->xfer; /* exactly adjacent */
     }
 
     /* ----- Sequential remainder (gap = xfer) ----- */
     for(uint64_t i=0;i<N_seq;i++){
-        off_t start = cur + (off_t)p->xfer; /* seq-but-not-consec */
+        off_t start = cur + (off_t)p->xfer; /* seq-but-not-consec with fixed gap */
+        /* (No extra alignment pressure here; leave it as natural) */
         start = clamp_range(start, fsz, p->xfer);
-        if(lseek(fd, start, SEEK_SET) < 0){ perror("lseek"); break; }
-        if(do_rw(fd, b.ptr, (size_t)p->xfer, is_write)<0){
-            perror(is_write?"write":"read"); break;
+        if(do_prw(fd, b.ptr, (size_t)p->xfer, start, is_write)<0){
+            perror(is_write?"pwrite":"pread"); break;
         }
         cur = start + (off_t)p->xfer;
     }
 
-    /* ----- Random (descending 32MiB chunks) ----- */
+    /* ----- Random (descending 32MiB chunks; pre-seek-eof honored as a fence only) ----- */
+    /* If requested, do a single seek to EOF (doesn't affect subsequent pread/pwrite positions). */
     if(N_rnd>0 && p->pre_seek_eof){
-        if(lseek(fd, fsz, SEEK_SET) < 0){ perror("lseek pre-seek-eof"); }
+        (void)lseek(fd, fsz, SEEK_SET);
     }
     uint64_t nchunks = (fsz>0) ? ( (fsz + CHUNK_RANDOM - 1) / CHUNK_RANDOM ) : 1;
     uint64_t cidx = (nchunks>0? nchunks-1 : 0);
@@ -234,27 +250,48 @@ static void do_posix_data(const phase_t* p)
             span = chunk_end - chunk_start;
             if(span < (off_t)p->xfer) { break; }
         }
+
         off_t start = chunk_start;
         if(span > (off_t)p->xfer){
             uint64_t r = (uint64_t)rand();
             off_t delta = (off_t)(r % (uint64_t)(span - (off_t)p->xfer + 1));
             start = chunk_start + delta;
         }
-        start = clamp_range(start, fsz, p->xfer);
-        if(lseek(fd, start, SEEK_SET) < 0){ perror("lseek random"); break; }
-        if(do_rw(fd, b.ptr, (size_t)p->xfer, is_write)<0){
-            perror(is_write?"write":"read"); break;
+
+        /* Enforce aligned vs unaligned mix for LARGE random ops */
+        if(large && align_left>0){
+            off_t aligned = start & ~(off_t)(LUSTRE_FILE_ALIGN-1);
+            if(aligned < chunk_start) aligned = chunk_start;
+            /* if aligned window too small, snap up within chunk */
+            if(aligned + (off_t)p->xfer <= chunk_end){
+                start = aligned;
+                align_left--;
+            }
         }
+
+        start = clamp_range(start, fsz, p->xfer);
+        if(do_prw(fd, b.ptr, (size_t)p->xfer, start, is_write)<0){
+            perror(is_write?"pwrite":"pread"); break;
+        }
+
         if(cidx>0) cidx--; else cidx = nchunks-1; /* round-robin descending */
     }
+
+    /* Phase summary */
+    fprintf(stderr,
+            "phase %d done: path=%s xfer=%" PRIu64 "B ops=%" PRIu64
+            " (consec=%" PRIu64 ", seq=%" PRIu64 ", rand=%" PRIu64 ") %s\n",
+            phase_idx, p->path, p->xfer, Nops, N_con, N_seq, N_rnd,
+            is_write ? "[WRITE]" : "[READ]");
+    fflush(stderr);
 
     free(b.base);
     close(fd);
 }
 
-static void do_posix_meta(const phase_t* p)
+static void do_posix_meta(const phase_t* p, int phase_idx)
 {
-    /* Simple synthetic meta ops */
+    /* META ops confined here so meta shares match planner expectations. */
     for(uint64_t i=0;i<p->meta_open;i++){
         int fd = open(p->path, O_RDONLY|O_CREAT, 0644);
         if(fd>=0) close(fd);
@@ -273,6 +310,12 @@ static void do_posix_meta(const phase_t* p)
         }
         close(fd);
     }
+
+    fprintf(stderr,
+            "phase %d done [META]: path=%s open=%" PRIu64 " stat=%" PRIu64
+            " seek=%" PRIu64 " sync=%" PRIu64 "\n",
+            phase_idx, p->path, p->meta_open, p->meta_stat, p->meta_seek, p->meta_sync);
+    fflush(stderr);
 }
 
 static void run_plan(FILE* fp)
@@ -284,13 +327,14 @@ static void run_plan(FILE* fp)
         if(parse_line(line,&p)) continue; /* header/empty */
         srand(p.seed);
         if(strcmp(p.type,"data")==0){
-            do_posix_data(&p);
+            do_posix_data(&p, (int)(nph+1));
         } else if(strcmp(p.type,"meta")==0){
-            do_posix_meta(&p);
+            do_posix_meta(&p, (int)(nph+1));
         }
         nph++;
     }
     fprintf(stderr,"Loaded %zu phases\n", nph);
+    fflush(stderr);
 }
 
 int main(int argc, char** argv)
@@ -312,9 +356,9 @@ int main(int argc, char** argv)
         } else if(!strcmp(argv[i],"--io-api") && i+1<argc){
             const char* v=argv[++i];
             if(!strcmp(v,"posix")) ioapi=API_POSIX;
-            else if(!strcmp(v,"mpiio")) ioapi=API_MPIIO;
+            else if(!strcmp(v,"mpiio")) ioapi=API_MPIIO; /* reserved */
         } else if(!strcmp(argv[i],"--meta-api") && i+1<argc){
-            (void)argv[++i]; /* only posix supported for meta now */
+            (void)argv[++i]; /* only posix used for meta */
             metapi=META_POSIX;
         } else if(!strcmp(argv[i],"--collective") && i+1<argc){
             const char* v=argv[++i];
@@ -342,11 +386,10 @@ int main(int argc, char** argv)
         fclose(fp);
     }
 
-    /* All ranks sync so Darshan can include everyone. */
+    /* All ranks sync so Darshan includes everyone. */
     MPI_Barrier(MPI_COMM_WORLD);
 
-    /* Silence “set but not used” if not exercising MPI-IO paths yet. */
-    (void)ioapi; (void)metapi; (void)cm;
+    (void)ioapi; (void)metapi; (void)cm; /* silence if not used yet */
 
     MPI_Finalize();
     return 0;
