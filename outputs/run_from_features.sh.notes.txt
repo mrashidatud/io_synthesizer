@@ -1,26 +1,123 @@
-=== Feature → Execution Mapping (OPS-first, uniform across files, single run) ===
-  cap_total_gib=512.00  pct_io_access=0.18  → IO bytes=92.16 GiB
-  Read ops=1473  |  Write ops=368
-  Read bin ops: S=736, M=0, L=737
-  Chosen xfer sizes: S=100.00 KiB, M=1.00 MiB, L=128.00 MiB, W=8B
+=== INPUT FEATURES (verbatim) ===
+  cap_total_gib: 512
+  cluster: 101
+  filename: 2025/4/22/4290323-7098400058022960405.txt
+  io_api: posix
+  jobid: 4290323
+  meta_api: posix
+  mpi_collective_mode: none
+  nprocs: 1
+  pct_byte_reads: 1.0
+  pct_byte_writes: 0.0
+  pct_bytes_read_only_files: 1.0
+  pct_bytes_read_write_files: 0.0
+  pct_bytes_shared_files: 1.0
+  pct_bytes_unique_files: 0.0
+  pct_bytes_write_only_files: 0.0
+  pct_consec_reads: 0.5
+  pct_consec_writes: 0.0
+  pct_file_not_aligned: 0.6
+  pct_io_access: 0.18
+  pct_mem_not_aligned: 0.4
+  pct_meta_open_access: 0.43
+  pct_meta_seek_access: 0.18
+  pct_meta_stat_access: 0.07
+  pct_meta_sync_access: 0.14
+  pct_read_0_100K: 0.5
+  pct_read_100K_10M: 0.0
+  pct_read_10M_1G_PLUS: 0.5
+  pct_read_only_files: 0.67
+  pct_read_write_files: 0.0
+  pct_reads: 0.8
+  pct_rw_switches: 0.0
+  pct_seq_reads: 0.5
+  pct_seq_writes: 1.0
+  pct_shared_files: 1.0
+  pct_unique_files: 0.0
+  pct_write_0_100K: 1.0
+  pct_write_100K_10M: 0.0
+  pct_write_10M_1G_PLUS: 0.0
+  pct_write_only_files: 0.33
+  pct_writes: 0.2
+  use_mdtest: False
 
-=== Seq/Consec ===
-  Reads: consec=0.500, seq=0.500 (consec⊂seq rule enforced)
-  Writes: consec=0.000, seq=1.000
+=== PLANNER OVERVIEW ===
+  Mode: OPS-first; S/M fixed ladders; L fixed at 16 MiB
+  Bins:
+    S_SUBS=[100, 1024, 4096, 65536]  M_SUBS=[262144, 1048576, 4194304]  L_SIZE=16777216
+  Phase split inside each (file,bin,sub-size,intent): Consec ⊂ Seq; remainder Random
+  Random placement: descending 32 MiB chunk RR; pre_seek_eof=1 for random phases
+  Rebalancer: in-bin only; auto up/down; strict per-file RR; presence floors; preserves op counts and L size
+  RW-switches: pct_rw_switches defines fraction of eligible RW alternations interleaved on RW files
+  Shared vs Unique: file counts from pct_shared_files/pct_unique_files; byte targets from pct_bytes_* (enforced via flags)
 
-=== Alignment ===
-  Target file_unaligned=0.60, mem_unaligned=0.40
-  Large-op aligned fraction≈0.799 (small/medium always unaligned)
-  SITE ALIGNMENT: FILE=1MiB, MEM=8
+=== CAPACITY → BYTES & INTENT TARGETS ===
+  cap_total_gib=512.00 → IO bytes target=512.00 GiB
+  intent bytes target: read=1.00 write=0.00
+  actual after rebalance: read=512.00 GiB write=1.63 MiB
 
-=== Files (uniform distribution) ===
-  RO=2  RW=0  WO=1
-  RO path: /mnt/hasanfs/out_synth/payload/data/ro/ro_shared_0.dat
-  RO path: /mnt/hasanfs/out_synth/payload/data/ro/ro_shared_1.dat
-  WO path: /mnt/hasanfs/out_synth/payload/data/wo/wo_shared_0.dat
+=== ROLE & SHARED/UNIQUE BYTE TARGETS ===
+  role byte targets (fractions):
+    RO=1.0  RW=0.0  WO=0.0
+  actual bytes after rebalance:
+    RO=512.00 GiB  RW=0.00 B  WO=1.63 MiB
+  shared/unique byte targets (fractions):
+    shared=1.0  unique=0.0
+  actual bytes after rebalance:
+    shared=256.40 GiB  unique=255.60 GiB
 
-=== Meta Ops (derived for pct_io_access) ===
-  open=4398, stat=716, seek=1841, sync=1432  (total=8387, io_ops=1841)
+=== FILE LAYOUT & TRUNCATE SIZES ===
+  RO=2  RW=0  WO=1 | shared_files≈1 unique_files≈2
+    RO [shared] /mnt/hasanfs/out_synth/payload/data/ro/ro_0.dat -> truncate 128.21 GiB
+    RO [unique] /mnt/hasanfs/out_synth/payload/data/ro/ro_1.dat -> truncate 127.80 GiB
+    WO [unique] /mnt/hasanfs/out_synth/payload/data/wo/wo_0.dat -> truncate 3.26 MiB
 
-=== Command ===
-  mpiexec -n 1 -genv LD_PRELOAD /mnt/hasanfs/darshan-3.4.7/darshan-runtime/install/lib/libdarshan.so /mnt/hasanfs/bin/mpi_synthio --plan /mnt/hasanfs/out_synth/payload/plan.csv --io-api posix --meta-api posix --collective none
+=== OPS BUDGET (BEFORE META) ===
+  Nio=81791  |  Nr=65433  |  Nw=16358
+  Per-intent per-bin ops:
+    read: S=32716 M=0 L=32717
+    write: S=16358 M=0 L=0
+
+=== ALIGNMENT TARGETING (FILE vs Darshan File-Alignment) ===
+  Requested pct_file_not_aligned=0.60
+  fs_align_bytes=1048576  (mem_align_bytes=8)
+  Intrinsic file-unaligned ops (xfer % fs_align != 0): 49074 of 81791  (floor=0.6000)
+  Eligible ops (xfer % fs_align == 0): 32717
+  Allocated extra unaligned ops on eligible sizes: ~1
+  Predicted overall file-unaligned fraction: ~0.6000
+
+=== PER-FILE SUB-SIZE OPS & EFFECTIVE p_ua_file (after rebalance) ===
+  FILE: /mnt/hasanfs/out_synth/payload/data/ro/ro_0.dat
+    bin=L xfer=16777216 elig=Y -> read_ops=16359 write_ops=0 p_ua_file≈0.000
+    bin=S xfer=100 elig=N -> read_ops=1 write_ops=0 p_ua_file≈1.000
+    bin=S xfer=1024 elig=N -> read_ops=1 write_ops=0 p_ua_file≈1.000
+    bin=S xfer=4096 elig=N -> read_ops=3577 write_ops=0 p_ua_file≈1.000
+    bin=S xfer=65536 elig=N -> read_ops=12781 write_ops=0 p_ua_file≈1.000
+  FILE: /mnt/hasanfs/out_synth/payload/data/ro/ro_1.dat
+    bin=L xfer=16777216 elig=Y -> read_ops=16358 write_ops=0 p_ua_file≈0.000
+    bin=S xfer=100 elig=N -> read_ops=16352 write_ops=0 p_ua_file≈1.000
+    bin=S xfer=1024 elig=N -> read_ops=2 write_ops=0 p_ua_file≈1.000
+    bin=S xfer=4096 elig=N -> read_ops=1 write_ops=0 p_ua_file≈1.000
+    bin=S xfer=65536 elig=N -> read_ops=1 write_ops=0 p_ua_file≈1.000
+  FILE: /mnt/hasanfs/out_synth/payload/data/wo/wo_0.dat
+    bin=S xfer=100 elig=N -> read_ops=0 write_ops=16354 p_ua_file≈1.000
+    bin=S xfer=1024 elig=N -> read_ops=0 write_ops=2 p_ua_file≈1.000
+    bin=S xfer=4096 elig=N -> read_ops=0 write_ops=1 p_ua_file≈1.000
+    bin=S xfer=65536 elig=N -> read_ops=0 write_ops=1 p_ua_file≈1.000
+
+=== RW SWITCHES ===
+  pct_rw_switches=0.00 → interleave this fraction of eligible RW (file,bin,xfer) pairs in segments (≤64 ops)
+  Interleaving happens only on RW files; Darshan counts read↔write alternations on the same path.
+
+=== META OPS MAPPING ===
+  pct_io_access=0.18
+  meta_kind_count ≈ (pct_meta_kind_access / pct_io_access) * (Nr+Nw)
+  planned: open=195390, stat=31808, seek=81791, sync=63615
+  Data phases use pread/pwrite only; META-only phase performs POSIX open/stat/seek/sync.
+
+=== ASSUMPTIONS & INVARIANTS ===
+  • L bin size is fixed to 16 MiB and never changed by the rebalancer.
+  • Rebalancer operates within bins only and preserves op counts (adjusts xfer by moving ops across S/M sub-sizes).
+  • Presence floors: any (file,bin,sub-size) that existed pre-rebalance keeps ≥1 op (prevents 100 B from disappearing).
+  • Shared vs Unique is enacted by the harness (|shared| sharded over ranks; |unique| pinned to a single owner).
+  • Random phases set pre_seek_eof=1 to stress end-of-file behavior; offsets remain within [0, size-xfer].

@@ -3,17 +3,29 @@
  * Harness: deterministic Consec → SeqRemainder → Random per phase,
  *          with L→M→S order coming from the planner's CSV ordering.
  *
- * Goals this file enforces:
+ * What this harness enforces:
  *   - Treat as an MPI job so Darshan records MPI context.
  *   - DATA phases:
- *       * Use pread()/pwrite() (NO lseek) so meta seeks are confined to META phase.
- *       * Respect p_ua_file for large ops (>= 1 MiB) across BOTH consec and random
- *         by choosing the requested fraction of aligned starts.
- *       * Consecutive first (exactly adjacent), then seq remainder with gap = xfer,
- *         then random (descending 32 MiB chunks; round-robin).
- *       * Offsets always sampled from [0, file_size - xfer].
+ *       * Use pread()/pwrite() (NO lseek for data) so meta seeks are confined to META phase.
+ *       * Respect p_ua_file across ALL ops (>= 1 MiB) proportionally (consec/seq/random),
+ *         by selecting the requested fraction of aligned starts (aligned fraction = 1 - p_ua_file).
+ *       * Respect p_ua_mem per-op proportionally (buffer misalignment for a planned fraction).
+ *       * Consec: exactly adjacent; Seq remainder: gap=xfer; Random: descending 32MiB chunks
+ *         with round-robin among chunks; optional pre_seek_eof fence before random ops.
+ *       * Offsets always sampled within [0, file_size - xfer] (files are pre-truncated by the planner).
  *   - META phase:
- *       * open/stat/seek/sync counts come from CSV.
+ *       * open/stat/seek/sync counts come from CSV and are executed only in the META phase.
+ *
+ * Multi-rank “shared vs unique” support:
+ *   - If CSV flags contain "|shared|", ALL ranks shard that phase's operations equally
+ *     on the SAME path ⇒ Darshan records SHARED bytes.
+ *   - If CSV flags contain "|unique|", exactly ONE owner rank (stable hash of path) executes;
+ *     others skip ⇒ Darshan records UNIQUE bytes.
+ *   - If neither marker is present, legacy behavior: rank 0 executes the phase.
+ *
+ * RW switches:
+ *   - The planner interleaves read/write rows on the SAME RW path to create read↔write alternation.
+ *     Darshan counts these as POSIX_RW_SWITCHES. No special handling required here.
  *
  * Build:
  *   mpicc -O3 -Wall -Wextra -o mpi_synthio mpi_synthio.c -lm
@@ -21,12 +33,6 @@
  * Run:
  *   mpiexec -n <N> ./mpi_synthio --plan payload/plan.csv \
  *           --io-api posix --meta-api posix --collective none
- *
- * Notes:
- *   - Only rank 0 replays the plan; other ranks idle at barriers so Darshan
- *     includes them in the job record cleanly.
- *   - The planner controls phase ordering to realize L→M→S and the desired
- *     seq/consec/random shares. We consume those proportions literally.
  */
 
 #define _GNU_SOURCE
@@ -71,19 +77,20 @@ typedef struct {
     double p_consec_r;
     double p_seq_w;
     double p_consec_w;
-    double p_ua_file;
-    double p_ua_mem;
-    double rw_switch;
+    double p_ua_file;   /* fraction of ops with NOT aligned file start (planner-proportional) */
+    double p_ua_mem;    /* fraction of ops with NOT aligned memory buffer (planner-proportional) */
+    double rw_switch;   /* unused here; planner creates switches via row alternation */
     uint64_t meta_open, meta_stat, meta_seek, meta_sync;
     uint32_t seed;
-    char   flags[64];  /* "consec"|"seq"|"random"|"meta_only"|... */
-    double p_rand_fwd_r, p_rand_fwd_w, p_consec_internal;
-    int    pre_seek_eof; /* 0/1 (optional) */
+    char   flags[256];  /* "consec"|"seq"|"random"|"meta_only"|... plus optional "|shared|" or "|unique|" */
+    double p_rand_fwd_r, p_rand_fwd_w, p_consec_internal; /* reserved */
+    int    pre_seek_eof; /* 0/1 */
+    uint64_t n_ops;      /* optional: planned ops in this phase (info only) */
 } phase_t;
 
 static int startswith(const char*s,const char*p){ return strncmp(s,p,strlen(p))==0; }
 
-/* Parse a CSV line that may contain the optional pre_seek_eof column. */
+/* Parse a CSV line that may contain the optional pre_seek_eof and n_ops columns. */
 static int parse_line(const char* line, phase_t* ph)
 {
     char buf[MAX_LINE];
@@ -94,6 +101,7 @@ static int parse_line(const char* line, phase_t* ph)
     char *tok; int col=0;
     memset(ph,0,sizeof(*ph));
     ph->pre_seek_eof = 0;
+    ph->n_ops = 0;
 
     tok = strtok(buf, ",\n");
     while(tok){
@@ -121,6 +129,7 @@ static int parse_line(const char* line, phase_t* ph)
             case 20: ph->p_rand_fwd_w = atof(tok); break;
             case 21: ph->p_consec_internal = atof(tok); break;
             case 22: ph->pre_seek_eof = atoi(tok); break; /* optional */
+            case 23: ph->n_ops = strtoull(tok,NULL,10); break; /* optional */
             default: break;
         }
         tok = strtok(NULL, ",\n"); col++;
@@ -130,12 +139,11 @@ static int parse_line(const char* line, phase_t* ph)
 
 typedef struct { void* base; void* ptr; } buf_t;
 
-static buf_t alloc_buffer(size_t sz, int want_misaligned)
+static buf_t alloc_buffer(size_t sz)
 {
     buf_t b; b.base=NULL; b.ptr=NULL;
     if(posix_memalign(&b.base, MEM_ALIGN, sz + MEM_ALIGN)) return b;
     b.ptr = b.base;
-    if(want_misaligned) b.ptr = (void*)((uintptr_t)b.base + 1);
     return b;
 }
 
@@ -161,8 +169,23 @@ static ssize_t do_prw(int fd2, void* buf2, size_t len, off_t off, int wr)
     return (ssize_t)len;
 }
 
+/* FNV-1a 64-bit for stable owner selection of unique rows */
+static unsigned long fnv1a_64(const char* s)
+{
+    unsigned long h = 1469598103934665603ULL;
+    while(*s){
+        h ^= (unsigned long)(unsigned char)(*s++);
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
 static void do_posix_data(const phase_t* p, int phase_idx)
 {
+    int world_rank=0, world_n=1;
+    MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &world_n);
+
     int fd = open(p->path, p->p_write>0.0 ? O_RDWR|O_CREAT : O_RDONLY, 0644);
     if(fd<0){ perror("open"); return; }
 
@@ -172,50 +195,91 @@ static void do_posix_data(const phase_t* p, int phase_idx)
 
     if(p->xfer==0 || p->total_bytes==0){ close(fd); return; }
 
+    /* Global (plan-level) ops for this phase */
     uint64_t Nops = p->total_bytes / p->xfer;
     int is_write = (p->p_write > 0.5);
 
-    /* Counts encoded via p_*  */
-    uint64_t N_con = (uint64_t)llround((double)Nops * p->p_consec_r);
-    uint64_t N_seq = 0;
-    if(p->p_seq_r > p->p_consec_r) {
-        N_seq = (uint64_t)llround((double)Nops * (p->p_seq_r - p->p_consec_r));
-    }
-    if(N_con + N_seq > Nops) {
-        if(N_con > Nops) N_con=Nops;
-        N_seq = Nops - N_con;
-    }
-    uint64_t N_rnd = Nops - N_con - N_seq;
+    /* Shared/unique/legacy scope based on flags */
+    int is_shared = (strstr(p->flags, "|shared|") != NULL);
+    int is_unique = (strstr(p->flags, "|unique|") != NULL);
 
-    /* Large-op alignment control (applies to xfer >= 1 MiB) */
+    int owner = 0;
+    if(is_unique){
+        owner = (int)(fnv1a_64(p->path) % (unsigned long)world_n);
+    }
+
+    /* Decide local ops for this rank */
+    uint64_t Nops_local = 0;
+    if(is_shared){
+        /* all ranks participate equally */
+        Nops_local = Nops / (uint64_t)world_n;
+        if((uint64_t)world_rank < (Nops % (uint64_t)world_n)) Nops_local++;
+    } else if(is_unique){
+        /* only owner executes */
+        if(world_rank != owner){ close(fd); return; }
+        Nops_local = Nops;
+    } else {
+        /* legacy leader-only behavior */
+        if(world_rank != 0){ close(fd); return; }
+        Nops_local = Nops;
+    }
+    if(Nops_local == 0){ close(fd); return; }
+
+    /* Compute consec/seq/random counts from local ops */
+    double p_con = p->p_consec_r;
+    double p_seq = p->p_seq_r;
+    if(is_write){
+        /* The harness uses p_seq_r/p_consec_r fields for both intents since planner
+           encodes the intent via p_write and phase flag; p_seq_w/p_consec_w kept for future. */
+        p_con = p->p_consec_r;
+        p_seq = p->p_seq_r;
+    }
+    if(p_con > p_seq) p_con = p_seq;
+
+    uint64_t N_con = (uint64_t)llround((double)Nops_local * p_con);
+    uint64_t N_seq = 0;
+    if(p_seq > p_con){
+        N_seq = (uint64_t)llround((double)Nops_local * (p_seq - p_con));
+    }
+    if(N_con + N_seq > Nops_local) {
+        if(N_con > Nops_local) N_con=Nops_local;
+        N_seq = Nops_local - N_con;
+    }
+    uint64_t N_rnd = Nops_local - N_con - N_seq;
+
+    /* Large-op file-start alignment quota (aligned fraction = 1 - p_ua_file) */
     int large = (p->xfer >= LUSTRE_FILE_ALIGN) ? 1 : 0;
     uint64_t N_align_total = 0;
     if(large){
-        /* p_ua_file = fraction UNALIGNED → aligned fraction = 1 - p_ua_file */
         double frac_aligned = 1.0 - p->p_ua_file;
         if(frac_aligned < 0) frac_aligned=0;
         if(frac_aligned > 1) frac_aligned=1;
-        N_align_total = (uint64_t)llround(frac_aligned * (double)Nops);
+        N_align_total = (uint64_t)llround(frac_aligned * (double)Nops_local);
     }
     uint64_t align_left = N_align_total;
 
-    /* Buffer & (mis)alignment */
-    /* (same policy as before: one draw per phase to match your earlier behavior) */
-    int want_mis_mem = ((double)rand()/RAND_MAX) < p->p_ua_mem ? 1:0;
-    buf_t b = alloc_buffer((size_t)p->xfer, want_mis_mem);
+    /* Memory misalignment quota (per-op proportional) */
+    uint64_t N_mem_mis = (uint64_t)llround(p->p_ua_mem * (double)Nops_local);
+    uint64_t mis_left = N_mem_mis;
+
+    buf_t b = alloc_buffer((size_t)p->xfer);
     if(!b.base){ perror("alloc_buffer"); close(fd); return; }
+    void* aligned_ptr = b.base;
+    void* mis_ptr = (void*)((uintptr_t)b.base + 1);
 
     /* ----- Consecutive ----- */
     off_t cur = 0;
     for(uint64_t i=0;i<N_con;i++){
         off_t start = cur;
         if(large && align_left>0){
-            /* snap to alignment */
+            /* snap to alignment boundary */
             start = (start + (LUSTRE_FILE_ALIGN-1)) & ~(LUSTRE_FILE_ALIGN-1);
             align_left--;
         }
         start = clamp_range(start, fsz, p->xfer);
-        if(do_prw(fd, b.ptr, (size_t)p->xfer, start, is_write)<0){
+        void* use_ptr = (mis_left>0) ? mis_ptr : aligned_ptr;
+        if(mis_left>0) mis_left--;
+        if(do_prw(fd, use_ptr, (size_t)p->xfer, start, is_write)<0){
             perror(is_write?"pwrite":"pread"); break;
         }
         cur = start + (off_t)p->xfer; /* exactly adjacent */
@@ -224,21 +288,28 @@ static void do_posix_data(const phase_t* p, int phase_idx)
     /* ----- Sequential remainder (gap = xfer) ----- */
     for(uint64_t i=0;i<N_seq;i++){
         off_t start = cur + (off_t)p->xfer; /* seq-but-not-consec with fixed gap */
-        /* (No extra alignment pressure here; leave it as natural) */
+        if(large && align_left>0){
+            start = (start + (LUSTRE_FILE_ALIGN-1)) & ~(LUSTRE_FILE_ALIGN-1);
+            align_left--;
+        }
         start = clamp_range(start, fsz, p->xfer);
-        if(do_prw(fd, b.ptr, (size_t)p->xfer, start, is_write)<0){
+        void* use_ptr = (mis_left>0) ? mis_ptr : aligned_ptr;
+        if(mis_left>0) mis_left--;
+        if(do_prw(fd, use_ptr, (size_t)p->xfer, start, is_write)<0){
             perror(is_write?"pwrite":"pread"); break;
         }
         cur = start + (off_t)p->xfer;
     }
 
-    /* ----- Random (descending 32MiB chunks; pre-seek-eof honored as a fence only) ----- */
-    /* If requested, do a single seek to EOF (doesn't affect subsequent pread/pwrite positions). */
+    /* ----- Random (descending 32MiB chunks; optional pre-seek-eof) ----- */
     if(N_rnd>0 && p->pre_seek_eof){
         (void)lseek(fd, fsz, SEEK_SET);
     }
     uint64_t nchunks = (fsz>0) ? ( (fsz + CHUNK_RANDOM - 1) / CHUNK_RANDOM ) : 1;
     uint64_t cidx = (nchunks>0? nchunks-1 : 0);
+    /* set PRNG seed per phase for reproducibility across ranks */
+    srand(p->seed + (unsigned int)world_rank * 1337u);
+
     for(uint64_t i=0;i<N_rnd;i++){
         off_t chunk_start = (off_t)cidx * (off_t)CHUNK_RANDOM;
         off_t chunk_end   = chunk_start + (off_t)CHUNK_RANDOM;
@@ -262,7 +333,6 @@ static void do_posix_data(const phase_t* p, int phase_idx)
         if(large && align_left>0){
             off_t aligned = start & ~(off_t)(LUSTRE_FILE_ALIGN-1);
             if(aligned < chunk_start) aligned = chunk_start;
-            /* if aligned window too small, snap up within chunk */
             if(aligned + (off_t)p->xfer <= chunk_end){
                 start = aligned;
                 align_left--;
@@ -270,19 +340,22 @@ static void do_posix_data(const phase_t* p, int phase_idx)
         }
 
         start = clamp_range(start, fsz, p->xfer);
-        if(do_prw(fd, b.ptr, (size_t)p->xfer, start, is_write)<0){
+        void* use_ptr = (mis_left>0) ? mis_ptr : aligned_ptr;
+        if(mis_left>0) mis_left--;
+        if(do_prw(fd, use_ptr, (size_t)p->xfer, start, is_write)<0){
             perror(is_write?"pwrite":"pread"); break;
         }
 
-        if(cidx>0) cidx--; else cidx = nchunks-1; /* round-robin descending */
+        /* round-robin descending among chunks */
+        if(cidx>0) cidx--; else cidx = nchunks-1;
     }
 
-    /* Phase summary */
+    /* Phase summary (stderr) */
     fprintf(stderr,
-            "phase %d done: path=%s xfer=%" PRIu64 "B ops=%" PRIu64
-            " (consec=%" PRIu64 ", seq=%" PRIu64 ", rand=%" PRIu64 ") %s\n",
-            phase_idx, p->path, p->xfer, Nops, N_con, N_seq, N_rnd,
-            is_write ? "[WRITE]" : "[READ]");
+            "rank %d: phase %d done: path=%s xfer=%" PRIu64 "B ops=%" PRIu64
+            " (consec=%" PRIu64 ", seq=%" PRIu64 ", rand=%" PRIu64 ") %s flags=%s\n",
+            world_rank, phase_idx, p->path, p->xfer, Nops_local, N_con, N_seq, N_rnd,
+            is_write ? "[WRITE]" : "[READ]", p->flags);
     fflush(stderr);
 
     free(b.base);
@@ -311,10 +384,12 @@ static void do_posix_meta(const phase_t* p, int phase_idx)
         close(fd);
     }
 
+    int world_rank=0;
+    MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
     fprintf(stderr,
-            "phase %d done [META]: path=%s open=%" PRIu64 " stat=%" PRIu64
+            "rank %d: phase %d done [META]: path=%s open=%" PRIu64 " stat=%" PRIu64
             " seek=%" PRIu64 " sync=%" PRIu64 "\n",
-            phase_idx, p->path, p->meta_open, p->meta_stat, p->meta_seek, p->meta_sync);
+            world_rank, phase_idx, p->path, p->meta_open, p->meta_stat, p->meta_seek, p->meta_sync);
     fflush(stderr);
 }
 
@@ -325,16 +400,25 @@ static void run_plan(FILE* fp)
     while(fgets(line,sizeof(line),fp)){
         phase_t p;
         if(parse_line(line,&p)) continue; /* header/empty */
+
+        /* Seed RNG each phase to keep behavior reproducible across ranks (random phase uses rand()) */
         srand(p.seed);
+
         if(strcmp(p.type,"data")==0){
             do_posix_data(&p, (int)(nph+1));
         } else if(strcmp(p.type,"meta")==0){
             do_posix_meta(&p, (int)(nph+1));
         }
         nph++;
+        /* Light barrier between phases to keep shared rows in step (optional) */
+        MPI_Barrier(MPI_COMM_WORLD);
     }
-    fprintf(stderr,"Loaded %zu phases\n", nph);
-    fflush(stderr);
+    int world_rank=0;
+    MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
+    if(world_rank==0){
+        fprintf(stderr,"Loaded %zu phases\n", nph);
+        fflush(stderr);
+    }
 }
 
 int main(int argc, char** argv)
@@ -356,9 +440,9 @@ int main(int argc, char** argv)
         } else if(!strcmp(argv[i],"--io-api") && i+1<argc){
             const char* v=argv[++i];
             if(!strcmp(v,"posix")) ioapi=API_POSIX;
-            else if(!strcmp(v,"mpiio")) ioapi=API_MPIIO; /* reserved */
+            else if(!strcmp(v,"mpiio")) ioapi=API_MPIIO; /* reserved for future */
         } else if(!strcmp(argv[i],"--meta-api") && i+1<argc){
-            (void)argv[++i]; /* only posix used for meta */
+            (void)argv[++i]; /* only posix used for meta (reserved) */
             metapi=META_POSIX;
         } else if(!strcmp(argv[i],"--collective") && i+1<argc){
             const char* v=argv[++i];
@@ -384,12 +468,22 @@ int main(int argc, char** argv)
         }
         run_plan(fp);
         fclose(fp);
+    } else {
+        /* Non-root ranks still need to consume the plan in lockstep barriers.
+           We re-open and iterate to honor shared/unique logic per row. */
+        FILE* fp = fopen(plan_path,"r");
+        if(!fp){
+            perror("fopen plan (non-root)");
+            MPI_Abort(MPI_COMM_WORLD, 2);
+        }
+        run_plan(fp);
+        fclose(fp);
     }
 
     /* All ranks sync so Darshan includes everyone. */
     MPI_Barrier(MPI_COMM_WORLD);
 
-    (void)ioapi; (void)metapi; (void)cm; /* silence if not used yet */
+    (void)ioapi; (void)metapi; (void)cm; /* reserved */
 
     MPI_Finalize();
     return 0;
