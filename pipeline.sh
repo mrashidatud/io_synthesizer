@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT="/mnt/hasanfs/io_synthesizer"
 BIN_DIR="/mnt/hasanfs/bin"
 OUT_ROOT="/mnt/hasanfs/out_synth"
-INPUT_DIR="${ROOT}/inputs"   # per your request
+INPUT_DIR="${ROOT}/inputs/exemplar_jsons"   # per your request
 FEATS_SCRIPT="${ROOT}/scripts/features2synth_opsaware.py"
 
 # Defaults (override on CLI: --cap 512 --nprocs 4 --io posix --meta posix --coll none)
