@@ -15,9 +15,20 @@ import os
 import json
 import pandas as pd
 import numpy as np
+import argparse   # ← ADD THIS
 
-# ─── CONFIG ────────────────────────────────────────────────────────────────────
-root_dir     = "/mnt/hasanfs/io_synthesizer/analysis/outputs_analysis"
+# ─── CONFIG (dynamic path) ─────────────────────────────────────────────────────
+# --root/--outdir points to the directory that CONTAINS darshan_summary.csv.
+# All outputs (filtered CSV + features JSON) will be written to this same dir.
+parser = argparse.ArgumentParser()
+parser.add_argument(
+    "--root", "--outdir",
+    dest="root",
+    default=os.getcwd(),
+    help="Directory containing darshan_summary.csv; outputs will be written here (default: current working dir)",
+)
+args = parser.parse_args()
+root_dir     = os.path.abspath(args.root)
 input_csv    = os.path.join(root_dir, "darshan_summary.csv")
 filtered_csv = os.path.join(root_dir, "darshan_summary_filtered.csv")
 output_json  = os.path.join(root_dir, "darshan_features_updated.json")

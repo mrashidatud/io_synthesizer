@@ -32,7 +32,7 @@ from pathlib import Path
 from collections import defaultdict, Counter
 
 # ---------------- Paths & constants ----------------
-OUTROOT   = Path("/mnt/hasanfs/out_synth")
+OUTROOT   = Path("/mnt/hasanfs/out_synth")   # default; overridden in main() per features file
 PAYLOAD   = OUTROOT / "payload"
 PLAN      = PAYLOAD / "plan.csv"
 DATA_RO   = PAYLOAD / "data" / "ro"
@@ -42,6 +42,22 @@ META_DIR  = PAYLOAD / "meta"
 PREP      = OUTROOT / "run_prep.sh"
 RUN       = OUTROOT / "run_from_features.sh"
 NOTES     = OUTROOT / "run_from_features.sh.notes.txt"
+
+def _set_outroot_per_json(json_path: str):
+    """Re-point all output paths to /mnt/hasanfs/out_synth/<json_base>/..."""
+    global OUTROOT, PAYLOAD, PLAN, DATA_RO, DATA_RW, DATA_WO, META_DIR, PREP, RUN, NOTES
+    json_base = Path(json_path).stem
+    OUTROOT = Path("/mnt/hasanfs/out_synth") / json_base
+    PAYLOAD = OUTROOT / "payload"
+    PLAN    = PAYLOAD / "plan.csv"
+    DATA_RO = PAYLOAD / "data" / "ro"
+    DATA_RW = PAYLOAD / "data" / "rw"
+    DATA_WO = PAYLOAD / "data" / "wo"
+    META_DIR= PAYLOAD / "meta"
+    PREP    = OUTROOT / "run_prep.sh"
+    RUN     = OUTROOT / "run_from_features.sh"
+    NOTES   = OUTROOT / "run_from_features.sh.notes.txt"
+    return json_base
 
 # Small/Medium fixed sub-sizes (bytes)
 S_SUBS = [100, 1024, 4096, 65536]            # 100 B, 1 KiB, 4 KiB, 64 KiB
@@ -640,12 +656,25 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
     iapi   = str(feats.get('io_api', 'posix'))
     mapi   = str(feats.get('meta_api', 'posix'))
     coll   = str(feats.get('mpi_collective_mode', 'none'))
+
+    # For DARSHAN_LOGFILE naming
+    cap_total_gib = float(feats.get("cap_total_gib", 1.0))
+    json_base = str(feats.get("_json_base", "features"))
+
+    darshan_name = f"{json_base}_cap_{int(cap_total_gib)}_nproc_{nprocs}_io_{iapi}_meta_{mapi}_coll_{coll}.darshan"
+    darshan_path = OUTROOT / darshan_name
+
     RUNNER = RUN
     with open(RUNNER, "w") as f:
         f.write("#!/usr/bin/env bash\nset -euo pipefail\n")
         f.write(f"bash {PREP}\n")
+        # Set DARSHAN_LOGFILE for consistent file name/location
+        f.write(f"export DARSHAN_LOGFILE='{darshan_path}'\n")
+        # mpiexec: LD_PRELOAD + DARSHAN_LOGFILE for all ranks
         f.write(
-            "mpiexec -n {n} -genv LD_PRELOAD /mnt/hasanfs/darshan-3.4.7/darshan-runtime/install/lib/libdarshan.so "
+            "mpiexec -n {n} "
+            "-genv LD_PRELOAD /mnt/hasanfs/darshan-3.4.7/darshan-runtime/install/lib/libdarshan.so "
+            "-genv DARSHAN_LOGFILE \"$DARSHAN_LOGFILE\" "
             "/mnt/hasanfs/bin/mpi_synthio --plan {plan} --io-api {iapi} --meta-api {mapi} --collective {coll}\n"
             .format(n=nprocs, plan=str(PLAN), iapi=iapi, mapi=mapi, coll=coll)
         )
@@ -775,12 +804,50 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--features", required=True, help="features.json")
-    ap.add_argument("--nranks", type=int, default=1, help="mpiexec -n <nranks> to use in the generated runner if 'nprocs' absent in features")
+    ap.add_argument("--nranks", type=int, default=1, help="mpiexec -n to use in the generated runner if 'nprocs' absent in features")
     ap.add_argument("--fs-align", type=int, default=1<<20, help="Darshan POSIX_FILE_ALIGNMENT to target (bytes). Default: 1 MiB")
+
+    # NEW: optional overrides
+    ap.add_argument("--cap-total-gib", type=float, default=None, help="Override cap_total_gib (GiB)")
+    ap.add_argument("--nprocs", type=int, default=None, help="Override number of ranks (takes precedence over --nranks)")
+    ap.add_argument("--io-api", choices=["posix","mpiio"], default=None, help="Override io_api")
+    ap.add_argument("--meta-api", choices=["posix"], default=None, help="Override meta_api")
+    ap.add_argument("--mpi-collective-mode", choices=["none","independent","collective"], default=None, help="Override mpi_collective_mode")
+
     args = ap.parse_args()
+
+    # Per-JSON outroot redirection
+    json_base = _set_outroot_per_json(args.features)
+
+    # Read features and apply overrides
     feats = read_features(args.features)
+
+    if args.cap_total_gib is not None:
+        feats["cap_total_gib"] = float(args.cap_total_gib)
+    if args.nprocs is not None:
+        feats["nprocs"] = int(args.nprocs)
+    elif "nprocs" not in feats:
+        feats["nprocs"] = max(1, int(args.nranks))
+
+    if args.io_api is not None:
+        feats["io_api"] = args.io_api
+    if args.meta_api is not None:
+        feats["meta_api"] = args.meta_api
+    if args.mpi_collective_mode is not None:
+        feats["mpi_collective_mode"] = args.mpi_collective_mode
+
+    # Keep align pref
     fs_align_bytes = int(feats.get("posix_file_alignment_bytes", args.fs_align))
-    out = plan_from_features(feats, nranks=max(1, args.nranks), fs_align_bytes=fs_align_bytes)
+
+    # Stash json base for runner naming
+    feats["_json_base"] = json_base
+
+    out = plan_from_features(
+        feats,
+        nranks=max(1, feats.get("nprocs", max(1, args.nranks))),
+        fs_align_bytes=fs_align_bytes
+    )
+
     import json as _json
     print(_json.dumps(out, indent=2))
 
