@@ -7,27 +7,31 @@ OUT_ROOT="/mnt/hasanfs/out_synth"
 INPUT_DIR="${ROOT}/inputs/exemplar_jsons"   # per your request
 FEATS_SCRIPT="${ROOT}/scripts/features2synth_opsaware.py"
 
-# Defaults (override on CLI: --cap 512 --nprocs 4 --io posix --meta posix --coll none)
+# Defaults (override on CLI: --cap 512 --nprocs 4 --nprocs-cap 64 --inputs <dir> --force-build)
 CAP_TOTAL_GIB=512
-NPROCS=""
-IO_API=""
-META_API=""
-MPI_COLL_MODE=""
+NPROCS_OVERRIDE=""      # optional, capped by NPROCS_CAP if provided
+NPROCS_CAP=64           # ✅ user-configurable cap via --nprocs-cap
 FORCE_BUILD=0
 
 # Parse optional overrides
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --cap) CAP_TOTAL_GIB="$2"; shift 2;;
-    --nprocs) NPROCS="$2"; shift 2;;
-    --io) IO_API="$2"; shift 2;;
-    --meta) META_API="$2"; shift 2;;
-    --coll) MPI_COLL_MODE="$2"; shift 2;;
+    --nprocs) NPROCS_OVERRIDE="$2"; shift 2;;
+    --nprocs-cap) NPROCS_CAP="$2"; shift 2;;
     --inputs) INPUT_DIR="$2"; shift 2;;
     --force-build) FORCE_BUILD=1; shift 1;;
     *) echo "Unknown arg: $1"; exit 1;;
   esac
 done
+
+# Basic validation on numeric args
+if [[ -n "${NPROCS_OVERRIDE}" && ! "${NPROCS_OVERRIDE}" =~ ^[0-9]+$ ]]; then
+  echo "Error: --nprocs must be an integer" >&2; exit 1
+fi
+if [[ -n "${NPROCS_CAP}" && ! "${NPROCS_CAP}" =~ ^[0-9]+$ ]]; then
+  echo "Error: --nprocs-cap must be an integer" >&2; exit 1
+fi
 
 timestamp() { date +"%Y%m%d_%H%M%S"; }
 LOG="${OUT_ROOT}/pipeline_$(timestamp).log"
@@ -62,14 +66,44 @@ for J in "${JSONS[@]}"; do
   echo ""
   echo "---- Processing: ${JSON_NAME} ----"
 
-  # Plan (generate prep/run scripts)
+  # Determine nprocs to pass (cap at NPROCS_CAP if provided or if present in input JSON)
+  DESIRED_NPROCS=""
+  if [[ -n "${NPROCS_OVERRIDE}" ]]; then
+    # CLI override (cap at NPROCS_CAP)
+    if (( NPROCS_OVERRIDE > NPROCS_CAP )); then
+      DESIRED_NPROCS="${NPROCS_CAP}"
+    else
+      DESIRED_NPROCS="${NPROCS_OVERRIDE}"
+    fi
+  else
+    # If input JSON has nprocs, cap at NPROCS_CAP and pass it; else let planner decide
+    JSON_NPROCS="$(python3 - "$JSON_ABS" <<'PY'
+import json,sys
+try:
+    d=json.load(open(sys.argv[1]))
+    n=d.get("nprocs", "")
+    if isinstance(n,int): print(n)
+    elif isinstance(n,str) and n.isdigit(): print(int(n))
+    else: print("")
+except Exception:
+    print("")
+PY
+)"
+    if [[ -n "${JSON_NPROCS}" ]]; then
+      if (( JSON_NPROCS > NPROCS_CAP )); then
+        DESIRED_NPROCS="${NPROCS_CAP}"
+      else
+        DESIRED_NPROCS="${JSON_NPROCS}"
+      fi
+    fi
+  fi
+
+  # Plan (generate prep/run scripts) — always force posix/posix/none as requested
   echo "[Plan] features2synth_opsaware.py for ${JSON_NAME}"
   cd "${ROOT}"
   CMD=( python3 "${FEATS_SCRIPT}" --features "${JSON_ABS}" --cap-total-gib "${CAP_TOTAL_GIB}" )
-  [[ -n "${NPROCS}" ]] && CMD+=( --nprocs "${NPROCS}" )
-  [[ -n "${IO_API}" ]] && CMD+=( --io-api "${IO_API}" )
-  [[ -n "${META_API}" ]] && CMD+=( --meta-api "${META_API}" )
-  [[ -n "${MPI_COLL_MODE}" ]] && CMD+=( --mpi-collective-mode "${MPI_COLL_MODE}" )
+  CMD+=( --io-api posix --meta-api posix --mpi-collective-mode none )
+  [[ -n "${DESIRED_NPROCS}" ]] && CMD+=( --nprocs "${DESIRED_NPROCS}" )
 
   printf 'Running: '; printf '%q ' "${CMD[@]}"; echo
   "${CMD[@]}"
@@ -89,16 +123,15 @@ for J in "${JSONS[@]}"; do
     continue
   fi
 
-  # Extract DARSHAN_LOGFILE='…' from the run script (quoted with single quotes)
+  # Extract DARSHAN_LOGFILE from the run script
   EXPECTED="$(awk -F"'" '/^export[[:space:]]+DARSHAN_LOGFILE=/{print $2}' "${RUN_SH}" || true)"
 
-  # If the exact darshan file already exists, skip the run
+  # If the exact .darshan already exists, skip execution
   if [[ -n "${EXPECTED}" && -f "${EXPECTED}" ]]; then
     echo "⏭️  Found existing Darshan artifact:"
     echo "    ${EXPECTED}"
     echo "    Skipping execution and proceeding to analysis."
   else
-    # Run it
     echo "[Run] ${RUN_SH}"
     bash "${RUN_SH}"
 
