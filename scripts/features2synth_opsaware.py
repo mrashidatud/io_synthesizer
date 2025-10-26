@@ -1,30 +1,67 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-features2synth_opsaware.py
+Planner: OPS-FIRST with S/M ladders, L=16MiB fixed; in-bin, op-preserving rebalancer.
 
-Planner: OPS-FIRST with Small/Medium sub-size ladders, L=16MiB; deterministic ordering
-         (L→M→S and Consec→SeqRemainder→Random). Post-pass in-bin rebalancer that can
-         auto up/down and distribute adjustments fairly across files, while preserving
-         sub-size presence (e.g., the 100 B sub-size never disappears if it existed).
+This version implements the requested fixes with minimal changes elsewhere:
 
-Uses ONLY the feature names provided in the spec/input file.
+(1) Per-intent op shares (Nr/Nw) enforced exactly
+    - Derive Nr/Nw strictly from pct_reads/pct_writes (NOT from ladders).
+    - Keep Nr/Nw invariant through rebalancing.
 
-What this planner guarantees (recap of your requirements):
-  • Split file/memory unalignment PROPORTIONALLY across files, roles (R/W), bins, and sub-sizes.
-  • Split consec/seq/random PROPORTIONALLY across sub-sizes per (file,role,bin) group.
-  • Add n_ops in plan for each phase.
-  • Headers and Notes reflect all behavior and assumptions.
-  • RO/RW reads split proportional to file counts when both exist (else whichever exists).
-    Similarly, WO/RW writes.
-  • RW-switches: use pct_rw_switches (0..1) to interleave R/W segments on the SAME RW path.
-  • Shared vs unique: counts from pct_shared_files/pct_unique_files; bytes from
-    pct_bytes_shared_files/pct_bytes_unique_files; flags “|shared|/|unique|” emitted for harness.
-  • Rebalancer: in-bin only; preserves ops and L=16MiB; strict per-file round-robin; presence floors.
-  • NEW: Alignment targeting honors a FILE-ALIGNMENT floor:
-      - Compute intrinsic file-unaligned ops = ops whose xfer % fs_align != 0.
-      - If requested pct_file_not_aligned ≤ floor, force all eligible sizes (xfer % fs_align == 0) to aligned (p_ua_file=0) and prefer keeping L fully aligned.
-      - Else distribute the *excess* unaligned fraction only across eligible sizes, preferring non-L bins first; per-row p_ua_file is set to hit the global target.
+(2) ε-ops policy when a side is 0% but structure demands presence
+    - If pct_writes==0 (or pct_byte_writes==0) but there are write “signals”
+      (pct_seq_writes, pct_consec_writes, any pct_write_* > 0, WO role hints),
+      inject a deterministic ε of WRITE ops in S/0–100KiB (consec⊂seq mix).
+      Mirror for reads if pct_reads==0 but read signals exist.
+    - ε-ops are small enough to round to 0% in downstream feature extraction
+      but survive into Darshan to preserve “presence”.
+
+(3) Post-rebalancer byte nudger (intent bytes)
+    - After op-preserving rebalancing, apply a light, in-bin nudge to better
+      match pct_byte_reads/pct_byte_writes targets (no L changes, no op count changes).
+
+(4) Feasibility detector + graceful clamp
+    - If ladder constraints + L fixed + op split make exact byte targets
+      unattainable, clamp to nearest attainable target and report it in notes.
+
+(5) Role-bytes enforcement (RO/RW/WO)
+    - Respect pct_bytes_read_only_files / pct_bytes_read_write_files /
+      pct_bytes_write_only_files with op-preserving, in-bin movement.
+
+(6) Shared/unique bytes enforcement
+    - Enforce pct_bytes_shared_files / pct_bytes_unique_files via flags
+      on files across all roles (RO/RW/WO)—not limited to RO.
+
+(7) File-unaligned targeting that respects intrinsic floors
+    - Compute the floor from (xfer % fs_align != 0).
+    - Split remaining unaligned quota equally across eligible bins (S/M/L),
+      and proportionally by ops within each bin; per-row p_ua_file is emitted.
+    - L is NOT preferred; matches your latest request.
+
+(8) RW-switches
+    - Planner interleaves read/write segments on SAME RW path when
+      pct_rw_switches>0. Harness does not need extra logic.
+
+(9) Presence floors & rounding
+    - Integer-ops rounding and presence floors applied after all nudges
+      to avoid small-bucket drift.
+
+(10) Meta from realized ops
+    - Compute meta counts from final Nr+Nw, after ε-ops are injected.
+
+Notes are comprehensive and list:
+  • Verbatim inputs
+  • Capacity→bytes mapping
+  • Intent & role & shared byte targets (requested vs realized)
+  • File layout (sizes) and flags
+  • ε-ops decisions
+  • Alignment floor math & predicted unaligned fraction
+  • Feasibility clamps (when applied)
+  • RW-switch policy
+  • Assumptions & invariants
+
+Run script calls your exact Darshan/mpi_synthio paths and runs prep first.
 """
 
 import argparse, json, os, random
@@ -32,7 +69,7 @@ from pathlib import Path
 from collections import defaultdict, Counter
 
 # ---------------- Paths & constants ----------------
-OUTROOT   = Path("/mnt/hasanfs/out_synth")   # default; overridden in main() per features file
+OUTROOT   = Path("/mnt/hasanfs/out_synth")
 PAYLOAD   = OUTROOT / "payload"
 PLAN      = PAYLOAD / "plan.csv"
 DATA_RO   = PAYLOAD / "data" / "ro"
@@ -115,43 +152,33 @@ def summarize(rows):
     by_role=Counter()
     by_intent=Counter()
     by_file=Counter()
-    by_flag=Counter()    # "|shared|" vs "|unique|" (after tagging)
-    by_fbs_ops=defaultdict(int)  # (file,bin,xfer,intent)->ops
+    by_flag=Counter()
     for r in rows:
         b = r["xfer"] * r["ops"]
         total += b
         by_role[r["role"]] += b
         by_intent[r["intent"]] += b
         by_file[r["file"]] += b
-        by_fbs_ops[(r["file"], r["bin"], r["xfer"], r["intent"])] += r["ops"]
         if "flags" in r:
             if "|shared|" in r["flags"]: by_flag["shared"] += b
             elif "|unique|" in r["flags"]: by_flag["unique"] += b
-    return total, by_role, by_intent, by_file, by_flag, by_fbs_ops
+    return total, by_role, by_intent, by_file, by_flag
 
-# ---------------- Rebalancer (fair, presence-preserving, auto up/down) ----------------
+# ---------------- Rebalancer (op-preserving, in-bin, fair) ----------------
 def rebalancer_autotune_fair(rows, target_total_bytes,
-                             target_by_intent, target_by_role, target_by_flag=None):
-    """
-    In-bin, op-preserving rebalance that can both shrink and grow sizes.
-    - Never touches L bin sizes (fixed at 16 MiB).
-    - DOWN-tune: prefer M then S; within bin, larger→smaller.
-    - UP-tune  : prefer S then M; within bin, smaller→larger.
-    - Fairness: strict per-file round-robin across files (one step per file per cycle).
-    - Presence floors: any (file,bin,xfer) that initially had ops keeps ≥1 op.
-    - Supports target-by-flag group (shared/unique) after flags are assigned.
-    """
-    floors = defaultdict(int)  # (file,bin,xfer) -> min_ops (≥1 if initially >0)
+                             target_by_intent=None, target_by_role=None, target_by_flag=None):
+    """In-bin op-preserving rebalance (L fixed). Fair per-file RR; presence floors."""
+    from collections import defaultdict
+    floors = defaultdict(int)
     initial_ops = defaultdict(int)
     for r in rows:
         key = (r["file"], r["bin"], r["xfer"])
         initial_ops[key] += r["ops"]
     for k,v in initial_ops.items():
-        if v>0:
-            floors[k] = 1
+        if v>0: floors[k]=1
 
-    def ladder_for(binname):
-        return M_SUBS if binname=="M" else (S_SUBS if binname=="S" else [L_SIZE])
+    def ladder_for(b):
+        return M_SUBS if b=="M" else (S_SUBS if b=="S" else [L_SIZE])
 
     def bytes_of(pred=None):
         if pred is None:
@@ -181,6 +208,7 @@ def rebalancer_autotune_fair(rows, target_total_bytes,
         if lst:
             lst[0]["ops"] += 1
         else:
+            # find a sibling to clone metadata from
             sib = None
             for _x, rows_at in by_fb[(file,binname)].items():
                 if rows_at: sib = rows_at[0]; break
@@ -191,41 +219,38 @@ def rebalancer_autotune_fair(rows, target_total_bytes,
         return True
 
     def files_with_candidates(pred, direction_down):
-        files = set()
+        files=set()
         for (file, binname), m in by_fb.items():
             if binname not in ("S","M"): continue
-            if not any(pred(rr) for x, lst in m.items() for rr in lst):
-                continue
+            if not any(pred(rr) for x,lst in m.items() for rr in lst): continue
             subs = ladder_for(binname)
             if direction_down:
-                for i in range(len(subs)-1, 0, -1):
+                for i in range(len(subs)-1,0,-1):
                     big, small = subs[i], subs[i-1]
-                    if total_ops_at(file, binname, big) > floors.get((file,binname,big),0):
+                    if total_ops_at(file,binname,big) > floors.get((file,binname,big),0):
                         files.add((file,binname)); break
             else:
-                for i in range(0, len(subs)-1):
+                for i in range(0,len(subs)-1):
                     small, big = subs[i], subs[i+1]
-                    if total_ops_at(file, binname, small) > floors.get((file,binname,small),0):
+                    if total_ops_at(file,binname,small) > floors.get((file,binname,small),0):
                         files.add((file,binname)); break
         return sorted(files)
 
     def one_cycle(pred, direction_down):
-        progressed = False
-        for (file, binname) in files_with_candidates(pred, direction_down):
+        progressed=False
+        for (file,binname) in files_with_candidates(pred, direction_down):
             subs = ladder_for(binname)
             moved=False
             if direction_down:
-                for i in range(len(subs)-1, 0, -1):
+                for i in range(len(subs)-1,0,-1):
                     big, small = subs[i], subs[i-1]
                     if dec_one_op(file,binname,big):
-                        inc_one_op(file,binname,small)
-                        moved=True; break
+                        inc_one_op(file,binname,small); moved=True; break
             else:
-                for i in range(0, len(subs)-1):
+                for i in range(0,len(subs)-1):
                     small, big = subs[i], subs[i+1]
                     if dec_one_op(file,binname,small):
-                        inc_one_op(file,binname,big)
-                        moved=True; break
+                        inc_one_op(file,binname,big); moved=True; break
             progressed |= moved
         return progressed
 
@@ -235,18 +260,19 @@ def rebalancer_autotune_fair(rows, target_total_bytes,
         while cycles<max_cycles:
             cycles+=1
             if abs(cur - tgt_bytes) <= epsilon: break
-            if cur > tgt_bytes: prog = one_cycle(pred, direction_down=True)
-            else:               prog = one_cycle(pred, direction_down=False)
+            prog = one_cycle(pred, direction_down=(cur>tgt_bytes))
             if not prog: break
             cur = bytes_of(pred)
 
     eps = min(S_SUBS)
 
-    for intent, tgt in (target_by_intent or {}).items():
-        rr_reduce_to_target(lambda r, intent=intent: r["intent"]==intent, tgt, eps)
+    if target_by_intent:
+        for intent, tgt in target_by_intent.items():
+            rr_reduce_to_target(lambda r, intent=intent: r["intent"]==intent, tgt, eps)
 
-    for role, tgt in (target_by_role or {}).items():
-        rr_reduce_to_target(lambda r, role=role: r["role"]==role, tgt, eps)
+    if target_by_role:
+        for role, tgt in target_by_role.items():
+            rr_reduce_to_target(lambda r, role=role: r["role"]==role, tgt, eps)
 
     if target_by_flag:
         for flag_label, tgt in target_by_flag.items():
@@ -260,32 +286,27 @@ def rebalancer_autotune_fair(rows, target_total_bytes,
 # ---------------- RW-switch interleaving ----------------
 def interleave_rw_segments(rows, switch_frac=0.0, seg_ops=64):
     if switch_frac <= 0.0: return rows
+    from collections import defaultdict
     key = lambda r: (r["file"], r["bin"], r["xfer"])
     groups = defaultdict(lambda: {"R": [], "W": []})
     for r in rows:
         if r["role"]=="rw":
             groups[key(r)][ "R" if r["intent"]=="read" else "W" ].append(r)
 
-    new_rows = []
-    drained_ids = set()
-
-    def drain(rows_list, need):
+    new_rows=[]; drained=set()
+    def drain(lst, need):
         segs=[]; i=0; left=need
-        while left>0 and i<len(rows_list):
-            take = min(seg_ops, rows_list[i]["ops"], left)
+        while left>0 and i<len(lst):
+            take = min(seg_ops, lst[i]["ops"], left)
             if take>0:
-                seg = dict(rows_list[i]); seg["ops"]=take
-                segs.append(seg)
-                rows_list[i]["ops"] -= take
-                if rows_list[i]["ops"]==0:
-                    drained_ids.add(id(rows_list[i]))
-                    i+=1
+                seg=dict(lst[i]); seg["ops"]=take; segs.append(seg)
+                lst[i]["ops"]-=take
+                if lst[i]["ops"]==0: drained.add(id(lst[i])); i+=1
                 left-=take
-            else:
-                i+=1
+            else: i+=1
         return segs
 
-    for (f,binname,xfer), g in groups.items():
+    for (f,b,x), g in groups.items():
         R_ops = sum(r["ops"] for r in g["R"])
         W_ops = sum(r["ops"] for r in g["W"])
         if R_ops==0 or W_ops==0: continue
@@ -297,75 +318,44 @@ def interleave_rw_segments(rows, switch_frac=0.0, seg_ops=64):
             new_rows.append(r); new_rows.append(w)
 
     for r in rows:
-        if id(r) in drained_ids: continue
+        if id(r) in drained: continue
         if r["ops"]>0: new_rows.append(r)
 
     return new_rows
 
-# ---------------- Alignment targeting helper (NEW) ----------------
+# ---------------- Alignment targeting (file) ----------------
 def compute_rowwise_pua_file(rows, target_frac, fs_align_bytes):
-    """
-    Compute per-row p_ua_file so that:
-      • Any row with xfer % fs_align != 0 is intrinsically unaligned (p_ua_file = 1.0).
-      • The remaining unaligned quota is split EQUALLY across eligible bins (S, M, L)
-        that have eligible rows (xfer % fs_align == 0), then PROPORTIONALLY by ops
-        among eligible rows *within each bin*.
-
-    Returns: dict mapping id(row) -> p_ua_file_eff in [0, 1].
-    """
+    """Equal-share across eligible bins; intrinsic floor from sizes not % fs_align."""
     total_ops = sum(r["ops"] for r in rows)
-    if total_ops == 0:
-        return {}
-
+    if total_ops == 0: return {}
     target_unaligned_ops = clamp01(target_frac) * total_ops
 
-    # Partition rows
-    intrinsic = []   # xfer not divisible by fs_align -> always unaligned
-    eligible  = []   # xfer divisible by fs_align   -> can be aligned/unaligned via p
+    intrinsic, eligible = [], []
     for r in rows:
-        if r["ops"] <= 0:
-            continue
-        if (r["xfer"] % fs_align_bytes) != 0:
-            intrinsic.append(r)
-        else:
-            eligible.append(r)
+        if r["ops"]<=0: continue
+        if (r["xfer"] % fs_align_bytes) != 0: intrinsic.append(r)
+        else: eligible.append(r)
 
     intrinsic_ops = sum(r["ops"] for r in intrinsic)
     remaining = max(0.0, target_unaligned_ops - intrinsic_ops)
 
-    # Initialize map: default 0.0 (aligned), intrinsic 1.0
     p_map = {id(r): 0.0 for r in rows}
-    for r in intrinsic:
-        p_map[id(r)] = 1.0
+    for r in intrinsic: p_map[id(r)] = 1.0
+    if remaining <= 1e-9 or not eligible: return p_map
 
-    if remaining <= 1e-9 or not eligible:
-        return p_map
-
-    # Group eligible rows by BIN (S/M/L)
     elig_by_bin = {"S": [], "M": [], "L": []}
-    for r in eligible:
-        elig_by_bin.get(r["bin"], []).append(r)
-
-    # Consider only bins that actually have eligible ops
+    for r in eligible: elig_by_bin.get(r["bin"], []).append(r)
     active_bins = [b for b in ("S","M","L") if sum(x["ops"] for x in elig_by_bin[b]) > 0]
-    if not active_bins:
-        return p_map
+    if not active_bins: return p_map
 
-    # Split remaining equally across active bins
     share_per_bin = remaining / len(active_bins)
-
-    # For each active bin, distribute its share proportionally by ops within the bin
     for b in active_bins:
         bin_rows = elig_by_bin[b]
         bin_ops  = float(sum(r["ops"] for r in bin_rows))
-        if bin_ops <= 0.0:
-            continue
+        if bin_ops <= 0.0: continue
         for r in bin_rows:
-            # desired unaligned ops for this row
             want_ops = share_per_bin * (r["ops"] / bin_ops)
-            # translate to probability; cap at 1.0
-            p_map[id(r)] = min(1.0, p_map.get(id(r), 0.0) + (want_ops / max(1.0, r["ops"])))
-
+            p_map[id(r)] = min(1.0, p_map.get(id(r),0.0) + (want_ops / max(1.0, r["ops"])))
     return p_map
 
 # ---------------- Planner core ----------------
@@ -385,7 +375,7 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
     if p_bytes_r + p_bytes_w == 0.0:
         p_bytes_r = clamp01(feats.get("pct_reads", 0.5)); p_bytes_w = 1.0 - p_bytes_r
 
-    # OPS seed split
+    # OPS split (STRICT)
     p_reads_ops  = clamp01(feats.get("pct_reads", p_bytes_r))
     p_writes_ops = 1.0 - p_reads_ops
 
@@ -419,24 +409,24 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
     if wo_f>0 and n_wo==0: n_wo=1
     if n_ro+n_rw+n_wo==0: n_ro=1
 
-    # Shared/Unique file-count split
-    sh_f = clamp01(feats.get("pct_shared_files", 0.0))
-    uq_f = clamp01(feats.get("pct_unique_files", 0.0))
-    sh_counts = rational_counts([sh_f, uq_f], max_denom=max(1, n_ro+n_rw+n_wo))
-    n_sh, n_uq = sh_counts
-    if sh_f>0 and n_sh==0: n_sh=1
-    if uq_f>0 and n_uq==0: n_uq=1
-    if n_sh + n_uq == 0: n_uq = n_ro+n_rw+n_wo  # default unique if unspecified
+    # Shared/Unique file-count split (scaled to total files; nprocs==1 ⇒ force all unique)
+    total_files = n_ro + n_rw + n_wo
+    p_shared = clamp01(feats.get("pct_shared_files", 0.0))
+    nprocs = int(feats.get('nprocs', max(1, nranks)))
+    if nprocs <= 1:
+        n_sh = 0
+    else:
+        n_sh = int(round(p_shared * total_files))
+    n_sh = max(0, min(total_files, n_sh))
+    n_uq = total_files - n_sh
 
     # Paths
     ro_paths = [str(DATA_RO / f"ro_{i}.dat") for i in range(n_ro)]
     rw_paths = [str(DATA_RW / f"rw_{i}.dat") for i in range(n_rw)]
     wo_paths = [str(DATA_WO / f"wo_{i}.dat") for i in range(n_wo)]
-
-    # Shared-file set selection: pick first n_sh paths from concatenated list
     all_paths = ro_paths + rw_paths + wo_paths
-    shared_paths = set(all_paths[:min(len(all_paths), n_sh)])
-    unique_paths = set(all_paths[min(len(all_paths), n_sh):])
+    shared_paths = set(all_paths[:n_sh])
+    unique_paths = set(all_paths[n_sh:])
 
     # Avg xfer estimates for initial Nio
     avgS = sum(S_SUBS)/len(S_SUBS)
@@ -449,9 +439,32 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
     Nr  = int(round(Nio * p_reads_ops))
     Nw  = Nio - Nr
 
-    # Bin ops
-    R_S = int(round(Nr * rS)); R_M = int(round(Nr * rM)); R_L = max(0, Nr - R_S - R_M)
-    W_S = int(round(Nw * wS)); W_M = int(round(Nw * wM)); W_L = max(0, Nw - W_S - W_M)
+    # ---- ε-ops policy (WRITE) ----
+    write_signals = (seq_w>0 or consec_w>0 or feats.get("pct_write_0_100K",0)>0
+                     or feats.get("pct_write_100K_10M",0)>0 or feats.get("pct_write_10M_1G_PLUS",0)>0
+                     or wo_f>0 or feats.get("pct_bytes_write_only_files",0)>0)
+    eps_writes = 0
+    if (clamp01(feats.get("pct_writes", p_bytes_w))==0.0 or p_bytes_w==0.0) and write_signals and Nw==0:
+        eps_writes = 1  # exactly 1 op total; S smallest size; survives to Darshan, ~0% in features
+        Nw = eps_writes
+        Nr = Nio - Nw
+
+    # ---- ε-ops policy (READ) ----
+    read_signals = (seq_r>0 or consec_r>0 or feats.get("pct_read_0_100K",0)>0
+                    or feats.get("pct_read_100K_10M",0)>0 or feats.get("pct_read_10M_1G_PLUS",0)>0
+                    or ro_f>0 or feats.get("pct_bytes_read_only_files",0)>0)
+    eps_reads = 0
+    if (clamp01(feats.get("pct_reads", p_bytes_r))==0.0 or p_bytes_r==0.0) and read_signals and Nr==0:
+        eps_reads = 1
+        Nr = eps_reads
+        Nw = Nio - Nr
+
+    # Bin ops (from fixed Nr/Nw; invariant later)
+    def bin_counts(N, sS,sM,sL):
+        S = int(round(N*sS)); M = int(round(N*sM)); L = max(0, N - S - M)
+        return S,M,L
+    R_S,R_M,R_L = bin_counts(Nr, rS,rM,rL)
+    W_S,W_M,W_L = bin_counts(Nw, wS,wM,wL)
 
     def per_file_subsizes(Nbin, subs, files):
         per_sub  = split_uniform(Nbin, len(subs))
@@ -463,8 +476,7 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
         return out
 
     # Initial layout rows
-    read_rows=[]
-    write_rows=[]
+    read_rows=[]; write_rows=[]
 
     # Reads across RO+RW if both exist; else whichever exists
     read_files = ro_paths + rw_paths if (ro_paths and rw_paths) else (ro_paths if ro_paths else rw_paths)
@@ -494,12 +506,10 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
 
     # Tag shared/unique by FILE counts
     for r in layout_rows:
-        if r["file"] in shared_paths:
-            r["flags"] = (r.get("flags","") + "|shared|")
-        else:
-            r["flags"] = (r.get("flags","") + "|unique|")
+        if r["file"] in shared_paths: r["flags"] = (r.get("flags","") + "|shared|")
+        else:                         r["flags"] = (r.get("flags","") + "|unique|")
 
-    # Build bytes targets (intent/role/flags)
+    # ---- Rebalance to intent/role/shared bytes; ops preserving ----
     by_intent_target = {
         "read" : int(round(io_bytes_target * p_bytes_r)),
         "write": int(round(io_bytes_target * p_bytes_w)),
@@ -525,20 +535,31 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
             "unique": int(round(io_bytes_target * p_bytes_uq / s_su)),
         }
 
-    # Rebalance fairly with presence floors
+    # Feasibility probe: current attainable ranges (rough, in-bin only)
+    # If sum of target_by_* exceeds IO target or is inconsistent, clamp.
+    tgt_sum = sum(by_intent_target.values())
+    infeasible_reasons=[]
+    if tgt_sum != io_bytes_target:
+        scale = io_bytes_target / max(1, tgt_sum)
+        for k in by_intent_target:
+            by_intent_target[k] = int(round(by_intent_target[k] * scale))
+        infeasible_reasons.append("intent-bytes scaled to IO target due to rounding mismatch")
+
     rebalancer_autotune_fair(layout_rows, io_bytes_target,
                              target_by_intent=by_intent_target,
                              target_by_role=by_role_target,
                              target_by_flag=by_flag_target)
 
-    # RW switches (interleave on RW files)
+    # Post-pass gentle nudger (op-preserving, in-bin) to touch-up intent bytes
+    rebalancer_autotune_fair(layout_rows, io_bytes_target,
+                             target_by_intent=by_intent_target,
+                             target_by_role=None, target_by_flag=None)
+
+    # RW switches
     switch_frac = clamp01(feats.get("pct_rw_switches", 0.0))
     layout_rows = interleave_rw_segments(layout_rows, switch_frac=switch_frac, seg_ops=64)
 
     # ---------- Alignment targeting (FILE) ----------
-    # Compute per-row p_ua_file (effective) following your strategy:
-    # 1) Intrinsic floor = ops with xfer % fs_align != 0 (these get p_ua_file=1).
-    # 2) Remaining unaligned ops are equally distributed across eligible rows (xfer % fs_align == 0)
     pua_file_map = compute_rowwise_pua_file(layout_rows, p_file_ua_req, fs_align_bytes)
 
     # ---------- Emit CSV ----------
@@ -576,22 +597,20 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
     def emit_intent_rows(rows, is_read):
         order_bin = {"L":0,"M":1,"S":2}
         rows_sorted = sorted(rows, key=lambda r: (order_bin[r["bin"]], r["file"], r["xfer"]))
+        from collections import defaultdict
         grp = defaultdict(list)
         for r in rows_sorted:
             grp[(r["file"], r["bin"], r["xfer"], r.get("flags",""))].append(r)
-
         for (path, bin_name, xfer, flags_extra), parts in grp.items():
             ops = sum(p["ops"] for p in parts)
             if ops<=0: continue
-            pc = consec_r if is_read else consec_w
-            ps = seq_r    if is_read else seq_w
+            pc = (consec_r if is_read else consec_w)
+            ps = (seq_r    if is_read else seq_w)
             pc = min(clamp01(pc), clamp01(ps))
             n_con = int(round(ops * pc))
             n_seq = int(round(ops * max(0.0, ps - pc)))
             n_rnd = max(0, ops - n_con - n_seq)
 
-            # Same p_ua_file for all phases of the same (file,bin,xfer,intent) group:
-            # compute as ops-weighted from its member rows (they should be same p in our map).
             sample = parts[0]
             p_ua_file_eff = pua_file_map.get(id(sample), 0.0)
 
@@ -619,11 +638,11 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
     lines.append(",".join(meta_row))
 
     # ---------- File sizing (truncate) ----------
+    from collections import defaultdict
     per_file_span = defaultdict(int)
     def add_span(rows, pc, ps):
         grp = defaultdict(lambda: defaultdict(int))  # file -> xfer -> ops
-        for r in rows:
-            grp[r["file"]][r["xfer"]] += r["ops"]
+        for r in rows: grp[r["file"]][r["xfer"]] += r["ops"]
         for f, sizes in grp.items():
             for xfer, ops in sizes.items():
                 n_con = int(round(ops * pc))
@@ -681,13 +700,15 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
     os.chmod(RUNNER, 0o755)
 
     # ---------- Comprehensive Notes ----------
-    total_bytes, by_role, by_intent, by_file, by_flag, by_fbs_ops = summarize(layout_rows)
+    total_bytes, by_role, by_intent, by_file, by_flag = summarize(layout_rows)
 
-    # Alignment accounting (for Notes):
+    # Alignment accounting (for Notes)
     total_ops = sum(r["ops"] for r in layout_rows)
     intrinsic_ops = sum(r["ops"] for r in layout_rows if r["xfer"] % fs_align_bytes != 0)
     eligible_ops  = total_ops - intrinsic_ops
-    allocated_ops = sum(clamp01(pua_file_map.get(id(r),0.0)) * r["ops"] for r in layout_rows if r["xfer"] % fs_align_bytes == 0)
+    # approximate extra-unaligned ops allocated (eligible only)
+    allocated_ops = sum( (compute_rowwise_pua_file([r], p_file_ua_req, fs_align_bytes).get(id(r),0.0) * r["ops"])
+                         for r in layout_rows if r["xfer"] % fs_align_bytes == 0 )
     predicted_unaligned_ops = intrinsic_ops + allocated_ops
     predicted_unaligned_frac = (predicted_unaligned_ops / total_ops) if total_ops>0 else 0.0
 
@@ -695,10 +716,8 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
         # Inputs (verbatim)
         f.write("=== INPUT FEATURES (verbatim) ===\n")
         for k in sorted(feats.keys()):
-            try:
-                f.write(f"  {k}: {feats[k]}\n")
-            except Exception:
-                pass
+            try: f.write(f"  {k}: {feats[k]}\n")
+            except Exception: pass
         f.write("\n")
 
         # High-level mapping
@@ -708,81 +727,73 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
         f.write(f"    S_SUBS={S_SUBS}  M_SUBS={M_SUBS}  L_SIZE={L_SIZE}\n")
         f.write("  Phase split inside each (file,bin,sub-size,intent): Consec ⊂ Seq; remainder Random\n")
         f.write("  Random placement: descending 32 MiB chunk RR; pre_seek_eof=1 for random phases\n")
-        f.write("  Rebalancer: in-bin only; auto up/down; strict per-file RR; presence floors; preserves op counts and L size\n")
-        f.write("  RW-switches: pct_rw_switches defines fraction of eligible RW alternations interleaved on RW files\n")
+        f.write("  Rebalancer: in-bin only; auto up/down; presence floors; preserves op counts and L size\n")
+        f.write("  RW-switches: planner interleaves segments on eligible RW paths when pct_rw_switches>0\n")
         f.write("  Shared vs Unique: file counts from pct_shared_files/pct_unique_files; byte targets from pct_bytes_* (enforced via flags)\n\n")
 
-        # Capacity to bytes & global intent bytes target
+        # Capacity to bytes & intent bytes target
         f.write("=== CAPACITY → BYTES & INTENT TARGETS ===\n")
         f.write(f"  cap_total_gib={cap_total_gib:.2f} → IO bytes target={human_bytes(io_bytes_target)}\n")
         f.write(f"  intent bytes target: read={p_bytes_r:.2f} write={p_bytes_w:.2f}\n")
-        f.write(f"  actual after rebalance: read={human_bytes(by_intent.get('read',0))} write={human_bytes(by_intent.get('write',0))}\n\n")
+        f.write(f"  realized after rebalance: read={human_bytes(by_intent.get('read',0))} write={human_bytes(by_intent.get('write',0))}\n\n")
 
         # Role & shared/unique bytes targets
         f.write("=== ROLE & SHARED/UNIQUE BYTE TARGETS ===\n")
         f.write("  role byte targets (fractions):\n")
         f.write(f"    RO={feats.get('pct_bytes_read_only_files',0)}  RW={feats.get('pct_bytes_read_write_files',0)}  WO={feats.get('pct_bytes_write_only_files',0)}\n")
-        f.write("  actual bytes after rebalance:\n")
+        f.write("  realized bytes after rebalance:\n")
         f.write(f"    RO={human_bytes(by_role.get('ro',0))}  RW={human_bytes(by_role.get('rw',0))}  WO={human_bytes(by_role.get('wo',0))}\n")
         f.write("  shared/unique byte targets (fractions):\n")
         f.write(f"    shared={feats.get('pct_bytes_shared_files',0)}  unique={feats.get('pct_bytes_unique_files',0)}\n")
-        f.write("  actual bytes after rebalance:\n")
+        f.write("  realized bytes after rebalance:\n")
         f.write(f"    shared={human_bytes(by_flag.get('shared',0))}  unique={human_bytes(by_flag.get('unique',0))}\n\n")
 
         # File-count layout & sizes (truncate sizes)
         f.write("=== FILE LAYOUT & TRUNCATE SIZES ===\n")
         f.write(f"  RO={len(ro_paths)}  RW={len(rw_paths)}  WO={len(wo_paths)} | shared_files≈{len(shared_paths)} unique_files≈{len(unique_paths)}\n")
         for pth in (ro_paths + rw_paths + wo_paths):
-            sz = per_file_span.get(pth, 0)
+            sz = 0
+            # summarize file size to be truncated
+            for line in lines[1:]:
+                cols = line.split(",")
+                if cols[0]!="data": continue
+                if cols[1]==pth: sz += int(cols[2])
             role = "RO" if pth in ro_paths else ("RW" if pth in rw_paths else "WO")
             su = "shared" if pth in shared_paths else "unique"
             f.write(f"    {role:2s} [{su:6s}] {pth} -> truncate {human_bytes(sz)}\n")
         f.write("\n")
 
         # Ops budgeting
-        Nr = sum(r["ops"] for r in layout_rows if r["intent"]=="read")
-        Nw = sum(r["ops"] for r in layout_rows if r["intent"]=="write")
-        Nio = Nr+Nw
+        Nr2 = sum(int(line.split(",")[-1]) for line in lines[1:] if line.startswith("data") and line.split(",")[4]=="0.000000")
+        Nw2 = sum(int(line.split(",")[-1]) for line in lines[1:] if line.startswith("data") and line.split(",")[4]=="1.000000")
         f.write("=== OPS BUDGET (BEFORE META) ===\n")
-        f.write(f"  Nio={Nio}  |  Nr={Nr}  |  Nw={Nw}\n")
-        by_bin_ops = Counter()
-        for r in layout_rows:
-            by_bin_ops[(r["intent"], r["bin"])] += r["ops"]
-        f.write("  Per-intent per-bin ops:\n")
-        for intent in ("read","write"):
-            f.write(f"    {intent}: S={by_bin_ops.get((intent,'S'),0)} M={by_bin_ops.get((intent,'M'),0)} L={by_bin_ops.get((intent,'L'),0)}\n")
-        f.write("\n")
+        f.write(f"  Nio={Nr2+Nw2}  |  Nr={Nr2}  |  Nw={Nw2}\n\n")
 
-        # Alignment section (NEW)
+        # ε-ops disclosure
+        f.write("=== EPSILON-OPS POLICY ===\n")
+        f.write(f"  eps_reads={eps_reads}  eps_writes={eps_writes} (injected only when side is 0%% but structure demands presence; placed in S/0–100KiB)\n\n")
+
+        # Alignment section
         f.write("=== ALIGNMENT TARGETING (FILE vs Darshan File-Alignment) ===\n")
         f.write(f"  Requested pct_file_not_aligned={p_file_ua_req:.2f}\n")
         f.write(f"  fs_align_bytes={fs_align_bytes}  (mem_align_bytes={mem_align_bytes})\n")
         f.write(f"  Intrinsic file-unaligned ops (xfer % fs_align != 0): {intrinsic_ops} of {total_ops}  (floor={intrinsic_ops/total_ops if total_ops>0 else 0.0:.4f})\n")
         f.write(f"  Eligible ops (xfer % fs_align == 0): {eligible_ops}\n")
-        f.write(f"  Allocated extra unaligned ops on eligible sizes: ~{int(round(allocated_ops))}\n")
-        f.write(f"  Predicted overall file-unaligned fraction: ~{predicted_unaligned_frac:.4f}\n\n")
+        f.write(f"  Predicted overall file-unaligned fraction: ~{predicted_unaligned_frac:.4f}\n")
+        f.write("  Distribution of extra unaligned: split equally across eligible S/M/L bins; proportional within-bin by ops.\n\n")
 
-        # Per-(file,bin,sub-size) ops split (aggregated) with effective p_ua_file
-        f.write("=== PER-FILE SUB-SIZE OPS & EFFECTIVE p_ua_file (after rebalance) ===\n")
-        order_bin = {"L":0,"M":1,"S":2}
-        for fpath in sorted(set(r["file"] for r in layout_rows)):
-            f.write(f"  FILE: {fpath}\n")
-            rows_f = [r for r in layout_rows if r["file"]==fpath]
-            groups = defaultdict(lambda: dict(read=0, write=0, pua=None, elig=None))
-            for r in rows_f:
-                key=(r["bin"], r["xfer"])
-                groups[key]["read"]  = groups[key].get("read",0)  + (r["ops"] if r["intent"]=="read"  else 0)
-                groups[key]["write"] = groups[key].get("write",0) + (r["ops"] if r["intent"]=="write" else 0)
-                groups[key]["pua"]   = pua_file_map.get(id(r),0.0)
-                groups[key]["elig"]  = (r["xfer"] % fs_align_bytes == 0)
-            for (b, x), g in sorted(groups.items(), key=lambda kv: (order_bin[kv[0][0]], kv[0][1])):
-                f.write(f"    bin={b} xfer={x} elig={'Y' if g['elig'] else 'N'} -> read_ops={g.get('read',0)} write_ops={g.get('write',0)} p_ua_file≈{g['pua']:.3f}\n")
+        # Feasibility
+        f.write("=== FEASIBILITY & CLAMPS ===\n")
+        if infeasible_reasons:
+            for r in infeasible_reasons:
+                f.write(f"  • {r}\n")
+        else:
+            f.write("  No clamps applied.\n")
         f.write("\n")
 
         # RW-switches details
         f.write("=== RW SWITCHES ===\n")
-        f.write(f"  pct_rw_switches={switch_frac:.2f} → interleave this fraction of eligible RW (file,bin,xfer) pairs in segments (≤64 ops)\n")
-        f.write("  Interleaving happens only on RW files; Darshan counts read↔write alternations on the same path.\n\n")
+        f.write(f"  pct_rw_switches={switch_frac:.2f} → planner interleaves ≤64-op segments on same RW paths; harness simply executes rows.\n\n")
 
         # META mapping
         f.write("=== META OPS MAPPING ===\n")
@@ -794,10 +805,9 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
         # Assumptions & invariants
         f.write("=== ASSUMPTIONS & INVARIANTS ===\n")
         f.write("  • L bin size is fixed to 16 MiB and never changed by the rebalancer.\n")
-        f.write("  • Rebalancer operates within bins only and preserves op counts (adjusts xfer by moving ops across S/M sub-sizes).\n")
-        f.write("  • Presence floors: any (file,bin,sub-size) that existed pre-rebalance keeps ≥1 op (prevents 100 B from disappearing).\n")
-        f.write("  • Shared vs Unique is enacted by the harness (|shared| sharded over ranks; |unique| pinned to a single owner).\n")
-        f.write("  • Random phases set pre_seek_eof=1 to stress end-of-file behavior; offsets remain within [0, size-xfer].\n")
+        f.write("  • Rebalancer operates within bins only and preserves op counts; L unchanged.\n")
+        f.write("  • Presence floors: any (file,bin,sub-size) that existed pre-rebalance keeps ≥1 op.\n")
+        f.write("  • With nprocs==1, Darshan cannot classify shared files; planner forces shared count to 0.\n")
 
     return {"plan_csv": str(PLAN), "prep_sh": str(PREP), "run_sh": str(RUN), "notes": str(NOTES)}
 

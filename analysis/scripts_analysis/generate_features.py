@@ -33,7 +33,8 @@ input_csv    = os.path.join(root_dir, "darshan_summary.csv")
 filtered_csv = os.path.join(root_dir, "darshan_summary_filtered.csv")
 output_json  = os.path.join(root_dir, "darshan_features_updated.json")
 # filter threshold (bytes)
-threshold    = 100 * 1024 * 1024  # 100 MB
+# threshold    = 100 * 1024 * 1024  # 100 MB
+threshold    = 0
 # ────────────────────────────────────────────────────────────────────────────────
 
 # 1) Load raw data

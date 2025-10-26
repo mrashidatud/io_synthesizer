@@ -4,16 +4,18 @@ set -euo pipefail
 ROOT="/mnt/hasanfs/io_synthesizer"
 BIN_DIR="/mnt/hasanfs/bin"
 OUT_ROOT="/mnt/hasanfs/out_synth"
-INPUT_DIR="${ROOT}/inputs/exemplar_jsons"   # per your request
+INPUT_DIR="${ROOT}/inputs/exemplar_jsons"
 FEATS_SCRIPT="${ROOT}/scripts/features2synth_opsaware.py"
 
-# Defaults (override on CLI: --cap 512 --nprocs 4 --nprocs-cap 64 --inputs <dir> --force-build)
+# Defaults
 CAP_TOTAL_GIB=512
-NPROCS_OVERRIDE=""      # optional, capped by NPROCS_CAP if provided
-NPROCS_CAP=64           # ✅ user-configurable cap via --nprocs-cap
+NPROCS_OVERRIDE=""
+NPROCS_CAP=64
 FORCE_BUILD=0
+DELETE_DARSHAN=0
 
-# Parse optional overrides
+# -------- Parse options (flags first, then filters/ranges) --------
+ARGS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --cap) CAP_TOTAL_GIB="$2"; shift 2;;
@@ -21,11 +23,19 @@ while [[ $# -gt 0 ]]; do
     --nprocs-cap) NPROCS_CAP="$2"; shift 2;;
     --inputs) INPUT_DIR="$2"; shift 2;;
     --force-build) FORCE_BUILD=1; shift 1;;
-    *) echo "Unknown arg: $1"; exit 1;;
+    --delete-darshan) DELETE_DARSHAN=1; shift 1;;
+    --) shift; break;;
+    -*)
+      echo "Unknown option: $1" >&2; exit 1;;
+    *)
+      ARGS+=("$1"); shift 1;;
   esac
 done
+# Anything after -- is also treated as filters
+if [[ $# -gt 0 ]]; then ARGS+=("$@"); fi
+FILTERS=( "${ARGS[@]}" )
 
-# Basic validation on numeric args
+# -------- Basic validation --------
 if [[ -n "${NPROCS_OVERRIDE}" && ! "${NPROCS_OVERRIDE}" =~ ^[0-9]+$ ]]; then
   echo "Error: --nprocs must be an integer" >&2; exit 1
 fi
@@ -51,37 +61,72 @@ else
   echo "⏭️  mpi_synthio already exists at ${BIN_DIR}/mpi_synthio — skipping build (use --force-build to rebuild)"
 fi
 
-# Gather JSONs
-mapfile -t JSONS < <(find "${INPUT_DIR}" -maxdepth 1 -type f -name "*.json" | sort)
+# -------- Collect JSONs to run (supports ranges & explicit names) --------
+declare -a JSONS=()
+declare -A SEEN=()  # to dedupe
+add_json() {
+  local path="$1"
+  if [[ -f "$path" ]]; then
+    local rp; rp="$(realpath "$path")"
+    if [[ -z "${SEEN[$rp]:-}" ]]; then
+      JSONS+=( "$rp" ); SEEN[$rp]=1
+    fi
+  fi
+}
+
+if [[ ${#FILTERS[@]} -gt 0 ]]; then
+  echo "ℹ️  Limiting to filters: ${FILTERS[*]}"
+  for tok in "${FILTERS[@]}"; do
+    if [[ "$tok" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+      # Range like 1-10  → include all topN_*.json for N in [start..end]
+      start="${BASH_REMATCH[1]}"; end="${BASH_REMATCH[2]}"
+      if (( start > end )); then tmp="$start"; start="$end"; end="$tmp"; fi
+      for ((n=start; n<=end; n++)); do
+        # include every top<n>_*.json that exists
+        shopt -s nullglob
+        for f in "${INPUT_DIR}/top${n}_"*.json; do add_json "$f"; done
+        shopt -u nullglob
+      done
+    elif [[ "$tok" =~ ^[0-9]+$ ]]; then
+      # Single number like 7 → top7_*.json
+      n="$tok"
+      shopt -s nullglob
+      for f in "${INPUT_DIR}/top${n}_"*.json; do add_json "$f"; done
+      shopt -u nullglob
+    else
+      # Base name like top8_48 (with or without .json)
+      base="${tok%.json}.json"
+      add_json "${INPUT_DIR}/${base}"
+    fi
+  done
+else
+  # Default: all *.json in INPUT_DIR
+  while IFS= read -r f; do add_json "$f"; done \
+    < <(find "${INPUT_DIR}" -maxdepth 1 -type f -name "*.json" -print0 | xargs -0 -I{} realpath "{}" | sort)
+fi
+
 if [[ ${#JSONS[@]} -eq 0 ]]; then
-  echo "No JSON inputs found in ${INPUT_DIR}"
+  echo "No JSON inputs selected/found (INPUT_DIR=${INPUT_DIR})."
   exit 0
 fi
 
 echo "=== STEP 1..N: Plan, run, validate, analyze for each input ==="
-for J in "${JSONS[@]}"; do
-  JSON_ABS="$(realpath "$J")"
-  JSON_NAME="$(basename "$J")"
+for JSON_ABS in "${JSONS[@]}"; do
+  JSON_NAME="$(basename "$JSON_ABS")"
   JSON_BASE="${JSON_NAME%.json}"
   echo ""
   echo "---- Processing: ${JSON_NAME} ----"
 
-  # Determine nprocs to pass (cap at NPROCS_CAP if provided or if present in input JSON)
+  # Determine nprocs to pass (cap at NPROCS_CAP if provided or present in input JSON)
   DESIRED_NPROCS=""
   if [[ -n "${NPROCS_OVERRIDE}" ]]; then
-    # CLI override (cap at NPROCS_CAP)
-    if (( NPROCS_OVERRIDE > NPROCS_CAP )); then
-      DESIRED_NPROCS="${NPROCS_CAP}"
-    else
-      DESIRED_NPROCS="${NPROCS_OVERRIDE}"
-    fi
+    if (( NPROCS_OVERRIDE > NPROCS_CAP )); then DESIRED_NPROCS="${NPROCS_CAP}"; else DESIRED_NPROCS="${NPROCS_OVERRIDE}"; fi
   else
-    # If input JSON has nprocs, cap at NPROCS_CAP and pass it; else let planner decide
     JSON_NPROCS="$(python3 - "$JSON_ABS" <<'PY'
 import json,sys
 try:
     d=json.load(open(sys.argv[1]))
-    n=d.get("nprocs", "")
+    n=d.get("nprocs","")
     if isinstance(n,int): print(n)
     elif isinstance(n,str) and n.isdigit(): print(int(n))
     else: print("")
@@ -90,15 +135,11 @@ except Exception:
 PY
 )"
     if [[ -n "${JSON_NPROCS}" ]]; then
-      if (( JSON_NPROCS > NPROCS_CAP )); then
-        DESIRED_NPROCS="${NPROCS_CAP}"
-      else
-        DESIRED_NPROCS="${JSON_NPROCS}"
-      fi
+      if (( JSON_NPROCS > NPROCS_CAP )); then DESIRED_NPROCS="${NPROCS_CAP}"; else DESIRED_NPROCS="${JSON_NPROCS}"; fi
     fi
   fi
 
-  # Plan (generate prep/run scripts) — always force posix/posix/none as requested
+  # Plan (generate prep/run scripts) — always force posix/posix/none
   echo "[Plan] features2synth_opsaware.py for ${JSON_NAME}"
   cd "${ROOT}"
   CMD=( python3 "${FEATS_SCRIPT}" --features "${JSON_ABS}" --cap-total-gib "${CAP_TOTAL_GIB}" )
@@ -123,11 +164,17 @@ PY
     continue
   fi
 
-  # Extract DARSHAN_LOGFILE from the run script
+  # Optional: delete existing Darshan files for this case before running
+  if [[ ${DELETE_DARSHAN} -eq 1 ]]; then
+    echo "[Pre-run] --delete-darshan enabled → removing any existing Darshan files in ${RUN_ROOT}"
+    rm -f "${RUN_ROOT}"/*.darshan 2>/dev/null || true
+  fi
+
+  # Extract DARSHAN_LOGFILE from the run script (used for validation)
   EXPECTED="$(awk -F"'" '/^export[[:space:]]+DARSHAN_LOGFILE=/{print $2}' "${RUN_SH}" || true)"
 
-  # If the exact .darshan already exists, skip execution
-  if [[ -n "${EXPECTED}" && -f "${EXPECTED}" ]]; then
+  # If the exact .darshan already exists AND we didn't delete it, skip execution
+  if [[ ${DELETE_DARSHAN} -eq 0 && -n "${EXPECTED}" && -f "${EXPECTED}" ]]; then
     echo "⏭️  Found existing Darshan artifact:"
     echo "    ${EXPECTED}"
     echo "    Skipping execution and proceeding to analysis."
@@ -145,10 +192,16 @@ PY
         echo "⚠️  Expected Darshan not found: ${EXPECTED}"
         echo "    Present .darshan files in ${RUN_ROOT}:"
         ls -l "${RUN_ROOT}"/*.darshan 2>/dev/null || true
+        # Cleanup subdirs in payload before moving on
+        PAYLOAD_DIR="${RUN_ROOT}/payload"
+        if [[ -d "${PAYLOAD_DIR}" ]]; then
+          echo "[Cleanup] Removing subdirectories inside ${PAYLOAD_DIR}"
+          find "${PAYLOAD_DIR}" -mindepth 1 -maxdepth 1 -type d -exec rm -rf {} + 2>/dev/null || true
+        fi
         continue
       fi
     else
-      # Fallback: try to find a single .darshan file if ENV var wasn't set
+      # Fallback: try to find a single .darshan if ENV var wasn't set
       shopt -s nullglob
       found=( "${RUN_ROOT}"/*.darshan )
       shopt -u nullglob
@@ -157,22 +210,43 @@ PY
         echo "ℹ️  Using discovered darshan file: ${EXPECTED}"
       else
         echo "❌ Could not determine Darshan artifact to analyze."
+        # Cleanup subdirs in payload before moving on
+        PAYLOAD_DIR="${RUN_ROOT}/payload"
+        if [[ -d "${PAYLOAD_DIR}" ]]; then
+          echo "[Cleanup] Removing subdirectories inside ${PAYLOAD_DIR}"
+          find "${PAYLOAD_DIR}" -mindepth 1 -maxdepth 1 -type d -exec rm -rf {} + 2>/dev/null || true
+        fi
         continue
       fi
     fi
   fi
 
-  # Analyze (merged script)
+  # Analyze (merged script) — tolerant of non-zero to keep loop going
   echo "[Analyze] merged analysis for ${JSON_NAME}"
   ANALYZE="${ROOT}/analysis/scripts_analysis/analyze_darshan_merged.py"
   if [[ ! -f "${ANALYZE}" ]]; then
     echo "❌ Missing ${ANALYZE}. Please place the merged script there."
-    continue
+    ANALYZE_RC=127
+  else
+    set +e
+    python3 "${ANALYZE}" \
+        --darshan "${EXPECTED}" \
+        --input-json "${JSON_ABS}" \
+        --outdir "${RUN_ROOT}"
+    ANALYZE_RC=$?
+    set -e
   fi
-  python3 "${ANALYZE}" \
-      --darshan "${EXPECTED}" \
-      --input-json "${JSON_ABS}" \
-      --outdir "${RUN_ROOT}"
+
+  if [[ ${ANALYZE_RC} -ne 0 ]]; then
+    echo "⚠️  Analysis returned non-zero (${ANALYZE_RC}) for ${JSON_NAME}. Continuing with next input."
+  fi
+
+  # -------- Post-analysis cleanup: remove only subdirectories inside payload --------
+  PAYLOAD_DIR="${RUN_ROOT}/payload"
+  if [[ -d "${PAYLOAD_DIR}" ]]; then
+    echo "[Cleanup] Removing subdirectories inside ${PAYLOAD_DIR}"
+    find "${PAYLOAD_DIR}" -mindepth 1 -maxdepth 1 -type d -exec rm -rf {} + 2>/dev/null || true
+  fi
 
   echo "---- Done: ${JSON_NAME} ----"
 done
