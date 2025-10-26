@@ -230,25 +230,47 @@ static void do_posix_data(const phase_t* p, int phase_idx)
     if(fstat(fd,&st)!=0){ perror("fstat"); close(fd); return; }
     off_t fsz = st.st_size;
 
-    /* Compute consec/seq/random counts from local ops */
+    /* ----- Split local ops into consec / seq / random (intent-aware) ----- */
     double p_con, p_seq;
-    if(is_write){
+    if (is_write) {
         p_con = p->p_consec_w;
         p_seq = p->p_seq_w;
-    }else{
+    } else {
         p_con = p->p_consec_r;
         p_seq = p->p_seq_r;
     }
-    if(p_con > p_seq) p_con = p_seq;
 
-    uint64_t N_con = (uint64_t)llround((double)Nops_local * p_con);
-    uint64_t N_seq = 0;
-    if(p_seq > p_con){ N_seq = (uint64_t)llround((double)Nops_local * (p_seq - p_con)); }
-    if(N_con + N_seq > Nops_local) {
-        if(N_con > Nops_local) N_con=Nops_local;
-        N_seq = Nops_local - N_con;
-    }
+    /* Clamp to [0,1] and enforce Consec ⊂ Seq (so seq ≥ consec) */
+    if (p_con < 0.0) p_con = 0.0; if (p_con > 1.0) p_con = 1.0;
+    if (p_seq < 0.0) p_seq = 0.0; if (p_seq > 1.0) p_seq = 1.0;
+    if (p_seq < p_con) p_seq = p_con;
+
+    /* Integerize with rounding; keep totals consistent */
+    uint64_t N_con = (uint64_t) llround((double)Nops_local * p_con);
+    uint64_t N_seq = (uint64_t) llround((double)Nops_local * (p_seq - p_con));
+
+    /* Backstop rounding so we never exceed Nops_local */
+    if (N_con > Nops_local) N_con = Nops_local;
+    if (N_seq > Nops_local - N_con) N_seq = Nops_local - N_con;
+
     uint64_t N_rnd = Nops_local - N_con - N_seq;
+
+    /* ε-ops safeguard: if structure is requested but rounding killed it, donate 1 op */
+    if ((p_seq > p_con) && (N_seq == 0) && (N_rnd > 0)) { N_seq++; N_rnd--; }
+    if ((p_con > 0.0) && (N_con == 0) && (N_rnd > 0))     { N_con++; N_rnd--; }
+
+    /* Final assert-like guards (no negatives, exact sum) */
+    if ((int64_t)N_rnd < 0) {
+        /* prefer to steal back from seq, then consec */
+        uint64_t need = (uint64_t)(-(int64_t)N_rnd);
+        uint64_t take = (N_seq >= need) ? need : N_seq;
+        N_seq -= take; need -= take;
+        if (need > 0) { 
+            take = (N_con >= need) ? need : N_con;
+            N_con -= take; need -= take;
+        }
+        N_rnd = Nops_local - N_con - N_seq;
+    }
 
     /* Large-op file alignment quotas (aligned vs unaligned) */
     int large = (p->xfer >= LUSTRE_FILE_ALIGN) ? 1 : 0;
@@ -272,45 +294,106 @@ static void do_posix_data(const phase_t* p, int phase_idx)
 
     /* ----- Consecutive ----- */
     off_t cur = 0;
-    for(uint64_t i=0;i<N_con;i++){
-        off_t start = cur;
-        if(large){
-            if(unaligned_left>0){
-                start = force_unaligned_start(start);
-                unaligned_left--;
-            }else if(aligned_left>0){
-                start = force_aligned_start(start);
-                aligned_left--;
+    if (N_con > 0) {
+        if (large) {
+            uint64_t U = (unaligned_left > N_con) ? N_con : unaligned_left;
+            uint64_t A = N_con - U;
+
+            /* Unaligned run first (if any) */
+            if (U > 0) {
+                off_t start = force_unaligned_start(cur);
+                start = clamp_range(start, fsz, p->xfer);
+                for (uint64_t i = 0; i < U; i++) {
+                    void* use_ptr = (mis_left>0) ? mis_ptr : aligned_ptr;
+                    if (mis_left>0) mis_left--;
+                    if (do_prw(fd, use_ptr, (size_t)p->xfer, start, is_write) < 0) {
+                        perror(is_write?"pwrite":"pread"); U = 0; break;
+                    }
+                    start += (off_t)p->xfer; /* exactly adjacent */
+                }
+                cur = (off_t)start;
+                unaligned_left -= U;
             }
+
+            /* Aligned run next (if any) */
+            if (A > 0) {
+                off_t start = force_aligned_start(cur);
+                start = clamp_range(start, fsz, p->xfer);
+                for (uint64_t i = 0; i < A; i++) {
+                    void* use_ptr = (mis_left>0) ? mis_ptr : aligned_ptr;
+                    if (mis_left>0) mis_left--;
+                    if (do_prw(fd, use_ptr, (size_t)p->xfer, start, is_write) < 0) {
+                        perror(is_write?"pwrite":"pread"); break;
+                    }
+                    start += (off_t)p->xfer; /* exactly adjacent */
+                }
+                cur = (off_t)start;
+                if (aligned_left >= A) aligned_left -= A; else aligned_left = 0;
+            }
+        } else {
+            /* Small xfers: keep strict adjacency; no per-op align toggle */
+            off_t start = clamp_range(cur, fsz, p->xfer);
+            for (uint64_t i=0; i<N_con; i++) {
+                void* use_ptr = (mis_left>0) ? mis_ptr : aligned_ptr;
+                if (mis_left>0) mis_left--;
+                if (do_prw(fd, use_ptr, (size_t)p->xfer, start, is_write) < 0) {
+                    perror(is_write?"pwrite":"pread"); break;
+                }
+                start += (off_t)p->xfer;
+            }
+            cur = start;
         }
-        start = clamp_range(start, fsz, p->xfer);
-        void* use_ptr = (mis_left>0) ? mis_ptr : aligned_ptr;
-        if(mis_left>0) mis_left--;
-        if(do_prw(fd, use_ptr, (size_t)p->xfer, start, is_write)<0){
-            perror(is_write?"pwrite":"pread"); break;
-        }
-        cur = start + (off_t)p->xfer; /* exactly adjacent */
     }
 
     /* ----- Sequential remainder (gap = xfer) ----- */
-    for(uint64_t i=0;i<N_seq;i++){
-        off_t start = cur + (off_t)p->xfer; /* seq-but-not-consec with fixed gap */
-        if(large){
-            if(unaligned_left>0){
-                start = force_unaligned_start(start);
-                unaligned_left--;
-            }else if(aligned_left>0){
-                start = force_aligned_start(start);
-                aligned_left--;
+    if (N_seq > 0) {
+        if (large) {
+            uint64_t U = (unaligned_left > N_seq) ? N_seq : unaligned_left;
+            uint64_t A = N_seq - U;
+
+            /* Unaligned seq-run (gap = xfer) */
+            if (U > 0) {
+                off_t start = force_unaligned_start(cur + (off_t)p->xfer);
+                start = clamp_range(start, fsz, p->xfer);
+                for (uint64_t i=0; i<U; i++) {
+                    void* use_ptr = (mis_left>0) ? mis_ptr : aligned_ptr;
+                    if (mis_left>0) mis_left--;
+                    if (do_prw(fd, use_ptr, (size_t)p->xfer, start, is_write) < 0) {
+                        perror(is_write?"pwrite":"pread"); U = 0; break;
+                    }
+                    start += (off_t)(p->xfer * 2); /* fixed gap */
+                }
+                cur = start - (off_t)p->xfer;
+                unaligned_left -= U;
             }
+
+            /* Aligned seq-run */
+            if (A > 0) {
+                off_t start = force_aligned_start(cur + (off_t)p->xfer);
+                start = clamp_range(start, fsz, p->xfer);
+                for (uint64_t i=0; i<A; i++) {
+                    void* use_ptr = (mis_left>0) ? mis_ptr : aligned_ptr;
+                    if (mis_left>0) mis_left--;
+                    if (do_prw(fd, use_ptr, (size_t)p->xfer, start, is_write) < 0) {
+                        perror(is_write?"pwrite":"pread"); break;
+                    }
+                    start += (off_t)(p->xfer * 2); /* fixed gap */
+                }
+                cur = start - (off_t)p->xfer;
+                if (aligned_left >= A) aligned_left -= A; else aligned_left = 0;
+            }
+        } else {
+            off_t start = clamp_range(cur + (off_t)p->xfer, fsz, p->xfer);
+            for (uint64_t i=0; i<N_seq; i++) {
+                void* use_ptr = (mis_left>0) ? mis_ptr : aligned_ptr;
+                if (mis_left>0) mis_left--;
+                if (do_prw(fd, use_ptr, (size_t)p->xfer, start, is_write) < 0) {
+                    perror(is_write?"pwrite":"pread"); break;
+                }
+                start += (off_t)(p->xfer * 2);
+            }
+            cur = start - (off_t)p->xfer;
         }
-        start = clamp_range(start, fsz, p->xfer);
-        void* use_ptr = (mis_left>0) ? mis_ptr : aligned_ptr;
-        if(mis_left>0) mis_left--;
-        if(do_prw(fd, use_ptr, (size_t)p->xfer, start, is_write)<0){
-            perror(is_write?"pwrite":"pread"); break;
-        }
-        cur = start + (off_t)p->xfer;
     }
 
     /* ----- Random (descending 32MiB chunks; optional pre-seek-eof) ----- */

@@ -101,6 +101,8 @@ S_SUBS = [100, 1024, 4096, 65536]            # 100 B, 1 KiB, 4 KiB, 64 KiB
 M_SUBS = [256*1024, 1<<20, 4*(1<<20)]        # 256 KiB, 1 MiB, 4 MiB
 L_SIZE = 16*(1<<20)                          # fixed 16 MiB
 
+L_CHOICES = [12 * (1<<20), 16 * (1<<20), 24 * (1<<20)]  # bytes; in-bin, all "L"
+
 CHUNK_RANDOM = 32*(1<<20)
 
 # ---------------- Helpers ----------------
@@ -265,6 +267,111 @@ def rebalancer_autotune_fair(rows, target_total_bytes,
             cur = bytes_of(pred)
 
     eps = min(S_SUBS)
+    
+    def _tune_intent_bytes_in_L(intent_label: str, delta_bytes: int,
+                                choices=L_CHOICES, fairness_rr=True, max_moves=None):
+        """
+        Change bytes for a given intent by moving L-ops across {12,16,24} MiB *without* changing op counts.
+        delta_bytes > 0  -> need to INCREASE bytes (promote 12->16->24)
+        delta_bytes < 0  -> need to DECREASE bytes (demote 24->16->12)
+        Returns the actual bytes changed (signed).
+        """
+
+        if delta_bytes == 0:
+            return 0
+
+        # Collect candidate rows (bin=L) for this intent, bucketed by xfer size and file.
+        from collections import defaultdict, deque
+        by_sz = defaultdict(list)  # size -> [rows]
+        for r in rows:
+            if r.get("intent") == intent_label and r.get("bin") == "L" and r.get("ops",0) > 0:
+                by_sz[r["xfer"]].append(r)
+
+        if not by_sz:
+            return 0
+
+        # Helper to fair-share by file (largest-ops first per file)
+        def _queue_for(size):
+            by_file = defaultdict(list)
+            for r in by_sz.get(size, []):
+                by_file[r["file"]].append(r)
+            for f in by_file:
+                by_file[f].sort(key=lambda rr: -rr["ops"])
+            return deque(sorted(by_file.keys())), by_file
+
+        changed = 0
+
+        # Decide promotion/demotion order
+        if delta_bytes > 0:
+            # INCREASE bytes: promote 12->16 first, then 16->24
+            pairs = [(choices[0], choices[1]), (choices[1], choices[2])]
+        else:
+            # DECREASE bytes: demote 24->16 first, then 16->12
+            pairs = [(choices[2], choices[1]), (choices[1], choices[0])]
+
+        # How many ops max to move? If not provided, derive from needed delta.
+        def _ops_needed(per_op_delta):
+            need = abs(delta_bytes) - abs(changed)
+            if need <= 0: return 0
+            return int((need + per_op_delta - 1) // per_op_delta)  # ceil
+
+        # For each adjacent size-pair, move ops fairly across files
+        for src, dst in pairs:
+            if abs(delta_bytes) <= abs(changed):
+                break
+            if not by_sz.get(src):
+                continue
+
+            per_op_delta = abs(dst - src)
+            q, by_file = _queue_for(src)
+
+            # derive a sensible cap from demand if max_moves not forced
+            cap_ops = _ops_needed(per_op_delta) if max_moves is None else max_moves
+            if cap_ops <= 0:
+                continue
+
+            moved_ops = 0
+            while q and moved_ops < cap_ops and abs(delta_bytes) > abs(changed):
+                f = q.popleft()
+                bucket = by_file[f]
+                while bucket and bucket[0]["ops"] == 0:
+                    bucket.pop(0)
+                if not bucket:
+                    continue
+
+                r = bucket[0]
+                take = min(r["ops"], cap_ops - moved_ops)
+                if take <= 0:
+                    continue
+
+                # materialize/append a sibling at dst (same meta, xfer=dst, ops=take)
+                nr = dict(r)
+                nr["xfer"] = dst
+                nr["ops"]  = take
+                rows.append(nr)
+                by_sz[dst].append(nr)
+
+                r["ops"] -= take
+                moved_ops += take
+                changed += (dst - src) * take
+
+                # requeue if still has movable ops and we still need change
+                if fairness_rr and r["ops"] > 0 and abs(delta_bytes) > abs(changed) and moved_ops < cap_ops:
+                    q.append(f)
+
+        return changed
+
+    # --- Pre-pass: bidirectional tuning on L to meet per-intent byte targets using {12,16,24} ---
+    if target_by_intent:
+        def _bytes_of_intent(lbl):
+            return sum(r["xfer"]*r["ops"] for r in rows if r.get("intent")==lbl)
+
+        TOL = 4 * (1<<20)  # 4 MiB
+        for intent, tgt_bytes in target_by_intent.items():
+            cur = _bytes_of_intent(intent)
+            if abs(cur - tgt_bytes) > TOL:
+                # Move just enough bytes on L by promoting/demoting across {12,16,24}
+                _tune_intent_bytes_in_L(intent_label=intent, delta_bytes=(tgt_bytes - cur))
 
     if target_by_intent:
         for intent, tgt in target_by_intent.items():
@@ -805,7 +912,10 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
         # Assumptions & invariants
         f.write("=== ASSUMPTIONS & INVARIANTS ===\n")
         f.write("  • L bin size is fixed to 16 MiB and never changed by the rebalancer.\n")
-        f.write("  • Rebalancer operates within bins only and preserves op counts; L unchanged.\n")
+        f.write("  • Rebalancer: in-bin only, op-preserving, presence floors. L bin uses a bounded ladder {12,16,24} MiB \
+            to auto up/down-tune per intent (read/write) before the fair in-bin nudger; S/M adjust only within \
+            their fixed ladders. Keeps 10M+ constraints intact. \
+            \n")
         f.write("  • Presence floors: any (file,bin,sub-size) that existed pre-rebalance keeps ≥1 op.\n")
         f.write("  • With nprocs==1, Darshan cannot classify shared files; planner forces shared count to 0.\n")
 
