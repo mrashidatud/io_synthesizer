@@ -43,22 +43,34 @@ if [[ -n "${NPROCS_CAP}" && ! "${NPROCS_CAP}" =~ ^[0-9]+$ ]]; then
   echo "Error: --nprocs-cap must be an integer" >&2; exit 1
 fi
 
-timestamp() { date +"%Y%m%d_%H%M%S"; }
-LOG="${OUT_ROOT}/pipeline_$(timestamp).log"
+# Timestamps
+timestamp() { date +"%Y%m%d_%H%M%S"; }      # for filenames
+ts() { date +"%F %T"; }                     # for log lines
+
+STAMP="$(timestamp)"
+LOG="${OUT_ROOT}/pipeline_${STAMP}.log"
 mkdir -p "${OUT_ROOT}"
 
 # tee everything to a logfile
 exec > >(tee -a "$LOG") 2>&1
 
-echo "=== STEP 0: Build mpi_synthio ==="
+# ---- init master comparison rollups (new) ----
+MASTER_TXT="${OUT_ROOT}/pct_compare_master_${STAMP}.txt"
+MASTER_CSV="${OUT_ROOT}/pct_compare_master_${STAMP}.csv"
+echo "# pct_* comparison rollup (all cases)  @ ${STAMP}" > "${MASTER_TXT}"
+if [[ ! -f "${MASTER_CSV}" ]]; then
+  echo "json,status,key,input,produced,abs_diff" > "${MASTER_CSV}"
+fi
+
+echo "$(ts)  === STEP 0: Build mpi_synthio ==="
 if [[ $FORCE_BUILD -eq 1 || ! -x "${BIN_DIR}/mpi_synthio" ]]; then
   pushd "${ROOT}/scripts" >/dev/null
   make clean && make
   mv -f mpi_synthio "${BIN_DIR}/"
   popd >/dev/null
-  echo "✅ Build complete; moved mpi_synthio to ${BIN_DIR}"
+  echo "$(ts)  ✅ Build complete; moved mpi_synthio to ${BIN_DIR}"
 else
-  echo "⏭️  mpi_synthio already exists at ${BIN_DIR}/mpi_synthio — skipping build (use --force-build to rebuild)"
+  echo "$(ts)  ⏭️  mpi_synthio already exists at ${BIN_DIR}/mpi_synthio — skipping build (use --force-build to rebuild)"
 fi
 
 # -------- Collect JSONs to run (supports ranges & explicit names) --------
@@ -75,14 +87,13 @@ add_json() {
 }
 
 if [[ ${#FILTERS[@]} -gt 0 ]]; then
-  echo "ℹ️  Limiting to filters: ${FILTERS[*]}"
+  echo "$(ts)  ℹ️  Limiting to filters: ${FILTERS[*]}"
   for tok in "${FILTERS[@]}"; do
     if [[ "$tok" =~ ^([0-9]+)-([0-9]+)$ ]]; then
       # Range like 1-10  → include all topN_*.json for N in [start..end]
       start="${BASH_REMATCH[1]}"; end="${BASH_REMATCH[2]}"
       if (( start > end )); then tmp="$start"; start="$end"; end="$tmp"; fi
       for ((n=start; n<=end; n++)); do
-        # include every top<n>_*.json that exists
         shopt -s nullglob
         for f in "${INPUT_DIR}/top${n}_"*.json; do add_json "$f"; done
         shopt -u nullglob
@@ -110,12 +121,12 @@ if [[ ${#JSONS[@]} -eq 0 ]]; then
   exit 0
 fi
 
-echo "=== STEP 1..N: Plan, run, validate, analyze for each input ==="
+echo "$(ts)  === STEP 1..N: Plan, run, validate, analyze for each input ==="
 for JSON_ABS in "${JSONS[@]}"; do
   JSON_NAME="$(basename "$JSON_ABS")"
   JSON_BASE="${JSON_NAME%.json}"
   echo ""
-  echo "---- Processing: ${JSON_NAME} ----"
+  echo "$(ts)  ---- Processing: ${JSON_NAME} ----"
 
   # Determine nprocs to pass (cap at NPROCS_CAP if provided or present in input JSON)
   DESIRED_NPROCS=""
@@ -140,13 +151,13 @@ PY
   fi
 
   # Plan (generate prep/run scripts) — always force posix/posix/none
-  echo "[Plan] features2synth_opsaware.py for ${JSON_NAME}"
+  echo "$(ts)  [Plan] features2synth_opsaware.py for ${JSON_NAME}"
   cd "${ROOT}"
   CMD=( python3 "${FEATS_SCRIPT}" --features "${JSON_ABS}" --cap-total-gib "${CAP_TOTAL_GIB}" )
   CMD+=( --io-api posix --meta-api posix --mpi-collective-mode none )
   [[ -n "${DESIRED_NPROCS}" ]] && CMD+=( --nprocs "${DESIRED_NPROCS}" )
 
-  printf 'Running: '; printf '%q ' "${CMD[@]}"; echo
+  printf '%s  Running: ' "$(ts)"; printf '%q ' "${CMD[@]}"; echo
   "${CMD[@]}"
 
   # Locate generated run script (prefer new per-JSON layout; fall back to legacy)
@@ -158,15 +169,15 @@ PY
   elif [[ -f "${CAND2}" ]]; then
     RUN_SH="${CAND2}"
     RUN_ROOT="$(dirname "${RUN_SH}")"
-    echo "⚠️  Using legacy run script location: ${RUN_SH}"
+    echo "$(ts)  ⚠️  Using legacy run script location: ${RUN_SH}"
   else
-    echo "❌ Could not find run_from_features.sh in ${CAND1} or ${CAND2}"
+    echo "$(ts)  ❌ Could not find run_from_features.sh in ${CAND1} or ${CAND2}"
     continue
   fi
 
   # Optional: delete existing Darshan files for this case before running
   if [[ ${DELETE_DARSHAN} -eq 1 ]]; then
-    echo "[Pre-run] --delete-darshan enabled → removing any existing Darshan files in ${RUN_ROOT}"
+    echo "$(ts)  [Pre-run] --delete-darshan enabled → removing any existing Darshan files in ${RUN_ROOT}"
     rm -f "${RUN_ROOT}"/*.darshan 2>/dev/null || true
   fi
 
@@ -175,27 +186,27 @@ PY
 
   # If the exact .darshan already exists AND we didn't delete it, skip execution
   if [[ ${DELETE_DARSHAN} -eq 0 && -n "${EXPECTED}" && -f "${EXPECTED}" ]]; then
-    echo "⏭️  Found existing Darshan artifact:"
+    echo "$(ts)  ⏭️  Found existing Darshan artifact:"
     echo "    ${EXPECTED}"
     echo "    Skipping execution and proceeding to analysis."
   else
-    echo "[Run] ${RUN_SH}"
+    echo "$(ts)  [Run] ${RUN_SH}"
     bash "${RUN_SH}"
 
-    echo "[Validate] Sleep 10s to allow Darshan to flush…"
+    echo "$(ts)  [Validate] Sleep 10s to allow Darshan to flush…"
     sleep 10
 
     if [[ -n "${EXPECTED}" ]]; then
       if [[ -f "${EXPECTED}" ]]; then
-        echo "✅ Found Darshan: ${EXPECTED}"
+        echo "$(ts)  ✅ Found Darshan: ${EXPECTED}"
       else
-        echo "⚠️  Expected Darshan not found: ${EXPECTED}"
+        echo "$(ts)  ⚠️  Expected Darshan not found: ${EXPECTED}"
         echo "    Present .darshan files in ${RUN_ROOT}:"
         ls -l "${RUN_ROOT}"/*.darshan 2>/dev/null || true
         # Cleanup subdirs in payload before moving on
         PAYLOAD_DIR="${RUN_ROOT}/payload"
         if [[ -d "${PAYLOAD_DIR}" ]]; then
-          echo "[Cleanup] Removing subdirectories inside ${PAYLOAD_DIR}"
+          echo "$(ts)  [Cleanup] Removing subdirectories inside ${PAYLOAD_DIR}"
           find "${PAYLOAD_DIR}" -mindepth 1 -maxdepth 1 -type d -exec rm -rf {} + 2>/dev/null || true
         fi
         continue
@@ -207,13 +218,13 @@ PY
       shopt -u nullglob
       if [[ ${#found[@]} -eq 1 && -f "${found[0]}" ]]; then
         EXPECTED="${found[0]}"
-        echo "ℹ️  Using discovered darshan file: ${EXPECTED}"
+        echo "$(ts)  ℹ️  Using discovered darshan file: ${EXPECTED}"
       else
-        echo "❌ Could not determine Darshan artifact to analyze."
+        echo "$(ts)  ❌ Could not determine Darshan artifact to analyze."
         # Cleanup subdirs in payload before moving on
         PAYLOAD_DIR="${RUN_ROOT}/payload"
         if [[ -d "${PAYLOAD_DIR}" ]]; then
-          echo "[Cleanup] Removing subdirectories inside ${PAYLOAD_DIR}"
+          echo "$(ts)  [Cleanup] Removing subdirectories inside ${PAYLOAD_DIR}"
           find "${PAYLOAD_DIR}" -mindepth 1 -maxdepth 1 -type d -exec rm -rf {} + 2>/dev/null || true
         fi
         continue
@@ -222,10 +233,10 @@ PY
   fi
 
   # Analyze (merged script) — tolerant of non-zero to keep loop going
-  echo "[Analyze] merged analysis for ${JSON_NAME}"
+  echo "$(ts)  [Analyze] merged analysis for ${JSON_NAME}"
   ANALYZE="${ROOT}/analysis/scripts_analysis/analyze_darshan_merged.py"
   if [[ ! -f "${ANALYZE}" ]]; then
-    echo "❌ Missing ${ANALYZE}. Please place the merged script there."
+    echo "$(ts)  ❌ Missing ${ANALYZE}. Please place the merged script there."
     ANALYZE_RC=127
   else
     set +e
@@ -238,18 +249,48 @@ PY
   fi
 
   if [[ ${ANALYZE_RC} -ne 0 ]]; then
-    echo "⚠️  Analysis returned non-zero (${ANALYZE_RC}) for ${JSON_NAME}. Continuing with next input."
+    echo "$(ts)  ⚠️  Analysis returned non-zero (${ANALYZE_RC}) for ${JSON_NAME}. Continuing with next input."
+  fi
+
+  # -------- NEW: Append per-case report to master rollups --------
+  REPORT="${RUN_ROOT}/pct_compare_report.txt"
+  if [[ -f "${REPORT}" ]]; then
+    {
+      echo ""
+      echo "=== ${JSON_BASE} ==="
+      cat "${REPORT}"
+    } >> "${MASTER_TXT}"
+
+    # Parse details into CSV: status ∈ {within,outside}
+    # Lines look like: "  - pct_key: <iv> vs <pv> (Δ=<d>)"
+    awk -v json="${JSON_BASE}" '
+      BEGIN{status=""}
+      /^Within tolerance/ {status="within"; next}
+      /^Outside tolerance/ {status="outside"; next}
+      # skip headers/summary lines
+      /^Pct-field comparison report/ || /^Time:/ || /^Input JSON:/ || /^Produced JSON:/ || /^Total pct_/ || /^Exact matches:/ || /^Within / || /^Differences/ {next}
+      # detail rows
+      /^  - / {
+        match($0, /^  - ([^:]+):[[:space:]]*([^[:space:]]+)[[:space:]]+vs[[:space:]]+([^[:space:]]+)[[:space:]]+\(Δ=([^)]+)\)/, m)
+        if (m[1] != "" && status != "") {
+          # json,status,key,input,produced,abs_diff
+          printf("%s,%s,%s,%s,%s,%s\n", json, status, m[1], m[2], m[3], m[4]);
+        }
+      }
+    ' "${REPORT}" >> "${MASTER_CSV}"
   fi
 
   # -------- Post-analysis cleanup: remove only subdirectories inside payload --------
   PAYLOAD_DIR="${RUN_ROOT}/payload"
   if [[ -d "${PAYLOAD_DIR}" ]]; then
-    echo "[Cleanup] Removing subdirectories inside ${PAYLOAD_DIR}"
+    echo "$(ts)  [Cleanup] Removing subdirectories inside ${PAYLOAD_DIR}"
     find "${PAYLOAD_DIR}" -mindepth 1 -maxdepth 1 -type d -exec rm -rf {} + 2>/dev/null || true
   fi
 
-  echo "---- Done: ${JSON_NAME} ----"
+  echo "$(ts)  ---- Done: ${JSON_NAME} ----"
 done
 
 echo ""
+echo "🧾 Master comparison (txt): ${MASTER_TXT}"
+echo "🧾 Master comparison (csv): ${MASTER_CSV}"
 echo "🎉 Pipeline complete. Log saved to ${LOG}"
