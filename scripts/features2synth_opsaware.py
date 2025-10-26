@@ -99,11 +99,11 @@ def _set_outroot_per_json(json_path: str):
 # Small/Medium fixed sub-sizes (bytes)
 S_SUBS = [100, 1024, 4096, 65536]            # 100 B, 1 KiB, 4 KiB, 64 KiB
 M_SUBS = [256*1024, 1<<20, 4*(1<<20)]        # 256 KiB, 1 MiB, 4 MiB
-L_SIZE = 16*(1<<20)                          # fixed 16 MiB
+# L bin default and allowed sizes (MiB): 12, 16, 20, ..., 64
+L_SIZE       = 16 * (1<<20)  # default stays 16 MiB
+L_SIZE_CHOICES = [mb * (1<<20) for mb in range(10+1, 64+1, 1)]
 
-L_CHOICES = [12 * (1<<20), 16 * (1<<20), 24 * (1<<20)]  # bytes; in-bin, all "L"
-
-CHUNK_RANDOM = 32*(1<<20)
+CHUNK_RANDOM = 128*(1<<20)
 
 # ---------------- Helpers ----------------
 def human_bytes(n):
@@ -267,128 +267,116 @@ def rebalancer_autotune_fair(rows, target_total_bytes,
             cur = bytes_of(pred)
 
     eps = min(S_SUBS)
-    
-    def _tune_intent_bytes_in_L(intent_label: str, delta_bytes: int,
-                                choices=L_CHOICES, fairness_rr=True, max_moves=None):
-        """
-        Change bytes for a given intent by moving L-ops across {12,16,24} MiB *without* changing op counts.
-        delta_bytes > 0  -> need to INCREASE bytes (promote 12->16->24)
-        delta_bytes < 0  -> need to DECREASE bytes (demote 24->16->12)
-        Returns the actual bytes changed (signed).
-        """
 
-        if delta_bytes == 0:
+    def l_nudge_intent(intent_label, needed_delta_bytes):
+        """
+        Shift L-bin bytes for one intent by jumping ops directly to the nearest
+        ladder edge in the desired direction (minimizes number of moved ops).
+        Preserves ops and bin. Returns realized byte delta.
+        """
+        need = int(needed_delta_bytes)
+        if need == 0:
             return 0
 
-        # Collect candidate rows (bin=L) for this intent, bucketed by xfer size and file.
-        from collections import defaultdict, deque
-        by_sz = defaultdict(list)  # size -> [rows]
-        for r in rows:
-            if r.get("intent") == intent_label and r.get("bin") == "L" and r.get("ops",0) > 0:
-                by_sz[r["xfer"]].append(r)
-
-        if not by_sz:
+        if not L_SIZE_CHOICES:
             return 0
 
-        # Helper to fair-share by file (largest-ops first per file)
-        def _queue_for(size):
-            by_file = defaultdict(list)
-            for r in by_sz.get(size, []):
-                by_file[r["file"]].append(r)
-            for f in by_file:
-                by_file[f].sort(key=lambda rr: -rr["ops"])
-            return deque(sorted(by_file.keys())), by_file
+        choices = L_SIZE_CHOICES
+        idx_of  = {sz: i for i, sz in enumerate(choices)}
+        up      = need > 0
+        realized = 0
+        need_abs = abs(need)
 
-        changed = 0
+        # Candidate L rows for this intent; biggest ops first
+        L_rows = [r for r in rows
+                  if r.get("intent") == intent_label and r.get("bin") == "L"
+                  and r.get("xfer") in idx_of and r.get("ops", 0) > 0]
+        L_rows.sort(key=lambda rr: -rr["ops"])
 
-        # Decide promotion/demotion order
-        if delta_bytes > 0:
-            # INCREASE bytes: promote 12->16 first, then 16->24
-            pairs = [(choices[0], choices[1]), (choices[1], choices[2])]
-        else:
-            # DECREASE bytes: demote 24->16 first, then 16->12
-            pairs = [(choices[2], choices[1]), (choices[1], choices[0])]
+        for r in L_rows:
+            cur_i = idx_of[r["xfer"]]
+            tgt_i = (len(choices) - 1) if up else 0
+            if cur_i == tgt_i:
+                continue
 
-        # How many ops max to move? If not provided, derive from needed delta.
-        def _ops_needed(per_op_delta):
-            need = abs(delta_bytes) - abs(changed)
-            if need <= 0: return 0
-            return int((need + per_op_delta - 1) // per_op_delta)  # ceil
+            delta_per_op = abs(choices[tgt_i] - choices[cur_i])
+            if delta_per_op <= 0:
+                continue
 
-        # For each adjacent size-pair, move ops fairly across files
-        for src, dst in pairs:
-            if abs(delta_bytes) <= abs(changed):
+            # minimal ops needed if we jump this row all the way to tgt_i
+            take = min(r["ops"], (need_abs + delta_per_op - 1) // delta_per_op)
+            if take <= 0:
+                continue
+
+            # find/create sibling at target rung
+            sib = None
+            for rr in rows:
+                if (rr.get("file") == r.get("file") and rr.get("bin") == "L" and
+                    rr.get("intent") == intent_label and rr.get("xfer") == choices[tgt_i] and
+                    rr.get("role") == r.get("role") and rr.get("flags","") == r.get("flags","")):
+                    sib = rr
+                    break
+            if sib is None:
+                sib = dict(r)
+                sib["xfer"] = choices[tgt_i]
+                sib["ops"]  = 0
+                rows.append(sib)
+
+            r["ops"]   -= take
+            sib["ops"] += take
+
+            bump = delta_per_op * take
+            realized += bump
+            if bump >= need_abs:
                 break
-            if not by_sz.get(src):
-                continue
+            need_abs -= bump
 
-            per_op_delta = abs(dst - src)
-            q, by_file = _queue_for(src)
+        return realized if up else -realized
 
-            # derive a sensible cap from demand if max_moves not forced
-            cap_ops = _ops_needed(per_op_delta) if max_moves is None else max_moves
-            if cap_ops <= 0:
-                continue
-
-            moved_ops = 0
-            while q and moved_ops < cap_ops and abs(delta_bytes) > abs(changed):
-                f = q.popleft()
-                bucket = by_file[f]
-                while bucket and bucket[0]["ops"] == 0:
-                    bucket.pop(0)
-                if not bucket:
-                    continue
-
-                r = bucket[0]
-                take = min(r["ops"], cap_ops - moved_ops)
-                if take <= 0:
-                    continue
-
-                # materialize/append a sibling at dst (same meta, xfer=dst, ops=take)
-                nr = dict(r)
-                nr["xfer"] = dst
-                nr["ops"]  = take
-                rows.append(nr)
-                by_sz[dst].append(nr)
-
-                r["ops"] -= take
-                moved_ops += take
-                changed += (dst - src) * take
-
-                # requeue if still has movable ops and we still need change
-                if fairness_rr and r["ops"] > 0 and abs(delta_bytes) > abs(changed) and moved_ops < cap_ops:
-                    q.append(f)
-
-        return changed
-
-    # --- Pre-pass: bidirectional tuning on L to meet per-intent byte targets using {12,16,24} ---
-    if target_by_intent:
-        def _bytes_of_intent(lbl):
-            return sum(r["xfer"]*r["ops"] for r in rows if r.get("intent")==lbl)
-
-        TOL = 4 * (1<<20)  # 4 MiB
-        for intent, tgt_bytes in target_by_intent.items():
-            cur = _bytes_of_intent(intent)
-            if abs(cur - tgt_bytes) > TOL:
-                # Move just enough bytes on L by promoting/demoting across {12,16,24}
-                _tune_intent_bytes_in_L(intent_label=intent, delta_bytes=(tgt_bytes - cur))
-
+    # --- coarse S/M passes ---
     if target_by_intent:
         for intent, tgt in target_by_intent.items():
-            rr_reduce_to_target(lambda r, intent=intent: r["intent"]==intent, tgt, eps)
-
+            rr_reduce_to_target(lambda r, intent=intent: r["intent"] == intent, tgt, eps)
     if target_by_role:
-        for role, tgt in target_by_role.items():
-            rr_reduce_to_target(lambda r, role=role: r["role"]==role, tgt, eps)
-
+        for role, tgt in (target_by_role or {}).items():
+            rr_reduce_to_target(lambda r, role=role: r["role"] == role, tgt, eps)
     if target_by_flag:
-        for flag_label, tgt in target_by_flag.items():
-            if flag_label not in ("shared","unique"): continue
-            rr_reduce_to_target(lambda r, lbl=flag_label:
-                                ("|shared|" in r.get("flags","")) if lbl=="shared"
-                                else ("|unique|" in r.get("flags","")), tgt, eps)
+        for lbl, tgt in (target_by_flag or {}).items():
+            if lbl in ("shared","unique"):
+                rr_reduce_to_target(
+                    lambda r, lbl=lbl: ("|shared|" in r.get("flags","")) if lbl == "shared"
+                                       else ("|unique|" in r.get("flags","")),
+                    tgt, eps
+                )
 
-    rr_reduce_to_target(lambda r: True, target_total_bytes, eps)
+    # --- intent L-nudges toward requested bytes ---
+    if target_by_intent:
+        def bytes_of_intent(lbl):
+            return sum(r["xfer"] * r["ops"] for r in rows if r.get("intent") == lbl)
+
+        for intent, tgt in target_by_intent.items():
+            l_nudge_intent(intent, tgt - bytes_of_intent(intent))
+            rr_reduce_to_target(lambda r, intent=intent: r["intent"] == intent, tgt, eps)
+
+        # ===== FINALIZE: fraction-first =====
+        req_sum  = float(sum(target_by_intent.values())) or 1.0
+        f_read   = float(target_by_intent.get("read", 0.0)) / req_sum
+        f_write  = 1.0 - f_read
+
+        cur_r = bytes_of_intent("read")
+        cur_w = bytes_of_intent("write")
+
+        # If writes are above their fraction, expand reads so produced split is exact
+        desired_total = (cur_w / f_write) if f_write > 0 else (cur_r / max(f_read, 1e-9))
+        desired_read  = desired_total * f_read
+        desired_write = desired_total - desired_read
+
+        # L-first, then tiny S/M polish
+        l_nudge_intent("read",  desired_read  - cur_r)
+        l_nudge_intent("write", desired_write - cur_w)
+
+        rr_reduce_to_target(lambda r: r.get("intent") == "read",  desired_read,  eps)
+        rr_reduce_to_target(lambda r: r.get("intent") == "write", desired_write, eps)
 
 # ---------------- RW-switch interleaving ----------------
 def interleave_rw_segments(rows, switch_frac=0.0, seg_ops=64):
@@ -657,11 +645,6 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
                              target_by_role=by_role_target,
                              target_by_flag=by_flag_target)
 
-    # Post-pass gentle nudger (op-preserving, in-bin) to touch-up intent bytes
-    rebalancer_autotune_fair(layout_rows, io_bytes_target,
-                             target_by_intent=by_intent_target,
-                             target_by_role=None, target_by_flag=None)
-
     # RW switches
     switch_frac = clamp01(feats.get("pct_rw_switches", 0.0))
     layout_rows = interleave_rw_segments(layout_rows, switch_frac=switch_frac, seg_ops=64)
@@ -676,28 +659,60 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
     lines=[header]
 
     def emit_data_phase(path, intent, xfer, ops, phase_kind, p_ua_file_eff, p_ua_mem, pre_seek_eof, flags_extra):
-        if ops<=0: return
+        if ops <= 0:
+            return
         total_bytes = ops * xfer
-        is_write = (intent=="write")
-        if phase_kind=="consec":
-            p_con_r = 1.0; p_seq_r = 1.0; p_rand=0.0
-        elif phase_kind=="seq":
-            p_con_r = 0.0; p_seq_r = 1.0; p_rand=0.0
-        else: # random
-            p_con_r = 0.0; p_seq_r = 0.0; p_rand=1.0
-        seed = random.randint(1,2**31-1)
+        is_write = (intent == "write")
+
+        # Phase structure → one definition used for both read and write columns
+        if phase_kind == "consec":
+            p_con = 1.0
+            p_seq = 1.0
+            p_rand = 0.0
+        elif phase_kind == "seq":
+            p_con = 0.0
+            p_seq = 1.0
+            p_rand = 0.0
+        else:  # "random"
+            p_con = 0.0
+            p_seq = 0.0
+            p_rand = 1.0
+
+        seed = random.randint(1, 2**31 - 1)
         flags = phase_kind + (flags_extra or "")
+
+        # Write the same phase structure into both read and write columns.
+        # The harness selects the correct pair based on is_write at runtime.
         row = [
             "data", path, str(total_bytes), str(xfer),
-            f"{1.0 if is_write else 0.0:.6f}", f"{p_rand:.6f}",
-            f"{p_seq_r:.6f}", f"{p_con_r:.6f}",
-            f"{1.0 if is_write else 0.0:.6f}", f"{0.0:.6f}",
+
+            # p_write
+            f"{1.0 if is_write else 0.0:.6f}",
+
+            # p_rand
+            f"{p_rand:.6f}",
+
+            # p_seq_r, p_consec_r
+            f"{p_seq:.6f}", f"{p_con:.6f}",
+
+            # p_seq_w, p_consec_w
+            f"{p_seq:.6f}", f"{p_con:.6f}",
+
+            # p_ua_file, p_ua_mem
             f"{clamp01(p_ua_file_eff):.6f}", f"{p_ua_mem:.6f}",
-            "0.0","0","0","0","0",
+
+            # rw_switch, meta_open/stat/seek/sync
+            "0.0", "0", "0", "0", "0",
+
+            # seed, flags
             str(seed), flags,
-            "0.0","0.0","0.0",
+
+            # p_rand_fwd_r, p_rand_fwd_w, p_consec_internal
+            "0.0", "0.0", "0.0",
+
+            # pre_seek_eof, n_ops
             "1" if pre_seek_eof else "0",
-            str(ops)
+            str(ops),
         ]
         lines.append(",".join(row))
 
@@ -829,12 +844,12 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
 
         # High-level mapping
         f.write("=== PLANNER OVERVIEW ===\n")
-        f.write("  Mode: OPS-first; S/M fixed ladders; L fixed at 16 MiB\n")
+        f.write("  Mode: OPS-first; S/M fixed ladders; L:11-64 MiB with 1 MiB increment;\n")
         f.write("  Bins:\n")
-        f.write(f"    S_SUBS={S_SUBS}  M_SUBS={M_SUBS}  L_SIZE={L_SIZE}\n")
+        f.write(f"    S_SUBS={S_SUBS}  M_SUBS={M_SUBS}  L_CHOICES={L_SIZE_CHOICES}\n")
         f.write("  Phase split inside each (file,bin,sub-size,intent): Consec ⊂ Seq; remainder Random\n")
-        f.write("  Random placement: descending 32 MiB chunk RR; pre_seek_eof=1 for random phases\n")
-        f.write("  Rebalancer: in-bin only; auto up/down; presence floors; preserves op counts and L size\n")
+        f.write("  Random placement: descending 128 MiB chunk RR; pre_seek_eof=1 for random phases\n")
+        f.write("  Rebalancer: in-bin only for S/M; preserves op counts; L moves within the 11–64 MiB ladder per intent; presence floors.\n")
         f.write("  RW-switches: planner interleaves segments on eligible RW paths when pct_rw_switches>0\n")
         f.write("  Shared vs Unique: file counts from pct_shared_files/pct_unique_files; byte targets from pct_bytes_* (enforced via flags)\n\n")
 
@@ -844,6 +859,44 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
         f.write(f"  intent bytes target: read={p_bytes_r:.2f} write={p_bytes_w:.2f}\n")
         f.write(f"  realized after rebalance: read={human_bytes(by_intent.get('read',0))} write={human_bytes(by_intent.get('write',0))}\n\n")
 
+        # --- Fraction-first finalize & L-ladder disclosure ---
+        f.write("=== INTENT FRACTION RECONCILE (fraction-first) ===\n")
+        # Requested fractions (already used to compute targets)
+        f.write(f"  requested fractions: read={p_bytes_r:.2f}  write={p_bytes_w:.2f}\n")
+
+        # Realized bytes & fractions
+        _tot = float(total_bytes) if total_bytes > 0 else 1.0
+        _read_b  = float(by_intent.get("read", 0))
+        _write_b = float(by_intent.get("write", 0))
+        _read_f  = _read_b  / _tot
+        _write_f = _write_b / _tot
+        f.write("  realized bytes: "
+                f"read={human_bytes(_read_b)} "
+                f"write={human_bytes(_write_b)}\n")
+        f.write(f"  realized fractions: read={_read_f:.4f}  write={_write_f:.4f}\n")
+
+        # Produced total vs original IO target (fraction-first can move total a bit under L floors)
+        _delta_total = int(total_bytes) - int(io_bytes_target)
+        sign = "+" if _delta_total >= 0 else "-"
+        f.write(f"  produced_total={human_bytes(total_bytes)}  "
+                f"target_total={human_bytes(io_bytes_target)}  "
+                f"Δ_total={sign}{human_bytes(abs(_delta_total))}\n")
+
+        # L-ladder used for nudging (MiB) + min step
+        _ladder_mib = [int(v // (1<<20)) for v in L_SIZE_CHOICES]
+        if len(L_SIZE_CHOICES) >= 2:
+            _min_step_bytes = min(abs(b - a) for a, b in zip(L_SIZE_CHOICES, L_SIZE_CHOICES[1:]))
+        else:
+            _min_step_bytes = 0
+        _min_step_mib = _min_step_bytes / float(1<<20) if _min_step_bytes else 0.0
+        f.write(f"  L ladder choices (MiB): {_ladder_mib}\n")
+        f.write(f"  L min adjacent step: {_min_step_mib:.2f} MiB\n")
+
+        # Method summary
+        f.write("  method: intent bytes rebalanced in S/M (ops-preserving),\n")
+        f.write("          then L-size nudges per intent (ops preserved) to satisfy requested split,\n")
+        f.write("          followed by a small S/M fair pass to polish residuals.\n\n")
+        
         # Role & shared/unique bytes targets
         f.write("=== ROLE & SHARED/UNIQUE BYTE TARGETS ===\n")
         f.write("  role byte targets (fractions):\n")
@@ -911,11 +964,7 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
 
         # Assumptions & invariants
         f.write("=== ASSUMPTIONS & INVARIANTS ===\n")
-        f.write("  • L bin size is fixed to 16 MiB and never changed by the rebalancer.\n")
-        f.write("  • Rebalancer: in-bin only, op-preserving, presence floors. L bin uses a bounded ladder {12,16,24} MiB \
-            to auto up/down-tune per intent (read/write) before the fair in-bin nudger; S/M adjust only within \
-            their fixed ladders. Keeps 10M+ constraints intact. \
-            \n")
+        f.write("  • Rebalancer: in-bin only, op-preserving, presence floors. L bin uses a bounded ladder 11-64 MiB with 1 MiB increment to auto up/down-tune per intent (read/write) before the fair in-bin nudger; S/M adjust only within their fixed ladders. Keeps 10M+ constraints intact.\n")
         f.write("  • Presence floors: any (file,bin,sub-size) that existed pre-rebalance keeps ≥1 op.\n")
         f.write("  • With nprocs==1, Darshan cannot classify shared files; planner forces shared count to 0.\n")
 

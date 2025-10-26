@@ -9,7 +9,7 @@
  *       * p_ua_file: for xfer >= FILE_ALIGN, enforce the exact fraction of NOT-aligned starts
  *         (unaligned quota via +1B skew; the rest snapped to align).
  *       * p_ua_mem: per-op buffer misalignment by 1B for the planned fraction.
- *       * Consec: adjacent; Seq remainder: fixed gap=xfer; Random: descending 32MiB chunks
+ *       * Consec: adjacent; Seq remainder: fixed gap=xfer; Random: descending 128MiB chunks
  *         with RR across chunks; optional pre_seek_eof fence.
  *       * Offsets clamped into [0, size-xfer]; files pre-truncated by planner.
  *   - META-only phase drives open/stat/seek/sync counts in a single phase.
@@ -55,7 +55,7 @@
 #endif
 
 #define MAX_LINE  4096
-#define CHUNK_RANDOM (32*1024*1024)
+#define CHUNK_RANDOM (128*1024*1024)
 
 typedef enum { API_POSIX=0, API_MPIIO=1 } io_api_t;
 typedef enum { META_POSIX=0 } meta_api_t;
@@ -241,8 +241,10 @@ static void do_posix_data(const phase_t* p, int phase_idx)
     }
 
     /* Clamp to [0,1] and enforce Consec ⊂ Seq (so seq ≥ consec) */
-    if (p_con < 0.0) p_con = 0.0; if (p_con > 1.0) p_con = 1.0;
-    if (p_seq < 0.0) p_seq = 0.0; if (p_seq > 1.0) p_seq = 1.0;
+    if (p_con < 0.0) p_con = 0.0;
+    if (p_con > 1.0) p_con = 1.0;
+    if (p_seq < 0.0) p_seq = 0.0;
+    if (p_seq > 1.0) p_seq = 1.0;
     if (p_seq < p_con) p_seq = p_con;
 
     /* Integerize with rounding; keep totals consistent */
@@ -396,7 +398,7 @@ static void do_posix_data(const phase_t* p, int phase_idx)
         }
     }
 
-    /* ----- Random (descending 32MiB chunks; optional pre-seek-eof) ----- */
+    /* ----- Random (descending 128MiB chunks; optional pre-seek-eof) ----- */
     if(N_rnd>0 && p->pre_seek_eof){
         (void)lseek(fd, fsz, SEEK_SET);
     }
