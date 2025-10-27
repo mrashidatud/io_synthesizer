@@ -166,6 +166,29 @@ def summarize(rows):
             elif "|unique|" in r["flags"]: by_flag["unique"] += b
     return total, by_role, by_intent, by_file, by_flag
 
+def split_ops_by_bins(N, sS, sM, sL):
+    S = int(round(N * sS)); M = int(round(N * sM)); L = max(0, N - S - M)
+    return S, M, L
+
+def min_size_in_bin(binname):
+    if binname == "S": return min(S_SUBS)
+    if binname == "M": return min(M_SUBS)
+    return min(L_SIZE_CHOICES)
+
+def max_size_in_bin(binname):
+    if binname == "S": return max(S_SUBS)
+    if binname == "M": return max(M_SUBS)
+    return max(L_SIZE_CHOICES)
+
+def weighted_extreme_avg(shareS, shareM, shareL, choose_max=True):
+    s = shareS + shareM + shareL
+    if s <= 0: return min(S_SUBS)  # harmless default
+    shareS, shareM, shareL = shareS/s, shareM/s, shareL/s
+    pickS = max(S_SUBS) if choose_max else min(S_SUBS)
+    pickM = max(M_SUBS) if choose_max else min(M_SUBS)
+    pickL = max(L_SIZE_CHOICES) if choose_max else min(L_SIZE_CHOICES)
+    return shareS*pickS + shareM*pickM + shareL*pickL
+
 # ---------------- Rebalancer (op-preserving, in-bin, fair) ----------------
 def rebalancer_autotune_fair(rows, target_total_bytes,
                              target_by_intent=None, target_by_role=None, target_by_flag=None):
@@ -508,20 +531,29 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
     total_files = n_ro + n_rw + n_wo
     p_shared = clamp01(feats.get("pct_shared_files", 0.0))
     nprocs = int(feats.get('nprocs', max(1, nranks)))
-    if nprocs <= 1:
-        n_sh = 0
-    else:
-        n_sh = int(round(p_shared * total_files))
-    n_sh = max(0, min(total_files, n_sh))
-    n_uq = total_files - n_sh
+
+    # META is shared only when we have multiple ranks
+    meta_is_shared = (nprocs > 1)
+    meta_flag = "meta_only|shared|" if meta_is_shared else "meta_only|unique|"
 
     # Paths
     ro_paths = [str(DATA_RO / f"ro_{i}.dat") for i in range(n_ro)]
     rw_paths = [str(DATA_RW / f"rw_{i}.dat") for i in range(n_rw)]
     wo_paths = [str(DATA_WO / f"wo_{i}.dat") for i in range(n_wo)]
-    all_paths = ro_paths + rw_paths + wo_paths
-    shared_paths = set(all_paths[:n_sh])
-    unique_paths = set(all_paths[n_sh:])
+    data_paths = ro_paths + rw_paths + wo_paths
+    N_data = len(data_paths)
+
+    if nprocs <= 1:
+        # Your invariant: single-rank runs have no shared data files
+        N_shared_data = 0
+    else:
+        # Target shared *file-count* fraction includes the META file when shared
+        # shared_fraction = (shared_data + 1 META) / (data + 1 META)
+        N_shared_data = int(round(p_shared * (N_data + 1) - 1.0))
+        N_shared_data = max(0, min(N_data, N_shared_data))
+
+    shared_paths = set(data_paths[:N_shared_data])
+    unique_paths = set(data_paths[N_shared_data:])
 
     # Avg xfer estimates for initial Nio
     avgS = sum(S_SUBS)/len(S_SUBS)
@@ -530,36 +562,120 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
     avg_read_xfer  = rS*avgS + rM*avgM + rL*avgL if (rS+rM+rL)>0 else avgS
     avg_write_xfer = wS*avgS + wM*avgM + wL*avgL if (wS+wM+wL)>0 else avgS
     avg_xfer = p_reads_ops*avg_read_xfer + p_writes_ops*avg_write_xfer
+
+    # ---- Symmetric quadrant policy for reads & writes (replaces ε-ops block) ----
+    EPS_OPS_FRAC   = 1e-3    # target: side_ops / total_ops ≤ 0.1% when ops≈0
+    EPS_BYTES_FRAC = 1e-3    # target: side_bytes / total_bytes ≤ 0.1% when bytes≈0
+
+    # Desired presence flags
+    want_ops_r   = (p_reads_ops  > 0.0)
+    want_bytes_r = (p_bytes_r    > 0.0)
+    want_ops_w   = (p_writes_ops > 0.0)
+    want_bytes_w = (p_bytes_w    > 0.0)
+
+    # Seed based on cap (will adjust)
     Nio = max(1, int(round(io_bytes_target / max(1, avg_xfer))))
     Nr  = int(round(Nio * p_reads_ops))
-    Nw  = Nio - Nr
+    Nw  = max(0, Nio - Nr)
 
-    # ---- ε-ops policy (WRITE) ----
-    write_signals = (seq_w>0 or consec_w>0 or feats.get("pct_write_0_100K",0)>0
-                     or feats.get("pct_write_100K_10M",0)>0 or feats.get("pct_write_10M_1G_PLUS",0)>0
-                     or wo_f>0 or feats.get("pct_bytes_write_only_files",0)>0)
-    eps_writes = 0
-    if (clamp01(feats.get("pct_writes", p_bytes_w))==0.0 or p_bytes_w==0.0) and write_signals and Nw==0:
-        eps_writes = 1  # exactly 1 op total; S smallest size; survives to Darshan, ~0% in features
-        Nw = eps_writes
-        Nr = Nio - Nw
+    # Precompute extreme avg xfers per side
+    avg_r_max = weighted_extreme_avg(rS, rM, rL, choose_max=True)
+    avg_r_min = weighted_extreme_avg(rS, rM, rL, choose_max=False)
+    avg_w_max = weighted_extreme_avg(wS, wM, wL, choose_max=True)
+    avg_w_min = weighted_extreme_avg(wS, wM, wL, choose_max=False)
 
-    # ---- ε-ops policy (READ) ----
-    read_signals = (seq_r>0 or consec_r>0 or feats.get("pct_read_0_100K",0)>0
-                    or feats.get("pct_read_100K_10M",0)>0 or feats.get("pct_read_10M_1G_PLUS",0)>0
-                    or ro_f>0 or feats.get("pct_bytes_read_only_files",0)>0)
-    eps_reads = 0
-    if (clamp01(feats.get("pct_reads", p_bytes_r))==0.0 or p_bytes_r==0.0) and read_signals and Nr==0:
-        eps_reads = 1
-        Nr = eps_reads
-        Nw = Nio - Nr
+    # Utility: ensure side's ops fraction ≤ eps by increasing the other side's ops.
+    def force_ops_fraction_small(side_ops, other_ops, eps=EPS_OPS_FRAC):
+        if side_ops == 0: return other_ops
+        min_other = int(round(max(0.0, (side_ops/eps) - side_ops)))
+        return max(other_ops, min_other)
 
-    # Bin ops (from fixed Nr/Nw; invariant later)
-    def bin_counts(N, sS,sM,sL):
-        S = int(round(N*sS)); M = int(round(N*sM)); L = max(0, N - S - M)
-        return S,M,L
-    R_S,R_M,R_L = bin_counts(Nr, rS,rM,rL)
-    W_S,W_M,W_L = bin_counts(Nw, wS,wM,wL)
+    # Utility: ensure side's bytes fraction ≤ eps by inflating other side bytes via ops*avg_xfer
+    def force_bytes_fraction_small(side_ops, side_avg_xfer, other_ops, other_avg_xfer, eps=EPS_BYTES_FRAC):
+        side_bytes = side_ops * max(1.0, side_avg_xfer)
+        if side_bytes == 0 or other_avg_xfer <= 0: return other_ops
+        need_total = side_bytes / max(eps, 1e-9)
+        have_total = side_bytes + other_ops * other_avg_xfer
+        if need_total > have_total:
+            add = int(round((need_total - have_total) / other_avg_xfer))
+            return other_ops + max(0, add)
+        return other_ops
+
+    # We may need to choose min/max per bin later when materializing rows:
+    read_pick  = {"S": None, "M": None, "L": None}   # None → ladder as-is
+    write_pick = {"S": None, "M": None, "L": None}
+
+    # Order of handling when both sides want "ops≈0 & bytes>0":
+    # prioritize the side with larger byte share so the other can treat ops≈0 relative to a large denominator.
+    sides_order = ["read", "write"]
+    if (not want_ops_r) and want_bytes_r and (not want_ops_w) and want_bytes_w:
+        if p_bytes_w > p_bytes_r:
+            sides_order = ["write", "read"]
+
+    for side in sides_order:
+        if side == "read":
+            # Quadrants for READ
+            if (not want_ops_r) and want_bytes_r:
+                # Few, large reads + inflate writes so read-ops% ≈ 0
+                target_bytes = io_bytes_target * p_bytes_r
+                Nr = max(1, int(round(target_bytes / max(1.0, avg_r_max))))
+                Nw = force_ops_fraction_small(Nr, Nw, eps=EPS_OPS_FRAC)
+                # choose max sizes in each bin for reads
+                read_pick["S"] = max(S_SUBS); read_pick["M"] = max(M_SUBS); read_pick["L"] = max(L_SIZE_CHOICES)
+
+            elif want_ops_r and (not want_bytes_r):
+                # Many, tiny reads; keep read-bytes% ≈ 0 by inflating write bytes if needed
+                # Start from split
+                Nr = max(1, int(round(max(1.0, Nio * p_reads_ops))))
+                Nw = max(0, Nio - Nr)
+                # push bytes ratio small
+                Nw = force_bytes_fraction_small(Nr, avg_r_min, Nw, avg_w_max, eps=EPS_BYTES_FRAC)
+                Nio = Nr + Nw
+                # choose min sizes for reads
+                read_pick["S"] = min(S_SUBS); read_pick["M"] = min(M_SUBS); read_pick["L"] = min(L_SIZE_CHOICES)
+
+            elif (not want_ops_r) and (not want_bytes_r):
+                # ε presence only if read signals exist; else none
+                read_signals = (seq_r>0 or consec_r>0 or feats.get("pct_read_0_100K",0)>0
+                                or feats.get("pct_read_100K_10M",0)>0 or feats.get("pct_read_10M_1G_PLUS",0)>0
+                                or ro_f>0 or feats.get("pct_bytes_read_only_files",0)>0)
+                if Nr == 0 and read_signals:
+                    Nr = 1
+                # keep picks as None (we'll use ladders)
+            else:
+                # normal: keep current Nr/Nw and ladders
+                pass
+
+        else:
+            # Quadrants for WRITE
+            if (not want_ops_w) and want_bytes_w:
+                target_bytes = io_bytes_target * p_bytes_w
+                Nw = max(1, int(round(target_bytes / max(1.0, avg_w_max))))
+                Nr = force_ops_fraction_small(Nw, Nr, eps=EPS_OPS_FRAC)
+                write_pick["S"] = max(S_SUBS); write_pick["M"] = max(M_SUBS); write_pick["L"] = max(L_SIZE_CHOICES)
+
+            elif want_ops_w and (not want_bytes_w):
+                Nw = max(1, int(round(max(1.0, Nio * p_writes_ops))))
+                Nr = max(0, Nio - Nw)
+                Nr = force_bytes_fraction_small(Nw, avg_w_min, Nr, avg_r_max, eps=EPS_BYTES_FRAC)
+                Nio = Nr + Nw
+                write_pick["S"] = min(S_SUBS); write_pick["M"] = min(M_SUBS); write_pick["L"] = min(L_SIZE_CHOICES)
+
+            elif (not want_ops_w) and (not want_bytes_w):
+                write_signals = (seq_w>0 or consec_w>0 or feats.get("pct_write_0_100K",0)>0
+                                 or feats.get("pct_write_100K_10M",0)>0 or feats.get("pct_write_10M_1G_PLUS",0)>0
+                                 or wo_f>0 or feats.get("pct_bytes_write_only_files",0)>0)
+                if Nw == 0 and write_signals:
+                    Nw = 1
+            else:
+                pass
+
+        # Keep Nio in sync after each side's adjustment
+        Nio = Nr + Nw
+
+    # Final bin splits from authoritative Nr/Nw
+    R_S,R_M,R_L = split_ops_by_bins(Nr, rS,rM,rL)
+    W_S,W_M,W_L = split_ops_by_bins(Nw, wS,wM,wL)
 
     def per_file_subsizes(Nbin, subs, files):
         per_sub  = split_uniform(Nbin, len(subs))
@@ -570,32 +686,33 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
                 if k>0: out.append((files[f_idx], subs[s_idx], k))
         return out
 
-    # Initial layout rows
-    read_rows=[]; write_rows=[]
-
-    # Reads across RO+RW if both exist; else whichever exists
+    # ----- READ rows -----
+    read_rows = []
     read_files = ro_paths + rw_paths if (ro_paths and rw_paths) else (ro_paths if ro_paths else rw_paths)
-    if R_S>0:
-        for (f,sz,k) in per_file_subsizes(R_S, S_SUBS, read_files):
-            read_rows.append({"role": role_of_path(f), "file": f, "bin":"S", "xfer":sz, "ops":k, "intent":"read"})
-    if R_M>0:
-        for (f,sz,k) in per_file_subsizes(R_M, M_SUBS, read_files):
-            read_rows.append({"role": role_of_path(f), "file": f, "bin":"M", "xfer":sz, "ops":k, "intent":"read"})
-    if R_L>0:
-        for (f,sz,k) in per_file_subsizes(R_L, [L_SIZE], read_files):
-            read_rows.append({"role": role_of_path(f), "file": f, "bin":"L", "xfer":L_SIZE, "ops":k, "intent":"read"})
 
-    # Writes across WO+RW if both exist; else whichever exists
+    def emit_read_bin(Nbin, binname, pick):
+        if Nbin <= 0: return
+        subs = [pick] if pick is not None else (S_SUBS if binname=="S" else (M_SUBS if binname=="M" else [L_SIZE]))
+        for (f, sz, k) in per_file_subsizes(Nbin, subs, read_files):
+            read_rows.append({"role": role_of_path(f), "file": f, "bin": binname, "xfer": sz, "ops": k, "intent": "read"})
+
+    emit_read_bin(R_S, "S", read_pick["S"])
+    emit_read_bin(R_M, "M", read_pick["M"])
+    emit_read_bin(R_L, "L", read_pick["L"])
+
+    # ----- WRITE rows -----
+    write_rows = []
     write_files = wo_paths + rw_paths if (wo_paths and rw_paths) else (wo_paths if wo_paths else rw_paths)
-    if W_S>0:
-        for (f,sz,k) in per_file_subsizes(W_S, S_SUBS, write_files):
-            write_rows.append({"role": role_of_path(f), "file": f, "bin":"S", "xfer":sz, "ops":k, "intent":"write"})
-    if W_M>0:
-        for (f,sz,k) in per_file_subsizes(W_M, M_SUBS, write_files):
-            write_rows.append({"role": role_of_path(f), "file": f, "bin":"M", "xfer":sz, "ops":k, "intent":"write"})
-    if W_L>0:
-        for (f,sz,k) in per_file_subsizes(W_L, [L_SIZE], write_files):
-            write_rows.append({"role": role_of_path(f), "file": f, "bin":"L", "xfer":L_SIZE, "ops":k, "intent":"write"})
+
+    def emit_write_bin(Nbin, binname, pick):
+        if Nbin <= 0: return
+        subs = [pick] if pick is not None else (S_SUBS if binname=="S" else (M_SUBS if binname=="M" else [L_SIZE]))
+        for (f, sz, k) in per_file_subsizes(Nbin, subs, write_files):
+            write_rows.append({"role": role_of_path(f), "file": f, "bin": binname, "xfer": sz, "ops": k, "intent": "write"})
+
+    emit_write_bin(W_S, "S", write_pick["S"])
+    emit_write_bin(W_M, "M", write_pick["M"])
+    emit_write_bin(W_L, "L", write_pick["L"])
 
     layout_rows = read_rows + write_rows
 
@@ -755,7 +872,7 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
                 f"{clamp01(p_file_ua_req):.6f}", f"{p_mem_ua:.6f}",
                 "0.0",
                 str(m_open), str(m_stat), str(m_seek), str(m_sync),
-                str(seed), "meta_only",
+                str(seed), meta_flag,
                 "0.0","0.0","0.0","0","0"]
     lines.append(",".join(meta_row))
 
@@ -930,8 +1047,15 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
         f.write(f"  Nio={Nr2+Nw2}  |  Nr={Nr2}  |  Nw={Nw2}\n\n")
 
         # ε-ops disclosure
-        f.write("=== EPSILON-OPS POLICY ===\n")
-        f.write(f"  eps_reads={eps_reads}  eps_writes={eps_writes} (injected only when side is 0%% but structure demands presence; placed in S/0–100KiB)\n\n")
+        f.write("=== ZERO-FRACTION POLICY (ops vs bytes) ===\n")
+        f.write(f"  requested fractions: READ(op={p_reads_ops:.4f}, bytes={p_bytes_r:.4f})  |  WRITE(op={p_writes_ops:.4f}, bytes={p_bytes_w:.4f})\n")
+        def _mode(want_ops, want_bytes):
+            if (not want_ops) and want_bytes:  return "OPS≈0, BYTES>0 (few, large ops; other side inflated)"
+            if want_ops and (not want_bytes):  return "BYTES≈0, OPS>0 (many, tiny ops)"
+            if (not want_ops) and (not want_bytes): return "OPS≈0, BYTES≈0 (ε presence if signals)"
+            return "normal"
+        f.write(f"  READ mode:  {_mode(want_ops_r, want_bytes_r)}\n")
+        f.write(f"  WRITE mode: {_mode(want_ops_w, want_bytes_w)}\n\n")
 
         # Alignment section
         f.write("=== ALIGNMENT TARGETING (FILE vs Darshan File-Alignment) ===\n")
@@ -960,7 +1084,9 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
         f.write(f"  pct_io_access={clamp01(feats.get('pct_io_access',0.18)):.2f}\n")
         f.write("  meta_kind_count ≈ (pct_meta_kind_access / pct_io_access) * (Nr+Nw)\n")
         f.write(f"  planned: open={m_open}, stat={m_stat}, seek={m_seek}, sync={m_sync}\n")
-        f.write("  Data phases use pread/pwrite only; META-only phase performs POSIX open/stat/seek/sync.\n\n")
+        f.write("  Data phases use pread/pwrite only; META-only phase performs POSIX open/stat/seek/sync.\n")
+        f.write("  META scope = shared if nprocs>1 else unique; counts in plan are GLOBAL; harness shards evenly per rank when shared.\n")
+        f.write("  Shared-file targeting accounts for META when shared: (shared_data + 1) / (data + 1) ≈ pct_shared_files.\n\n")
 
         # Assumptions & invariants
         f.write("=== ASSUMPTIONS & INVARIANTS ===\n")

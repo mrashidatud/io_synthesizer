@@ -175,6 +175,69 @@ static unsigned long fnv1a_64(const char* s)
     return h;
 }
 
+// === ADD: helpers for flags, time stamps, sharding, run detection ===
+static inline int has_flag(const char* flags, const char* needle) {
+    return flags && strstr(flags, needle) != NULL;
+}
+static inline int is_shared_row_flags(const char* flags) { return has_flag(flags, "|shared|"); }
+static inline int is_unique_row_flags(const char* flags) { return has_flag(flags, "|unique|"); }
+
+// ISO8601 wallclock for logs
+static inline void wallclock_iso8601(char* buf, size_t n) {
+    struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+    struct tm tm; gmtime_r(&ts.tv_sec, &tm);
+    snprintf(buf, n, "%04d-%02d-%02dT%02d:%02d:%02d.%03ldZ",
+             tm.tm_year+1900, tm.tm_mon+1, tm.tm_mday,
+             tm.tm_hour, tm.tm_min, tm.tm_sec, ts.tv_nsec/1000000);
+}
+
+/* Wallclock helpers: get now, format ISO8601 UTC */
+static inline void wallclock_now(struct timespec* ts) {
+#if defined(CLOCK_REALTIME)
+    clock_gettime(CLOCK_REALTIME, ts);
+#else
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    ts->tv_sec = tv.tv_sec;
+    ts->tv_nsec = (long)tv.tv_usec * 1000L;
+#endif
+}
+
+static inline void wallclock_iso8601_from(const struct timespec* ts, char* out, size_t n) {
+    time_t s = (time_t)ts->tv_sec;
+    int ms = (int)llround((double)ts->tv_nsec / 1.0e6);
+    if (ms >= 1000) { s += 1; ms = 0; }
+
+    struct tm tm_utc;
+#if defined(_WIN32)
+    gmtime_s(&tm_utc, &s);
+#else
+    gmtime_r(&s, &tm_utc);
+#endif
+    snprintf(out, n, "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ",
+        tm_utc.tm_year + 1900, tm_utc.tm_mon + 1, tm_utc.tm_mday,
+        tm_utc.tm_hour, tm_utc.tm_min, tm_utc.tm_sec, ms);
+}
+
+// even split (for shared rows)
+static inline uint64_t split_even(uint64_t total, int nprocs, int rank, uint64_t* start_index_out) {
+    uint64_t base = total / (uint64_t)nprocs, rem = total % (uint64_t)nprocs;
+    uint64_t mine = base + ((uint64_t)rank < rem ? 1 : 0);
+    uint64_t start =
+        ((uint64_t)rank < rem)
+        ? ((uint64_t)rank * (base + 1))
+        : (rem * (base + 1) + ((uint64_t)rank - rem) * base);
+    if (start_index_out) *start_index_out = start;
+    return mine;
+}
+
+// count a consecutive run of UNIQUE rows starting at idx
+static int count_unique_run(const phase_t* phases, int nphases, int idx) {
+    int k = 0;
+    while (idx + k < nphases && is_unique_row_flags(phases[idx + k].flags)) ++k;
+    return k;
+}
+
 /* --- helpers for alignment (C) --- */
 static inline off_t force_aligned_start(off_t s)
 {
@@ -187,278 +250,203 @@ static inline off_t force_unaligned_start(off_t s)
     return s;
 }
 
-static void do_posix_data(const phase_t* p, int phase_idx)
-{
-    int world_rank=0, world_n=1;
+// === ADD: execute a DATA row for exactly Nops_local ops starting at logical op-index 'start_idx'
+static void exec_phase_data_local(const phase_t* p, int phase_idx,
+                                  uint64_t Nops_local, uint64_t start_idx) {
+    if (p->xfer == 0 || Nops_local == 0) return;
+
+    int world_rank=0;
     MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &world_n);
 
-    if(p->xfer==0 || p->total_bytes==0){ return; }
-
-    /* Global (plan-level) ops for this phase */
-    uint64_t Nops = p->total_bytes / p->xfer;
+    // Open (participants only)
     int is_write = (p->p_write > 0.5);
-
-    /* Shared/unique/legacy scope based on flags (decide BEFORE opening) */
-    int is_shared = (strstr(p->flags, "|shared|") != NULL);
-    int is_unique = (strstr(p->flags, "|unique|") != NULL);
-
-    int owner = 0;
-    if(is_unique){
-        owner = (int)(fnv1a_64(p->path) % (unsigned long)world_n);
-    }
-
-    /* Decide local ops for this rank */
-    uint64_t Nops_local = 0;
-    if(is_shared){
-        Nops_local = Nops / (uint64_t)world_n;
-        if((uint64_t)world_rank < (Nops % (uint64_t)world_n)) Nops_local++;
-    } else if(is_unique){
-        if(world_rank != owner){ return; } /* non-owners do not open */
-        Nops_local = Nops;
-    } else {
-        if(world_rank != 0){ return; }     /* non-leader do not open */
-        Nops_local = Nops;
-    }
-    if(Nops_local == 0){ return; }
-
-    /* Open only participating ranks now */
-    int fd = open(p->path, p->p_write>0.0 ? O_RDWR|O_CREAT : O_RDONLY, 0644);
-    if(fd<0){ perror("open"); return; }
+    int fd = open(p->path, is_write ? O_RDWR|O_CREAT : O_RDONLY, 0644);
+    if (fd < 0) { perror("open"); return; }
 
     struct stat st;
-    if(fstat(fd,&st)!=0){ perror("fstat"); close(fd); return; }
+    if (fstat(fd, &st) != 0) { perror("fstat"); close(fd); return; }
     off_t fsz = st.st_size;
 
-    /* ----- Split local ops into consec / seq / random (intent-aware) ----- */
-    double p_con, p_seq;
-    if (is_write) {
-        p_con = p->p_consec_w;
-        p_seq = p->p_seq_w;
-    } else {
-        p_con = p->p_consec_r;
-        p_seq = p->p_seq_r;
-    }
+    struct timespec ts_start, ts_end;
+    wallclock_now(&ts_start);
 
-    /* Clamp to [0,1] and enforce Consec ⊂ Seq (so seq ≥ consec) */
-    if (p_con < 0.0) p_con = 0.0;
-    if (p_con > 1.0) p_con = 1.0;
-    if (p_seq < 0.0) p_seq = 0.0;
-    if (p_seq > 1.0) p_seq = 1.0;
+    // Decide consec/seq/random counts the same way as in do_posix_data, but using Nops_local.
+    double p_con, p_seq;
+    if (is_write) { p_con = p->p_consec_w; p_seq = p->p_seq_w; }
+    else          { p_con = p->p_consec_r; p_seq = p->p_seq_r; }
+    if (p_con < 0.0) p_con = 0.0; if (p_con > 1.0) p_con = 1.0;
+    if (p_seq < 0.0) p_seq = 0.0; if (p_seq > 1.0) p_seq = 1.0;
     if (p_seq < p_con) p_seq = p_con;
 
-    /* Integerize with rounding; keep totals consistent */
     uint64_t N_con = (uint64_t) llround((double)Nops_local * p_con);
     uint64_t N_seq = (uint64_t) llround((double)Nops_local * (p_seq - p_con));
-
-    /* Backstop rounding so we never exceed Nops_local */
     if (N_con > Nops_local) N_con = Nops_local;
     if (N_seq > Nops_local - N_con) N_seq = Nops_local - N_con;
-
     uint64_t N_rnd = Nops_local - N_con - N_seq;
+    if ((p_seq > p_con) && N_seq == 0 && N_rnd > 0) { N_seq++; N_rnd--; }
+    if (p_con > 0.0 && N_con == 0 && N_rnd > 0)     { N_con++; N_rnd--; }
 
-    /* ε-ops safeguard: if structure is requested but rounding killed it, donate 1 op */
-    if ((p_seq > p_con) && (N_seq == 0) && (N_rnd > 0)) { N_seq++; N_rnd--; }
-    if ((p_con > 0.0) && (N_con == 0) && (N_rnd > 0))     { N_con++; N_rnd--; }
-
-    /* Final assert-like guards (no negatives, exact sum) */
-    if ((int64_t)N_rnd < 0) {
-        /* prefer to steal back from seq, then consec */
-        uint64_t need = (uint64_t)(-(int64_t)N_rnd);
-        uint64_t take = (N_seq >= need) ? need : N_seq;
-        N_seq -= take; need -= take;
-        if (need > 0) { 
-            take = (N_con >= need) ? need : N_con;
-            N_con -= take; need -= take;
-        }
-        N_rnd = Nops_local - N_con - N_seq;
-    }
-
-    /* Large-op file alignment quotas (aligned vs unaligned) */
-    int large = (p->xfer >= LUSTRE_FILE_ALIGN) ? 1 : 0;
+    // Large-op alignment quotas
+    int large = (p->xfer >= LUSTRE_FILE_ALIGN);
     uint64_t N_unaligned_total = 0, N_aligned_total = 0;
-    if(large){
+    if (large) {
         N_unaligned_total = (uint64_t)llround(p->p_ua_file * (double)Nops_local);
-        if(N_unaligned_total > Nops_local) N_unaligned_total = Nops_local;
+        if (N_unaligned_total > Nops_local) N_unaligned_total = Nops_local;
         N_aligned_total = Nops_local - N_unaligned_total;
     }
     uint64_t unaligned_left = N_unaligned_total;
     uint64_t aligned_left   = N_aligned_total;
 
-    /* Memory misalignment quota (per-op proportional) */
+    // mem misalignment
     uint64_t N_mem_mis = (uint64_t)llround(p->p_ua_mem * (double)Nops_local);
     uint64_t mis_left = N_mem_mis;
 
     buf_t b = alloc_buffer((size_t)p->xfer);
-    if(!b.base){ perror("alloc_buffer"); close(fd); return; }
+    if (!b.base) { perror("alloc_buffer"); close(fd); return; }
     void* aligned_ptr = b.base;
-    void* mis_ptr = (void*)((uintptr_t)b.base + 1);
+    void* mis_ptr     = (void*)((uintptr_t)b.base + 1);
 
-    /* ----- Consecutive ----- */
+    // Seed randomness per rank for random-phase, stable across runs
+    srand(p->seed + (unsigned int)world_rank * 1337u + (unsigned int)(start_idx % 7919u));
+
+    // The execution body is identical to your existing do_posix_data(),
+    // except we use local counters (N_con/N_seq/N_rnd) and keep its offset math.
+    // --- paste the consecutive/seq/random loops from do_posix_data here verbatim ---
+    //     (from: "/* ----- Consecutive ----- */" down to the final log+free+close)
+    //     Replace the final fprintf with the expanded one below to add timestamps & alignment info.
+
+    // ====== BEGIN: copy of your loops (unchanged apart from counters) ======
     off_t cur = 0;
     if (N_con > 0) {
         if (large) {
             uint64_t U = (unaligned_left > N_con) ? N_con : unaligned_left;
             uint64_t A = N_con - U;
-
-            /* Unaligned run first (if any) */
             if (U > 0) {
                 off_t start = force_unaligned_start(cur);
                 start = clamp_range(start, fsz, p->xfer);
                 for (uint64_t i = 0; i < U; i++) {
                     void* use_ptr = (mis_left>0) ? mis_ptr : aligned_ptr;
                     if (mis_left>0) mis_left--;
-                    if (do_prw(fd, use_ptr, (size_t)p->xfer, start, is_write) < 0) {
-                        perror(is_write?"pwrite":"pread"); U = 0; break;
-                    }
-                    start += (off_t)p->xfer; /* exactly adjacent */
+                    if (do_prw(fd, use_ptr, (size_t)p->xfer, start, is_write) < 0) { perror(is_write?"pwrite":"pread"); U = 0; break; }
+                    start += (off_t)p->xfer;
                 }
-                cur = (off_t)start;
-                unaligned_left -= U;
+                cur = (off_t)start; unaligned_left -= U;
             }
-
-            /* Aligned run next (if any) */
             if (A > 0) {
                 off_t start = force_aligned_start(cur);
                 start = clamp_range(start, fsz, p->xfer);
                 for (uint64_t i = 0; i < A; i++) {
                     void* use_ptr = (mis_left>0) ? mis_ptr : aligned_ptr;
                     if (mis_left>0) mis_left--;
-                    if (do_prw(fd, use_ptr, (size_t)p->xfer, start, is_write) < 0) {
-                        perror(is_write?"pwrite":"pread"); break;
-                    }
-                    start += (off_t)p->xfer; /* exactly adjacent */
+                    if (do_prw(fd, use_ptr, (size_t)p->xfer, start, is_write) < 0) { perror(is_write?"pwrite":"pread"); break; }
+                    start += (off_t)p->xfer;
                 }
-                cur = (off_t)start;
-                if (aligned_left >= A) aligned_left -= A; else aligned_left = 0;
+                cur = (off_t)start; if (aligned_left >= A) aligned_left -= A; else aligned_left = 0;
             }
         } else {
-            /* Small xfers: keep strict adjacency; no per-op align toggle */
             off_t start = clamp_range(cur, fsz, p->xfer);
             for (uint64_t i=0; i<N_con; i++) {
                 void* use_ptr = (mis_left>0) ? mis_ptr : aligned_ptr;
                 if (mis_left>0) mis_left--;
-                if (do_prw(fd, use_ptr, (size_t)p->xfer, start, is_write) < 0) {
-                    perror(is_write?"pwrite":"pread"); break;
-                }
+                if (do_prw(fd, use_ptr, (size_t)p->xfer, start, is_write) < 0) { perror(is_write?"pwrite":"pread"); break; }
                 start += (off_t)p->xfer;
             }
             cur = start;
         }
     }
 
-    /* ----- Sequential remainder (gap = xfer) ----- */
     if (N_seq > 0) {
         if (large) {
             uint64_t U = (unaligned_left > N_seq) ? N_seq : unaligned_left;
             uint64_t A = N_seq - U;
-
-            /* Unaligned seq-run (gap = xfer) */
             if (U > 0) {
                 off_t start = force_unaligned_start(cur + (off_t)p->xfer);
                 start = clamp_range(start, fsz, p->xfer);
                 for (uint64_t i=0; i<U; i++) {
                     void* use_ptr = (mis_left>0) ? mis_ptr : aligned_ptr;
                     if (mis_left>0) mis_left--;
-                    if (do_prw(fd, use_ptr, (size_t)p->xfer, start, is_write) < 0) {
-                        perror(is_write?"pwrite":"pread"); U = 0; break;
-                    }
-                    start += (off_t)(p->xfer * 2); /* fixed gap */
+                    if (do_prw(fd, use_ptr, (size_t)p->xfer, start, is_write) < 0) { perror(is_write?"pwrite":"pread"); U = 0; break; }
+                    start += (off_t)(p->xfer * 2);
                 }
-                cur = start - (off_t)p->xfer;
-                unaligned_left -= U;
+                cur = start - (off_t)p->xfer; unaligned_left -= U;
             }
-
-            /* Aligned seq-run */
             if (A > 0) {
                 off_t start = force_aligned_start(cur + (off_t)p->xfer);
                 start = clamp_range(start, fsz, p->xfer);
                 for (uint64_t i=0; i<A; i++) {
                     void* use_ptr = (mis_left>0) ? mis_ptr : aligned_ptr;
                     if (mis_left>0) mis_left--;
-                    if (do_prw(fd, use_ptr, (size_t)p->xfer, start, is_write) < 0) {
-                        perror(is_write?"pwrite":"pread"); break;
-                    }
-                    start += (off_t)(p->xfer * 2); /* fixed gap */
+                    if (do_prw(fd, use_ptr, (size_t)p->xfer, start, is_write) < 0) { perror(is_write?"pwrite":"pread"); break; }
+                    start += (off_t)(p->xfer * 2);
                 }
-                cur = start - (off_t)p->xfer;
-                if (aligned_left >= A) aligned_left -= A; else aligned_left = 0;
+                cur = start - (off_t)p->xfer; if (aligned_left >= A) aligned_left -= A; else aligned_left = 0;
             }
         } else {
             off_t start = clamp_range(cur + (off_t)p->xfer, fsz, p->xfer);
             for (uint64_t i=0; i<N_seq; i++) {
                 void* use_ptr = (mis_left>0) ? mis_ptr : aligned_ptr;
                 if (mis_left>0) mis_left--;
-                if (do_prw(fd, use_ptr, (size_t)p->xfer, start, is_write) < 0) {
-                    perror(is_write?"pwrite":"pread"); break;
-                }
+                if (do_prw(fd, use_ptr, (size_t)p->xfer, start, is_write) < 0) { perror(is_write?"pwrite":"pread"); break; }
                 start += (off_t)(p->xfer * 2);
             }
             cur = start - (off_t)p->xfer;
         }
     }
 
-    /* ----- Random (descending 128MiB chunks; optional pre-seek-eof) ----- */
-    if(N_rnd>0 && p->pre_seek_eof){
-        (void)lseek(fd, fsz, SEEK_SET);
-    }
-    uint64_t nchunks = (fsz>0) ? ( (fsz + CHUNK_RANDOM - 1) / CHUNK_RANDOM ) : 1;
-    uint64_t cidx = (nchunks>0? nchunks-1 : 0);
-    srand(p->seed + (unsigned int)world_rank * 1337u);
+    if (N_rnd > 0 && p->pre_seek_eof) { (void)lseek(fd, fsz, SEEK_SET); }
+    uint64_t nchunks = (fsz>0) ? ((fsz + CHUNK_RANDOM - 1) / CHUNK_RANDOM) : 1;
+    uint64_t cidx = (nchunks>0 ? nchunks-1 : 0);
 
-    for(uint64_t i=0;i<N_rnd;i++){
+    for (uint64_t i=0; i<N_rnd; i++) {
         off_t chunk_start = (off_t)cidx * (off_t)CHUNK_RANDOM;
         off_t chunk_end   = chunk_start + (off_t)CHUNK_RANDOM;
-        if(chunk_end > fsz) chunk_end = fsz;
+        if (chunk_end > fsz) chunk_end = fsz;
         off_t span = chunk_end - chunk_start;
-        if(span < (off_t)p->xfer){
-            if(cidx>0) { cidx--; i--; continue; }
-            chunk_start = 0; chunk_end = fsz;
-            span = chunk_end - chunk_start;
-            if(span < (off_t)p->xfer) { break; }
+        if (span < (off_t)p->xfer) {
+            if (cidx>0) { cidx--; i--; continue; }
+            chunk_start = 0; chunk_end = fsz; span = chunk_end - chunk_start;
+            if (span < (off_t)p->xfer) break;
         }
-
         off_t start = chunk_start;
-        if(span > (off_t)p->xfer){
+        if (span > (off_t)p->xfer) {
             uint64_t r = (uint64_t)rand();
             off_t delta = (off_t)(r % (uint64_t)(span - (off_t)p->xfer + 1));
             start = chunk_start + delta;
         }
-
-        if(large){
-            if(unaligned_left>0){
-                start = force_unaligned_start(start);
-                unaligned_left--;
-            }else if(aligned_left>0){
-                /* move to nearest aligned start ≤ current where possible */
+        if (large) {
+            if (unaligned_left>0) { start = force_unaligned_start(start); unaligned_left--; }
+            else if (aligned_left>0) {
                 off_t aligned = start & ~(off_t)(LUSTRE_FILE_ALIGN-1);
-                if(aligned < chunk_start) aligned = chunk_start;
-                if(aligned + (off_t)p->xfer <= chunk_end){
-                    start = aligned;
-                }else{
-                    /* fallback to ceil alignment if floor doesn't fit */
-                    start = force_aligned_start(start);
-                }
+                if (aligned < chunk_start) aligned = chunk_start;
+                if (aligned + (off_t)p->xfer <= chunk_end) start = aligned;
+                else start = force_aligned_start(start);
                 aligned_left--;
             }
         }
-
         start = clamp_range(start, fsz, p->xfer);
         void* use_ptr = (mis_left>0) ? mis_ptr : aligned_ptr;
-        if(mis_left>0) mis_left--;
-        if(do_prw(fd, use_ptr, (size_t)p->xfer, start, is_write)<0){
-            perror(is_write?"pwrite":"pread"); break;
-        }
-
-        if(cidx>0) cidx--; else cidx = nchunks-1;
+        if (mis_left>0) mis_left--;
+        if (do_prw(fd, use_ptr, (size_t)p->xfer, start, is_write) < 0) { perror(is_write?"pwrite":"pread"); break; }
+        if (cidx>0) cidx--; else cidx = nchunks-1;
     }
+    // ====== END: copy of loops ======
 
-    /* Phase summary (stderr) */
+    wallclock_now(&ts_end);
+    char ts0[40], ts1[40];
+    wallclock_iso8601_from(&ts_start, ts0, sizeof ts0);
+    wallclock_iso8601_from(&ts_end,   ts1, sizeof ts1);
+
+    // Timestamped, richer phase log (stderr)
     fprintf(stderr,
-            "rank %d: phase %d done: path=%s xfer=%" PRIu64 "B ops=%" PRIu64
-            " (consec=%" PRIu64 ", seq=%" PRIu64 ", rand=%" PRIu64 ") %s flags=%s\n",
-            world_rank, phase_idx, p->path, p->xfer, Nops_local, N_con, N_seq, N_rnd,
-            is_write ? "[WRITE]" : "[READ]", p->flags);
+        "rank %d: phase %d done %s: path=%s xfer=%" PRIu64 "B ops=%" PRIu64
+        " (consec=%" PRIu64 ", seq=%" PRIu64 ", rand=%" PRIu64 ") %s flags=%s "
+        "file_align=%dB mem_align=%dB start_idx=%" PRIu64 " start=%s end=%s\n",
+        world_rank, phase_idx,
+        is_shared_row_flags(p->flags) ? "[SHARED]" :
+        (is_unique_row_flags(p->flags) ? "[UNIQUE]" : "[LEGACY]"),
+        p->path, p->xfer, Nops_local, N_con, N_seq, N_rnd,
+        is_write ? "[WRITE]" : "[READ]", p->flags,
+        (int)LUSTRE_FILE_ALIGN, (int)MEM_ALIGN, start_idx, ts0, ts1);
     fflush(stderr);
 
     free(b.base);
@@ -467,60 +455,219 @@ static void do_posix_data(const phase_t* p, int phase_idx)
 
 static void do_posix_meta(const phase_t* p, int phase_idx)
 {
-    /* META ops confined here to match planner expectations. */
-    for(uint64_t i=0;i<p->meta_open;i++){
+    int world_rank=0, world_n=1;
+    MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &world_n);
+
+    const int is_shared = (strstr(p->flags, "|shared|") != NULL);
+    const int is_unique = (strstr(p->flags, "|unique|") != NULL);
+
+    uint64_t open_local=0, stat_local=0, seek_local=0, sync_local=0;
+
+    if (is_shared) {
+        // shard global totals evenly across ranks
+        #define SHARD(total) ({ \
+            uint64_t _T=(total), _q=_T/(uint64_t)world_n, _r=_T%(uint64_t)world_n; \
+            _q + ((uint64_t)world_rank < _r ? 1 : 0); })
+        open_local = SHARD(p->meta_open);
+        stat_local = SHARD(p->meta_stat);
+        seek_local = SHARD(p->meta_seek);
+        sync_local = SHARD(p->meta_sync);
+        #undef SHARD
+    } else if (is_unique) {
+        // pick a deterministic owner rank for this path
+        int owner = 0;
+        unsigned long h = 1469598103934665603ULL;
+        const char* s = p->path;
+        while (*s) { h ^= (unsigned long)(unsigned char)(*s++); h *= 1099511628211ULL; }
+        owner = (int)(h % (unsigned long)world_n);
+        if (world_rank != owner) return;
+        open_local = p->meta_open;
+        stat_local = p->meta_stat;
+        seek_local = p->meta_seek;
+        sync_local = p->meta_sync;
+    } else {
+        // fallback: leader-only
+        if (world_rank != 0) return;
+        open_local = p->meta_open;
+        stat_local = p->meta_stat;
+        seek_local = p->meta_seek;
+        sync_local = p->meta_sync;
+    }
+    
+    struct timespec ts_start, ts_end;
+    wallclock_now(&ts_start);
+
+    for (uint64_t i=0;i<open_local;i++){
         int fd = open(p->path, O_RDONLY|O_CREAT, 0644);
-        if(fd>=0) close(fd);
+        if (fd>=0) close(fd);
     }
     struct stat st;
-    for(uint64_t i=0;i<p->meta_stat;i++){
+    for (uint64_t i=0;i<stat_local;i++){
         (void)stat(p->path, &st);
     }
     int fd = open(p->path, O_RDONLY|O_CREAT, 0644);
-    if(fd>=0){
-        for(uint64_t i=0;i<p->meta_seek;i++){
+    if (fd>=0){
+        for (uint64_t i=0;i<seek_local;i++){
             (void)lseek(fd, (off_t)(i%4096), SEEK_SET);
         }
-        for(uint64_t i=0;i<p->meta_sync;i++){
+        for (uint64_t i=0;i<sync_local;i++){
             (void)fsync(fd);
         }
         close(fd);
     }
 
-    int world_rank=0;
-    MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
+    // === REPLACE: do_posix_meta() final fprintf with timestamped one ===
+    wallclock_now(&ts_end);
+    char ts0[40], ts1[40];
+    wallclock_iso8601_from(&ts_start, ts0, sizeof ts0);
+    wallclock_iso8601_from(&ts_end,   ts1, sizeof ts1);
+    
     fprintf(stderr,
-            "rank %d: phase %d done [META]: path=%s open=%" PRIu64 " stat=%" PRIu64
-            " seek=%" PRIu64 " sync=%" PRIu64 "\n",
-            world_rank, phase_idx, p->path, p->meta_open, p->meta_stat, p->meta_seek, p->meta_sync);
+        "rank %d: phase %d done [META]: path=%s open=%" PRIu64 " stat=%" PRIu64
+        " seek=%" PRIu64 " sync=%" PRIu64 " start=%s end=%s\n",
+        world_rank, phase_idx, p->path, open_local, stat_local, seek_local, sync_local, ts0, ts1);
     fflush(stderr);
 }
 
+// === REPLACE: run_plan with wavefront scheduler ===
 static void run_plan(FILE* fp)
 {
+    // 1) Parse all rows first
+    phase_t* phases = NULL; size_t cap = 0, nph = 0;
     char line[MAX_LINE];
-    size_t nph=0;
-    while(fgets(line,sizeof(line),fp)){
+    while (fgets(line, sizeof(line), fp)) {
         phase_t p;
-        if(parse_line(line,&p)) continue; /* header/empty */
-
-        /* Seed RNG each phase to keep behavior reproducible across ranks (random phase uses rand()) */
-        srand(p.seed);
-
-        if(strcmp(p.type,"data")==0){
-            do_posix_data(&p, (int)(nph+1));
-        } else if(strcmp(p.type,"meta")==0){
-            do_posix_meta(&p, (int)(nph+1));
+        if (parse_line(line, &p)) continue; // skip header/empty
+        if (nph == cap) {
+            cap = cap ? cap * 2 : 256;
+            phases = (phase_t*)realloc(phases, cap * sizeof(phase_t));
+            if (!phases) { perror("realloc phases"); MPI_Abort(MPI_COMM_WORLD, 3); }
         }
-        nph++;
-        MPI_Barrier(MPI_COMM_WORLD);
+        phases[nph++] = p;
     }
-    int world_rank=0;
-    MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
-    if(world_rank==0){
-        fprintf(stderr,"Loaded %zu phases\n", nph);
+
+    int rank=0, nprocs=1;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &nprocs);
+
+    size_t idx = 0;
+    while (idx < nph) {
+        phase_t* P = &phases[idx];
+
+        if (!strcmp(P->type, "meta")) {
+            // META: keep your existing behavior (sharded when |shared|, owner/leader otherwise)
+            MPI_Barrier(MPI_COMM_WORLD);
+            double t_start = MPI_Wtime();
+
+            do_posix_meta(P, (int)(idx + 1));
+
+            double t_end = MPI_Wtime();
+            double min_start=0.0, max_end=0.0;
+            MPI_Reduce(&t_start, &min_start, 1, MPI_DOUBLE, MPI_MIN, 0, MPI_COMM_WORLD);
+            MPI_Reduce(&t_end,   &max_end,   1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+            MPI_Barrier(MPI_COMM_WORLD);
+            if (rank==0) {
+                fprintf(stdout, "phase %zu SUMMARY: META wall=%.6fs (min_start=%.6f, max_end=%.6f)\n",
+                        idx+1, max_end - min_start, min_start, max_end);
+                fflush(stdout);
+            }
+            idx++;
+            continue;
+        }
+
+        // DATA rows:
+        const int is_shared = is_shared_row_flags(P->flags);
+        const int is_unique = is_unique_row_flags(P->flags);
+
+        // Compute global ops for this row
+        uint64_t Nops = (P->xfer ? (P->total_bytes / P->xfer) : 0);
+
+        if (is_shared || (!is_unique && !is_shared)) {
+            // ===== SHARED (or legacy) =====
+            uint64_t start_idx_local = 0;
+            uint64_t my_ops = split_even(Nops, nprocs, rank, &start_idx_local);
+
+            // Align start, then measure per-rank start time
+            MPI_Barrier(MPI_COMM_WORLD);
+            double t_start = MPI_Wtime();
+
+            exec_phase_data_local(P, (int)(idx + 1), my_ops, start_idx_local);
+
+            double t_end = MPI_Wtime();
+
+            // Compute global bounds: min start, max end, and sum of ops
+            double min_start = 0.0, max_end = 0.0;
+            uint64_t my_ops_u64 = my_ops;
+            unsigned long long my_ops_ull = (unsigned long long)my_ops_u64;
+            unsigned long long sum_ops_ull = 0ULL;
+
+            MPI_Reduce(&t_start, &min_start, 1, MPI_DOUBLE, MPI_MIN, 0, MPI_COMM_WORLD);
+            MPI_Reduce(&t_end,   &max_end,   1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+            MPI_Reduce(&my_ops_ull, &sum_ops_ull, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+
+            MPI_Barrier(MPI_COMM_WORLD); // ensure all finished before printing
+
+            if (rank == 0) {
+                double wall = max_end - min_start;
+                fprintf(stdout,
+                    "phase %zu SUMMARY: SHARED/LEGACY ops=%llu wall=%.6fs (min_start=%.6f, max_end=%.6f)\n",
+                    idx + 1, sum_ops_ull, wall, min_start, max_end);
+                fflush(stdout);
+            }
+            idx++;
+            continue;
+        }
+
+        // ===== UNIQUE RUN in waves =====
+        int run_len = count_unique_run(phases, (int)nph, (int)idx);
+        int cursor  = 0;
+
+        while (cursor < run_len) {
+            int wave_len = (run_len - cursor < nprocs) ? (run_len - cursor) : nprocs;
+            int my_slot  = rank;
+            int my_i     = (my_slot < wave_len) ? ((int)idx + cursor + my_slot) : -1;
+
+            MPI_Barrier(MPI_COMM_WORLD);
+            double t_start = MPI_Wtime();
+
+            unsigned long long my_ops_ull = 0ULL;
+            if (my_i >= 0) {
+                phase_t* U = &phases[my_i];
+                uint64_t Nops_u = (U->xfer ? (U->total_bytes / U->xfer) : 0);
+                my_ops_ull = (unsigned long long)Nops_u;
+                exec_phase_data_local(U, my_i + 1, Nops_u, 0 /* full row */);
+            }
+
+            double t_end = MPI_Wtime();
+
+            double min_start = 0.0, max_end = 0.0;
+            unsigned long long sum_ops_ull = 0ULL;
+
+            MPI_Reduce(&t_start, &min_start, 1, MPI_DOUBLE, MPI_MIN, 0, MPI_COMM_WORLD);
+            MPI_Reduce(&t_end,   &max_end,   1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+            MPI_Reduce(&my_ops_ull, &sum_ops_ull, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+
+            MPI_Barrier(MPI_COMM_WORLD);
+
+            if (rank == 0) {
+                double wall = max_end - min_start;
+                fprintf(stdout,
+                    "UNIQUE wave SUMMARY: phases [%zu..%zu] ops=%llu wall=%.6fs (min_start=%.6f, max_end=%.6f)\n",
+                    idx + cursor + 1, idx + cursor + wave_len,
+                    sum_ops_ull, wall, min_start, max_end);
+                fflush(stdout);
+            }
+            cursor += wave_len;
+        }
+        idx += (size_t)run_len;
+    }
+
+    if (rank == 0) {
+        fprintf(stderr, "Loaded %zu phases\n", nph);
         fflush(stderr);
     }
+    free(phases);
 }
 
 int main(int argc, char** argv)
