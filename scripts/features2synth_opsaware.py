@@ -125,23 +125,36 @@ def read_features(path):
 
 def clamp01(x): return max(0.0, min(1.0, float(x)))
 
-def rational_counts(fracs, max_denom=10):
-    fracs = [clamp01(x) for x in fracs]
+def rational_counts(fracs, max_denom=64):
+    """
+    Map fractional shares to small integer counts, preferring higher-denominator
+    fits when error ties (so we can realize ratios like 7/1/6).
+    Guarantees: if frac_i>0 → count_i>=1; if all fracs=0 → all counts=0.
+    """
+    fracs = [clamp01(float(x)) for x in fracs]
     s = sum(fracs)
-    if s == 0:
-        return [0]*len(fracs)
+    if s <= 0:
+        return [0] * len(fracs)
     fracs = [x/s for x in fracs]
+
     best = None
-    for denom in range(1, max_denom+1):
-        counts = [int(round(f*denom)) for f in fracs]
-        for i,f in enumerate(fracs):
-            if f>0 and counts[i]==0: counts[i]=1
-        if sum(counts)==0: continue
-        approx = [c/sum(counts) for c in counts]
-        err = sum(abs(a-b) for a,b in zip(approx, fracs))
-        if best is None or err < best[0]:
-            best = (err, counts)
-    return best[1]
+    for denom in range(1, max_denom + 1):
+        counts = [int(round(f * denom)) for f in fracs]
+        # ensure presence for positive fracs
+        for i, f in enumerate(fracs):
+            if f > 0 and counts[i] == 0:
+                counts[i] = 1
+        total = sum(counts)
+        if total == 0:
+            continue
+        approx = [c/total for c in counts]
+        # primary metric: L1 error; tie-break 1) smaller L∞, 2) larger denom, 3) larger total
+        l1 = sum(abs(a - b) for a, b in zip(approx, fracs))
+        linf = max(abs(a - b) for a, b in zip(approx, fracs))
+        cand = (l1, linf, -denom, -total, counts)
+        if best is None or cand < best:
+            best = cand
+    return best[-1]
 
 def split_uniform(n, k):
     if k<=0: return []
@@ -194,6 +207,55 @@ def weighted_extreme_avg(shareS, shareM, shareL, choose_max=True):
     pickM = max(M_SUBS) if choose_max else min(M_SUBS)
     pickL = max(L_SIZE_CHOICES) if choose_max else min(L_SIZE_CHOICES)
     return shareS*pickS + shareM*pickM + shareL*pickL
+
+def make_file_weights_for_intent(feats, ro_paths, rw_paths, wo_paths, intent):
+    """
+    Return per-file weights for the given intent ('read' or 'write'),
+    based on *byte* fractions across file roles. We normalize only over
+    roles that actually have files, then divide each role's weight evenly
+    across its files.
+    """
+    if intent == "read":
+        # Read bytes can land on RO or RW files
+        p_ro = clamp01(feats.get("pct_bytes_read_only_files", 0.0))
+        p_rw = clamp01(feats.get("pct_bytes_read_write_files", 0.0))
+        role_specs = [("RO", ro_paths, p_ro), ("RW", rw_paths, p_rw)]
+    else:
+        # Write bytes can land on RW or WO files
+        p_rw = clamp01(feats.get("pct_bytes_read_write_files", 0.0))
+        p_wo = clamp01(feats.get("pct_bytes_write_only_files", 0.0))
+        role_specs = [("RW", rw_paths, p_rw), ("WO", wo_paths, p_wo)]
+
+    # Keep only roles that actually have files
+    avail = [(role, paths, frac) for (role, paths, frac) in role_specs if paths]
+
+    # If nothing is available, return empty (caller will fallback)
+    if not avail:
+        return {}
+
+    # Normalize fractions across available roles; if all zeros, split evenly
+    s = sum(frac for _, _, frac in avail)
+    if s > 0.0:
+        w_roles = {role: (frac / s) for (role, _, frac) in avail}
+    else:
+        eq = 1.0 / float(len(avail))
+        w_roles = {role: eq for (role, _, _) in avail}
+
+    # Divide role weights evenly across that role's files
+    weights = {}
+    for role, paths, _ in avail:
+        per = w_roles[role] / float(len(paths))
+        for p in paths:
+            weights[p] = per
+
+    # Light guard: if something went wrong and all zeros, fall back to uniform
+    if sum(weights.values()) <= 0.0:
+        uni = 1.0 / float(sum(len(paths) for _, paths, _ in avail))
+        for _, paths, _ in avail:
+            for p in paths:
+                weights[p] = uni
+
+    return weights
 
 def pick_bin_sizes_for_intent(intent, feats, S_SUBS, M_SUBS, L_CHOICES, minimize_bytes=True):
     """
@@ -252,7 +314,7 @@ def plan_tiny_intent(intent, feats, Nio, target_total_bytes,
                      S_SUBS, M_SUBS, L_CHOICES,
                      file_roles_by_intent,
                      want_ops, want_bytes,
-                     p_ops_target, p_bytes_target):
+                     p_ops_target, p_bytes_target, file_weights):
     """
     Build a tiny-but-structured footprint for one intent ('read'|'write').
     - If want_ops=False and want_bytes=False: minimize both (tiny N, smallest xfers)
@@ -325,16 +387,49 @@ def plan_tiny_intent(intent, feats, Nio, target_total_bytes,
         if c+s+r > 0:
             bin_plan.append((xfer, c, s, r))
 
+    # inside plan_tiny_intent, after pool is set:
+    if file_weights:
+        w_raw = [(p, max(0.0, float(file_weights.get(p, 0.0)))) for p in pool]
+        s = sum(w for _, w in w_raw)
+        if s <= 0:
+            w_norm = [(p, 1.0/len(pool)) for p in pool]
+        else:
+            w_norm = [(p, w/s) for p, w in w_raw]
+        # alias-free sampler: expand a schedule proportional to weights * total tiny ops
+        # ensures at least 1 for any file with positive weight
+        k_sched = [max(1 if w>0 else 0, int(round(w * (N_con+N_seq+N_rand)))) for _, w in w_norm]
+        # adjust to match the exact total
+        delta = (N_con+N_seq+N_rand) - sum(k_sched)
+        if delta != 0:
+            order = sorted(range(len(w_norm)), key=lambda i: w_norm[i][1], reverse=True)
+            for i in (order if delta>0 else reversed(order)):
+                if delta == 0: break
+                if delta>0: k_sched[i]+=1; delta-=1
+                elif k_sched[i]>0: k_sched[i]-=1; delta+=1
+        weighted_cycle = []
+        for (p,_), k in zip(w_norm, k_sched):
+            weighted_cycle.extend([p]*k)
+    else:
+        weighted_cycle = pool[:]  # fallback round-robin
+    if not weighted_cycle:
+        weighted_cycle = pool[:]  # uniform fallback
+
     # 5) spread across files round-robin, preferring main pool first
     items = []
     fi = 0
+    # Precompute a fast role lookup once (outside the loops):
+    role_map = {}
+    if intent == "read":
+        for p in file_roles_by_intent["read"].get("RO", []): role_map[p] = "RO"
+        for p in file_roles_by_intent["read"].get("RW", []): role_map[p] = "RW"
+    else:
+        for p in file_roles_by_intent["write"].get("RW", []): role_map[p] = "RW"
+        for p in file_roles_by_intent["write"].get("WO", []): role_map[p] = "WO"
     for (xfer, c, s, r) in bin_plan:
         total = c+s+r
         for _ in range(total):
-            path = pool[fi % len(pool)]
-            role = "RW" if path in pool_main and intent=="write" else \
-                   "RO" if path in pool_main and intent=="read"  else \
-                   ("WO" if intent=="write" else "RW")
+            path = weighted_cycle[fi % len(weighted_cycle)]
+            role = role_map.get(path, ("RW" if intent=="read" else "WO")) 
             if c > 0:
                 items.append({"path": path, "xfer": xfer, "con":1, "seq":0, "rnd":0, "role":role}); c -= 1
             elif s > 0:
@@ -738,7 +833,7 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
     ro_f = clamp01(feats.get("pct_read_only_files", 0.0))
     rw_f = clamp01(feats.get("pct_read_write_files", 0.0))
     wo_f = clamp01(feats.get("pct_write_only_files", 0.0))
-    counts = rational_counts([ro_f, rw_f, wo_f], max_denom=6)
+    counts = rational_counts([ro_f, rw_f, wo_f], max_denom=64)
     n_ro, n_rw, n_wo = counts
     if ro_f>0 and n_ro==0: n_ro=1
     if rw_f>0 and n_rw==0: n_rw=1
@@ -764,14 +859,16 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
         "read":  {"RO": list(ro_paths), "RW": list(rw_paths)},
         "write": {"RW": list(rw_paths), "WO": list(wo_paths)},
     }
+    read_file_w  = make_file_weights_for_intent(feats, ro_paths, rw_paths, wo_paths, "read")
+    write_file_w = make_file_weights_for_intent(feats, ro_paths, rw_paths, wo_paths, "write")
 
     if nprocs <= 1:
         # Your invariant: single-rank runs have no shared data files
         N_shared_data = 0
     else:
         # Target shared *file-count* fraction includes the META file when shared
-        # shared_fraction = (shared_data + 1 META) / (data + 1 META)
-        N_shared_data = int(round(p_shared * (N_data + 1) - 1.0))
+        # We want: (N_shared_data + (1 if meta_is_shared else 0)) / (N_data + 1) ≈ p_shared
+        N_shared_data = int(round(p_shared * (N_data + 1) - (1 if meta_is_shared else 0)))
         N_shared_data = max(0, min(N_data, N_shared_data))
 
     shared_paths = set(data_paths[:N_shared_data])
@@ -829,7 +926,8 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
                     want_ops=want_ops_r,
                     want_bytes=want_bytes_r,
                     p_ops_target=p_reads_ops,         # feats.get("pct_reads")
-                    p_bytes_target=p_bytes_r          # feats.get("pct_byte_reads")
+                    p_bytes_target=p_bytes_r,          # feats.get("pct_byte_reads")
+                    file_weights=read_file_w
                 )
                 # Stash for coalescing later:
                 extra_tiny_rows_read = tiny_read_rows
@@ -847,7 +945,8 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
                     want_ops=want_ops_w,
                     want_bytes=want_bytes_w,
                     p_ops_target=p_writes_ops,        # feats.get("pct_writes")
-                    p_bytes_target=p_bytes_w          # feats.get("pct_byte_writes")
+                    p_bytes_target=p_bytes_w,          # feats.get("pct_byte_writes")
+                    file_weights=write_file_w
                 )
                 extra_tiny_rows_write = tiny_write_rows
 
@@ -858,13 +957,40 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
     R_S,R_M,R_L = split_ops_by_bins(Nr, rS,rM,rL)
     W_S,W_M,W_L = split_ops_by_bins(Nw, wS,wM,wL)
 
-    def per_file_subsizes(Nbin, subs, files):
-        per_sub  = split_uniform(Nbin, len(subs))
-        out=[]
-        for s_idx, ops in enumerate(per_sub):
-            per_file = split_uniform(ops, len(files))
-            for f_idx, k in enumerate(per_file):
-                if k>0: out.append((files[f_idx], subs[s_idx], k))
+    def _int_round_allocation(total, weights_seq):
+        # Proportional allocation with largest-remainder rounding
+        raw = [total * w for w in weights_seq]
+        base = [int(math.floor(x)) for x in raw]
+        rem  = total - sum(base)
+        if rem > 0:
+            # assign remaining to the largest fractional parts
+            order = sorted(range(len(raw)), key=lambda i: (raw[i] - base[i]), reverse=True)
+            for i in order[:rem]:
+                base[i] += 1
+        return base
+
+    def per_file_subsizes_weighted(Nbin, subs, files, file_weights):
+        """
+        Split Nbin ops across 'subs' (sizes) first (uniform by sub),
+        then across files proportionally to 'file_weights' (same for each sub).
+        Returns list of (file, sub_size, ops) triples (ops may be 0).
+        """
+        if Nbin <= 0 or not files:
+            return []
+        per_sub = split_uniform(Nbin, len(subs))
+        # normalize weights for the participating files
+        w = [max(0.0, float(file_weights.get(f, 0.0))) for f in files]
+        s = sum(w)
+        if s <= 0:
+            w = [1.0/len(files)] * len(files)
+        else:
+            w = [x/s for x in w]
+        out = []
+        for sub_ops, sz in zip(per_sub, subs):
+            per_file_ops = _int_round_allocation(sub_ops, w)
+            for f, k in zip(files, per_file_ops):
+                if k > 0:
+                    out.append((f, sz, k))
         return out
 
     # ----- READ rows -----
@@ -874,7 +1000,9 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
     def emit_read_bin(Nbin, binname, pick):
         if Nbin <= 0: return
         subs = [pick] if pick is not None else (S_SUBS if binname=="S" else (M_SUBS if binname=="M" else [L_SIZE]))
-        for (f, sz, k) in per_file_subsizes(Nbin, subs, read_files):
+        files = list(read_file_w.keys())  # files that actually have weights
+        triples = per_file_subsizes_weighted(Nbin, subs, files, read_file_w)
+        for (f, sz, k) in triples:
             read_rows.append({"role": role_of_path(f), "file": f, "bin": binname, "xfer": sz, "ops": k, "intent": "read"})
 
     emit_read_bin(R_S, "S", read_pick["S"])
@@ -888,7 +1016,9 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
     def emit_write_bin(Nbin, binname, pick):
         if Nbin <= 0: return
         subs = [pick] if pick is not None else (S_SUBS if binname=="S" else (M_SUBS if binname=="M" else [L_SIZE]))
-        for (f, sz, k) in per_file_subsizes(Nbin, subs, write_files):
+        files = list(write_file_w.keys())
+        triples = per_file_subsizes_weighted(Nbin, subs, files, write_file_w)
+        for (f, sz, k) in triples:
             write_rows.append({"role": role_of_path(f), "file": f, "bin": binname, "xfer": sz, "ops": k, "intent": "write"})
 
     emit_write_bin(W_S, "S", write_pick["S"])
@@ -902,54 +1032,6 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
         if r["file"] in shared_paths: r["flags"] = (r.get("flags","") + "|shared|")
         else:                         r["flags"] = (r.get("flags","") + "|unique|")
 
-    # ---- Rebalance to intent/role/shared bytes; ops preserving ----
-    by_intent_target = {
-        "read" : int(round(io_bytes_target * p_bytes_r)),
-        "write": int(round(io_bytes_target * p_bytes_w)),
-    }
-    p_bytes_ro = clamp01(feats.get("pct_bytes_read_only_files", 0.0))
-    p_bytes_rw = clamp01(feats.get("pct_bytes_read_write_files", 0.0))
-    p_bytes_wo = clamp01(feats.get("pct_bytes_write_only_files", 0.0))
-    s_role = p_bytes_ro + p_bytes_rw + p_bytes_wo
-    by_role_target={}
-    if s_role>0:
-        by_role_target = {
-            "ro": int(round(io_bytes_target * p_bytes_ro / s_role)),
-            "rw": int(round(io_bytes_target * p_bytes_rw / s_role)),
-            "wo": int(round(io_bytes_target * p_bytes_wo / s_role)),
-        }
-    p_bytes_sh = clamp01(feats.get("pct_bytes_shared_files", 0.0))
-    p_bytes_uq = clamp01(feats.get("pct_bytes_unique_files", 0.0))
-    s_su = p_bytes_sh + p_bytes_uq
-    by_flag_target=None
-    if s_su>0:
-        by_flag_target = {
-            "shared": int(round(io_bytes_target * p_bytes_sh / s_su)),
-            "unique": int(round(io_bytes_target * p_bytes_uq / s_su)),
-        }
-
-    # Feasibility probe: current attainable ranges (rough, in-bin only)
-    # If sum of target_by_* exceeds IO target or is inconsistent, clamp.
-    tgt_sum = sum(by_intent_target.values())
-    infeasible_reasons=[]
-    if tgt_sum != io_bytes_target:
-        scale = io_bytes_target / max(1, tgt_sum)
-        for k in by_intent_target:
-            by_intent_target[k] = int(round(by_intent_target[k] * scale))
-        infeasible_reasons.append("intent-bytes scaled to IO target due to rounding mismatch")
-
-    rebalancer_autotune_fair(layout_rows, io_bytes_target,
-                             target_by_intent=by_intent_target,
-                             target_by_role=by_role_target,
-                             target_by_flag=by_flag_target)
-
-    # RW switches
-    switch_frac = clamp01(feats.get("pct_rw_switches", 0.0))
-    layout_rows = interleave_rw_segments(layout_rows, switch_frac=switch_frac, seg_ops=64)
-
-    # ---------- Alignment targeting (FILE) ----------
-    pua_file_map = compute_rowwise_pua_file(layout_rows, p_file_ua_req, fs_align_bytes)
-
     # Build per-path flag suffix so tiny rows inherit the same shared/unique marker.
     # We take the first seen flags per path from your layout_rows; fallback will be "|unique|".
     path_flags = {}
@@ -961,50 +1043,125 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
         elif "|unique|" in f: suffix = "|unique|"
         path_flags.setdefault(r["file"], suffix if suffix else "|unique|")
 
+    # ---------- Tiny bytes accounting (exclude tiny rows from rebalancer) ----------
+    from collections import defaultdict
+
+    def _tiny_stats(tiny_items, intent_label, path_flags):
+        """Return tiny bytes split by intent/role/flag for subtraction from targets."""
+        by_intent = defaultdict(int)
+        by_role   = defaultdict(int)   # keys: 'ro','rw','wo'
+        by_flag   = defaultdict(int)   # keys: 'shared','unique'
+        total_b   = 0
+        if not tiny_items:
+            return total_b, by_intent, by_role, by_flag
+
+        for it in tiny_items:
+            ops = int(it.get("con",0)) + int(it.get("seq",0)) + int(it.get("rnd",0))
+            if ops <= 0: 
+                continue
+            b = int(it["xfer"]) * ops
+            total_b += b
+            by_intent[intent_label] += b
+
+            role_key = str(it.get("role","")).lower()  # "RO|RW|WO" → "ro|rw|wo"
+            if role_key in ("ro","rw","wo"):
+                by_role[role_key] += b
+
+            fl = path_flags.get(it["path"], "|unique|")
+            if "|shared|" in fl:
+                by_flag["shared"] += b
+            else:
+                by_flag["unique"] += b
+
+        return total_b, by_intent, by_role, by_flag
+
+    # Tiny rows you collected earlier (may be empty lists)
+    tiny_read_items  = locals().get("extra_tiny_rows_read",  [])
+    tiny_write_items = locals().get("extra_tiny_rows_write", [])
+
+    # Bytes already “spent” by tiny presence
+    tr_tot, tr_int, tr_role, tr_flag = _tiny_stats(tiny_read_items,  "read",  path_flags)
+    tw_tot, tw_int, tw_role, tw_flag = _tiny_stats(tiny_write_items, "write", path_flags)
+
+    tiny_total_bytes = tr_tot + tw_tot
+
+    # Original targets (you already compute these above)
+    by_intent_target = {
+        "read":  int(round(io_bytes_target * p_bytes_r)),
+        "write": int(round(io_bytes_target * p_bytes_w)),
+    }
+
+    p_bytes_ro = clamp01(feats.get("pct_bytes_read_only_files", 0.0))
+    p_bytes_rw = clamp01(feats.get("pct_bytes_read_write_files", 0.0))
+    p_bytes_wo = clamp01(feats.get("pct_bytes_write_only_files", 0.0))
+    s_role = p_bytes_ro + p_bytes_rw + p_bytes_wo
+    by_role_target = {}
+    if s_role > 0:
+        by_role_target = {
+            "ro": int(round(io_bytes_target * p_bytes_ro / s_role)),
+            "rw": int(round(io_bytes_target * p_bytes_rw / s_role)),
+            "wo": int(round(io_bytes_target * p_bytes_wo / s_role)),
+        }
+
+    p_bytes_sh = clamp01(feats.get("pct_bytes_shared_files", 0.0))
+    p_bytes_uq = clamp01(feats.get("pct_bytes_unique_files", 0.0))
+    s_su = p_bytes_sh + p_bytes_uq
+    by_flag_target = None
+    if s_su > 0:
+        by_flag_target = {
+            "shared": int(round(io_bytes_target * p_bytes_sh / s_su)),
+            "unique": int(round(io_bytes_target * p_bytes_uq / s_su)),
+        }
+
+    # ----- Build residual targets (subtract tiny bytes; clamp at 0) -----
+    res_intent = {
+        "read":  max(0, by_intent_target.get("read", 0)  - tr_int.get("read", 0)),
+        "write": max(0, by_intent_target.get("write", 0) - tw_int.get("write", 0)),
+    }
+
+    res_role = None
+    if by_role_target:
+        tiny_by_role = defaultdict(int)
+        for k, v in tr_role.items(): tiny_by_role[k] += v
+        for k, v in tw_role.items(): tiny_by_role[k] += v
+        res_role = {k: max(0, by_role_target.get(k,0) - tiny_by_role.get(k,0)) for k in by_role_target.keys()}
+
+    res_flag = None
+    if by_flag_target:
+        tiny_by_flag = defaultdict(int)
+        for k, v in tr_flag.items(): tiny_by_flag[k] += v
+        for k, v in tw_flag.items(): tiny_by_flag[k] += v
+        res_flag = {k: max(0, by_flag_target.get(k,0) - tiny_by_flag.get(k,0)) for k in by_flag_target.keys()}
+
+    # Optional: if the sum of residual intent targets drifts from the available normal bytes,
+    # scale them proportionally (keeps rebalancer well-conditioned).
+    normal_bytes = sum(r["xfer"]*r["ops"] for r in layout_rows)
+    sum_res_intent = sum(res_intent.values())
+    if sum_res_intent > 0 and normal_bytes > 0 and sum_res_intent != normal_bytes:
+        scale = normal_bytes / float(sum_res_intent)
+        res_intent = {k: int(round(v * scale)) for k, v in res_intent.items()}
+
+    # ----- Rebalance ONLY normal rows to residual targets -----
+    rebalancer_autotune_fair(
+        layout_rows,
+        target_total_bytes=normal_bytes,            # informational in your implementation
+        target_by_intent=res_intent,
+        target_by_role=res_role,
+        target_by_flag=res_flag
+    )
+
+    # RW switches
+    switch_frac = clamp01(feats.get("pct_rw_switches", 0.0))
+    layout_rows = interleave_rw_segments(layout_rows, switch_frac=switch_frac, seg_ops=64)
+
+    # ---------- Alignment targeting (FILE) ----------
+    pua_file_map = compute_rowwise_pua_file(layout_rows, p_file_ua_req, fs_align_bytes)
+
     # ---------- Emit CSV ----------
     header=("type,path,total_bytes,xfer,p_write,p_rand,p_seq_r,p_consec_r,p_seq_w,p_consec_w,"
             "p_ua_file,p_ua_mem,rw_switch,meta_open,meta_stat,meta_seek,meta_sync,seed,flags,"
             "p_rand_fwd_r,p_rand_fwd_w,p_consec_internal,pre_seek_eof,n_ops")
     lines=[header]
-
-    def emit_tiny_items(tiny_items, intent, path_flags, p_ua_file_default, p_mem_ua):
-        """
-        tiny_items: list of {"path","xfer","con","seq","rnd","role"} from plan_tiny_intent()
-        intent: "read"|"write"
-        path_flags: dict path->flags suffix like "|unique|" or "|shared|"
-        p_ua_file_default: float to use for p_ua_file (you already compute p_file_ua_req earlier)
-        p_mem_ua: float (you already have p_mem_ua)
-        """
-        from collections import defaultdict
-        # Coalesce identical (path,xfer,flags) to keep CSV compact
-        agg = defaultdict(lambda: {"con":0, "seq":0, "rnd":0})
-        for it in tiny_items:
-            path = it["path"]
-            xfer = int(it["xfer"])
-            flags_extra = path_flags.get(path, "|unique|")  # fallback sensible default
-            key = (path, xfer, flags_extra)
-            a = agg[key]
-            a["con"] += int(it.get("con", 0))
-            a["seq"] += int(it.get("seq", 0))
-            a["rnd"] += int(it.get("rnd", 0))
-
-        # Emit three phases per (path,xfer,flags): consec, seq, random
-        # Use pre_seek_eof=True for the random leg to match your convention
-        n_emitted_ops = 0
-        for (path, xfer, flags_extra), a in agg.items():
-            if a["con"] > 0:
-                emit_data_phase(path, intent, xfer, a["con"], "consec",
-                                p_ua_file_default, p_mem_ua, False, flags_extra)
-                n_emitted_ops += a["con"]
-            if a["seq"] > 0:
-                emit_data_phase(path, intent, xfer, a["seq"], "seq",
-                                p_ua_file_default, p_mem_ua, False, flags_extra)
-                n_emitted_ops += a["seq"]
-            if a["rnd"] > 0:
-                emit_data_phase(path, intent, xfer, a["rnd"], "random",
-                                p_ua_file_default, p_mem_ua, True, flags_extra)
-                n_emitted_ops += a["rnd"]
-        return n_emitted_ops
 
     def emit_data_phase(path, intent, xfer, ops, phase_kind, p_ua_file_eff, p_ua_mem, pre_seek_eof, flags_extra):
         if ops <= 0:
@@ -1088,6 +1245,48 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
             emit_data_phase(path, "read" if is_read else "write", xfer, n_seq, "seq",    p_ua_file_eff, p_mem_ua, False, flags_extra)
             emit_data_phase(path, "read" if is_read else "write", xfer, n_rnd, "random", p_ua_file_eff, p_mem_ua, True,  flags_extra)
 
+    emit_intent_rows([r for r in layout_rows if r["intent"]=="read"],  is_read=True)
+    emit_intent_rows([r for r in layout_rows if r["intent"]=="write"], is_read=False)
+
+    def emit_tiny_items(tiny_items, intent, path_flags, p_ua_file_default, p_mem_ua):
+        """
+        tiny_items: list of {"path","xfer","con","seq","rnd","role"} from plan_tiny_intent()
+        intent: "read"|"write"
+        path_flags: dict path->flags suffix like "|unique|" or "|shared|"
+        p_ua_file_default: float to use for p_ua_file (you already compute p_file_ua_req earlier)
+        p_mem_ua: float (you already have p_mem_ua)
+        """
+        from collections import defaultdict
+        # Coalesce identical (path,xfer,flags) to keep CSV compact
+        agg = defaultdict(lambda: {"con":0, "seq":0, "rnd":0})
+        for it in tiny_items:
+            path = it["path"]
+            xfer = int(it["xfer"])
+            flags_extra = path_flags.get(path, "|unique|")  # fallback sensible default
+            key = (path, xfer, flags_extra)
+            a = agg[key]
+            a["con"] += int(it.get("con", 0))
+            a["seq"] += int(it.get("seq", 0))
+            a["rnd"] += int(it.get("rnd", 0))
+
+        # Emit three phases per (path,xfer,flags): consec, seq, random
+        # Use pre_seek_eof=True for the random leg to match your convention
+        n_emitted_ops = 0
+        for (path, xfer, flags_extra), a in agg.items():
+            if a["con"] > 0:
+                emit_data_phase(path, intent, xfer, a["con"], "consec",
+                                p_ua_file_default, p_mem_ua, False, flags_extra)
+                n_emitted_ops += a["con"]
+            if a["seq"] > 0:
+                emit_data_phase(path, intent, xfer, a["seq"], "seq",
+                                p_ua_file_default, p_mem_ua, False, flags_extra)
+                n_emitted_ops += a["seq"]
+            if a["rnd"] > 0:
+                emit_data_phase(path, intent, xfer, a["rnd"], "random",
+                                p_ua_file_default, p_mem_ua, True, flags_extra)
+                n_emitted_ops += a["rnd"]
+        return n_emitted_ops
+
     # Optional tiny rows collected earlier per your quadrant logic:
     # (initialize these to [] earlier in the script if they might be absent)
     extra_tiny_rows_read  = locals().get("extra_tiny_rows_read",  [])
@@ -1111,16 +1310,38 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
             p_mem_ua=p_mem_ua
         )
 
-    emit_intent_rows([r for r in layout_rows if r["intent"]=="read"],  is_read=True)
-    emit_intent_rows([r for r in layout_rows if r["intent"]=="write"], is_read=False)
+    # after the layout_rows (data rows) are finalized
+    Nr = sum(r["ops"] for r in layout_rows if r["intent"]=="read")
+    Nw = sum(r["ops"] for r in layout_rows if r["intent"]=="write")
+    Nio_realized = Nr + Nw + tiny_ops_total
 
-    # ---------- META phase ----------
-    io_ops = sum(r["ops"] for r in layout_rows) + tiny_ops_total
-    denom = clamp01(feats.get("pct_io_access", 0.18)) or 1.0
-    m_open = int(round(clamp01(feats.get("pct_meta_open_access",0.0)) * io_ops / denom))
-    m_stat = int(round(clamp01(feats.get("pct_meta_stat_access",0.0)) * io_ops / denom))
-    m_seek = int(round(clamp01(feats.get("pct_meta_seek_access",0.0)) * io_ops / denom))
-    m_sync = int(round(clamp01(feats.get("pct_meta_sync_access",0.0)) * io_ops / denom))
+    # desired meta totals (counts), using *features* fractions and the user’s requested io/meta split
+    p_io   = clamp01(feats.get("pct_io_access", 1))
+    p_open = clamp01(feats.get("pct_meta_open_access", 0.0))
+    p_stat = clamp01(feats.get("pct_meta_stat_access", 0.0))
+    p_seek = clamp01(feats.get("pct_meta_seek_access", 0.0))
+    p_sync = clamp01(feats.get("pct_meta_sync_access", 0.0))
+
+    # If p_io == 0, avoid divide-by-zero; otherwise scale meta so that:
+    # meta_total / (meta_total + Nio_realized) ≈ (1 - p_io)
+    if p_io > 0.0:
+        scale = (1.0 - p_io) / p_io
+    else:
+        scale = 0.0  # no IO requested → keep meta at 0
+
+    meta_total_target = int(round(scale * Nio_realized))
+
+    # allocate meta_total_target across kinds according to p_open:p_stat:p_seek:p_sync
+    k_fracs = [p_open, p_stat, p_seek, p_sync]
+    s_k = sum(k_fracs) or 1.0
+    k_fracs = [k/s_k for k in k_fracs]
+
+    m_open = int(round(meta_total_target * k_fracs[0]))
+    m_stat = int(round(meta_total_target * k_fracs[1]))
+    m_seek = int(round(meta_total_target * k_fracs[2]))
+    m_sync = int(round(meta_total_target * k_fracs[3]))
+
+    # emit one META row using these finalized counts
     seed = 777
     meta_row = ["meta", str(META_DIR / "meta_only.dat"), "0","1","0","0","0","0","0","0",
                 f"{clamp01(p_file_ua_req):.6f}", f"{p_mem_ua:.6f}",
@@ -1319,15 +1540,6 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
         f.write(f"  Eligible ops (xfer % fs_align == 0): {eligible_ops}\n")
         f.write(f"  Predicted overall file-unaligned fraction: ~{predicted_unaligned_frac:.4f}\n")
         f.write("  Distribution of extra unaligned: split equally across eligible S/M/L bins; proportional within-bin by ops.\n\n")
-
-        # Feasibility
-        f.write("=== FEASIBILITY & CLAMPS ===\n")
-        if infeasible_reasons:
-            for r in infeasible_reasons:
-                f.write(f"  • {r}\n")
-        else:
-            f.write("  No clamps applied.\n")
-        f.write("\n")
 
         # RW-switches details
         f.write("=== RW SWITCHES ===\n")
