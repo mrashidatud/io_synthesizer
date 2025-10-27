@@ -99,7 +99,7 @@ def _set_outroot_per_json(json_path: str):
 # Small/Medium fixed sub-sizes (bytes)
 S_SUBS = [100, 1024, 4096, 65536]            # 100 B, 1 KiB, 4 KiB, 64 KiB
 M_SUBS = [256*1024, 1<<20, 4*(1<<20)]        # 256 KiB, 1 MiB, 4 MiB
-# L bin default and allowed sizes (MiB): 12, 16, 20, ..., 64
+# L bin default and allowed sizes (MiB): 11, 12, 16, 20, ..., 64
 L_SIZE       = 16 * (1<<20)  # default stays 16 MiB
 L_SIZE_CHOICES = [mb * (1<<20) for mb in range(10+1, 64+1, 1)]
 
@@ -207,6 +207,69 @@ def weighted_extreme_avg(shareS, shareM, shareL, choose_max=True):
     pickM = max(M_SUBS) if choose_max else min(M_SUBS)
     pickL = max(L_SIZE_CHOICES) if choose_max else min(L_SIZE_CHOICES)
     return shareS*pickS + shareM*pickM + shareL*pickL
+
+def ensure_rw_has_both(layout_rows, nprocs):
+    """
+    For any file with role 'rw', ensure both intents exist.
+    If one intent is missing, split ops from the other intent
+    (prefer the largest-ops row) to create a new row with >= min_seed ops.
+    """
+    from collections import defaultdict
+
+    per_file = defaultdict(lambda: {"read": [], "write": []})
+    for idx, r in enumerate(layout_rows):
+        if r["role"] == "rw":
+            per_file[r["file"]][r["intent"]].append((idx, r))
+
+    # Walk each RW file and fix missing side
+    inserts = []
+    decrements = []
+    for f, sides in per_file.items():
+        has_r = len(sides["read"]) > 0
+        has_w = len(sides["write"]) > 0
+        if has_r and has_w:
+            continue
+
+        missing = "read" if not has_r else "write"
+        donor_side = "write" if missing == "read" else "read"
+        donors = sides[donor_side]
+        if not donors:
+            # nothing to do; this file wasn't emitted as RW after all
+            continue
+
+        # pick the biggest donor row for this file
+        donors_sorted = sorted(donors, key=lambda t: t[1]["ops"], reverse=True)
+        di, drow = donors_sorted[0]
+        if drow["ops"] <= 1:
+            # can't steal anything meaningful
+            continue
+
+        seed_ops = max(1, min(nprocs, drow["ops"] // 2))
+        # clone donor row, flip intent, set ops to seed_ops
+        newrow = dict(drow)
+        newrow["intent"] = missing
+        newrow["ops"] = seed_ops
+        if newrow.get("bin") in ("S","M","L"):
+            newrow["total_bytes"] = newrow["xfer"] * newrow["ops"]
+
+        # schedule: insert right next to donor so intra-file ordering stays tight
+        inserts.append((di + 1, newrow))
+        # decrement donor
+        drow = dict(drow)
+        drow["ops"] -= seed_ops
+        if drow.get("bin") in ("S","M","L"):
+            drow["total_bytes"] = drow["xfer"] * drow["ops"]
+        decrements.append((di, drow))
+
+    # apply edits (indices from original, so do decrements first)
+    for di, drow in decrements:
+        layout_rows[di] = drow
+    offset = 0
+    for ins_idx, newrow in sorted(inserts, key=lambda t: t[0]):
+        layout_rows.insert(ins_idx + offset, newrow)
+        offset += 1
+
+    return layout_rows
 
 def make_file_weights_for_intent(feats, ro_paths, rw_paths, wo_paths, intent):
     """
@@ -391,7 +454,7 @@ def plan_tiny_intent(intent, feats, Nio, target_total_bytes,
                      S_SUBS, M_SUBS, L_CHOICES,
                      file_roles_by_intent,
                      want_ops, want_bytes,
-                     p_ops_target, p_bytes_target, file_weights):
+                     p_ops_target, p_bytes_target, file_weights, nprocs):
     """
     Build a tiny-but-structured footprint for one intent ('read'|'write').
     - If want_ops=False and want_bytes=False: minimize both (tiny N, smallest xfers)
@@ -437,12 +500,16 @@ def plan_tiny_intent(intent, feats, Nio, target_total_bytes,
         desired_bytes = int(round(p_bytes_target * float(target_total_bytes)))
         N_ops_tiny = max(1, int(math.ceil(desired_bytes / float(xfer_max))))
         # soft-cap ops (prefer increasing xfer via picks rather than growing ops)
-        N_cap = max(1, int(math.floor(EPS_OPS_FRAC_CAP * float(Nio))))
+        base_cap = int(math.floor(EPS_OPS_FRAC_CAP * float(Nio)))
+        # ensure at least nprocs, but don't exceed Nio
+        N_cap = max(1, min(Nio, max(nprocs, base_cap)))
         if N_ops_tiny > N_cap:
             N_ops_tiny = N_cap
     else:
         # minimize both (0/0 case) or both false → small but nonzero to keep structure alive
-        N_cap = max(1, int(math.floor(EPS_OPS_FRAC_CAP * float(Nio))))
+        base_cap = int(math.floor(EPS_OPS_FRAC_CAP * float(Nio)))
+        # ensure at least nprocs, but don't exceed Nio
+        N_cap = max(1, min(Nio, max(nprocs, base_cap)))
         # touch at least a few files
         n_files_tiny = max(1, min(len(pool), int(math.ceil(N_cap / max(EPS_OPS_PER_FILE,1)))))
         N_ops_tiny = min(max(EPS_OPS_ABS_MIN, EPS_OPS_PER_FILE * n_files_tiny), N_cap)
@@ -1022,7 +1089,8 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
                     want_bytes=want_bytes_r,
                     p_ops_target=p_reads_ops,         # feats.get("pct_reads")
                     p_bytes_target=p_bytes_r,          # feats.get("pct_byte_reads")
-                    file_weights=read_file_w
+                    file_weights=read_file_w,
+                    nprocs=nprocs
                 )
                 # Stash for coalescing later:
                 extra_tiny_rows_read = tiny_read_rows
@@ -1041,7 +1109,8 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
                     want_bytes=want_bytes_w,
                     p_ops_target=p_writes_ops,        # feats.get("pct_writes")
                     p_bytes_target=p_bytes_w,          # feats.get("pct_byte_writes")
-                    file_weights=write_file_w
+                    file_weights=write_file_w,
+                    nprocs=nprocs
                 )
                 extra_tiny_rows_write = tiny_write_rows
 
@@ -1121,6 +1190,7 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
     emit_write_bin(W_L, "L", write_pick["L"])
 
     layout_rows = read_rows + write_rows
+    layout_rows = ensure_rw_has_both(layout_rows, nprocs=nprocs)
 
     # Tag shared/unique by FILE counts
     for r in layout_rows:
@@ -1236,8 +1306,8 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
 
     # RW switches
     switch_frac = clamp01(feats.get("pct_rw_switches", 0.0))
-    layout_rows = interleave_rw_segments(layout_rows, switch_frac=switch_frac, seg_ops=64)
-
+    layout_rows = interleave_rw_segments(layout_rows, switch_frac=switch_frac, seg_ops=max(64, nprocs))
+    
     # ---------- Alignment targeting (FILE) ----------
     pua_file_map = compute_rowwise_pua_file(layout_rows, p_file_ua_req, fs_align_bytes)
 
@@ -1438,17 +1508,53 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
     # ---------- File sizing (truncate) ----------
     from collections import defaultdict
     per_file_span = defaultdict(int)
-    def add_span(rows, pc, ps):
-        grp = defaultdict(lambda: defaultdict(int))  # file -> xfer -> ops
-        for r in rows: grp[r["file"]][r["xfer"]] += r["ops"]
-        for f, sizes in grp.items():
+    def add_span(rows, pc, ps, pr):
+        """
+        rows: iterable of {"file","xfer","ops"}
+        pc, ps, pr: fractions for consec, seq, random *for this intent* (already clamped [0,1])
+        """
+        # aggregate ops per (file, xfer)
+        by_fx = defaultdict(lambda: defaultdict(int))  # file -> xfer -> ops
+        for r in rows:
+            by_fx[r["file"]][r["xfer"]] += int(r["ops"])
+
+        for f, sizes in by_fx.items():
             for xfer, ops in sizes.items():
+                if ops <= 0:
+                    continue
+
+                # split ops by structure
                 n_con = int(round(ops * pc))
                 n_seq = int(round(ops * max(0.0, ps - pc)))
-                span = n_con * xfer + n_seq * (xfer + xfer)
+                n_rand = max(0, ops - n_con - n_seq)
+
+                # coverage for consec/seq:
+                # - consec: each op advances by xfer
+                # - seq:    same stride; previous code doubled, but coverage is ~n_seq*xfer
+                #   (If you intentionally want “headroom” for seq, you can add +xfer once.)
+                cov_struct = n_con * xfer + n_seq * xfer
+
+                # coverage for random:
+                # harness uses 128MiB random "chunks" and RR across chunks.
+                # If we try to avoid reusing offsets inside a chunk, the most
+                # new space one chunk can “cover” before reuse is CHUNK_RANDOM.
+                # Number of chunks "needed" if we wanted no reuse:
+                ops_per_chunk = max(1, CHUNK_RANDOM // max(1, xfer))
+                chunks_needed = int(math.ceil(n_rand / float(ops_per_chunk))) if n_rand > 0 else 0
+                cov_random = chunks_needed * CHUNK_RANDOM
+
+                # final required span for this (file,xfer) bucket is the larger of
+                # structured coverage and random-chunk coverage.
+                span = max(cov_struct, cov_random)
+
+                # accumulate (multiple xfer buckets for the same file combine)
                 per_file_span[f] += span
-    add_span([r for r in layout_rows if r["intent"]=="read"],  consec_r, seq_r)
-    add_span([r for r in layout_rows if r["intent"]=="write"], consec_w, seq_w)
+
+    # NOTE: pass the per-intent random fraction too (usually 1 - seq when pc=0 for random legs)
+    # For reads:
+    add_span([r for r in layout_rows if r["intent"] == "read"],  consec_r, seq_r, pr=1.0 - min(1.0, seq_r))
+    # For writes:
+    add_span([r for r in layout_rows if r["intent"] == "write"], consec_w, seq_w, pr=1.0 - min(1.0, seq_w))
 
     # ---------- Write plan.csv ----------
     os.makedirs(PAYLOAD, exist_ok=True)
