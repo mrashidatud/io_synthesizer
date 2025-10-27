@@ -257,6 +257,83 @@ def make_file_weights_for_intent(feats, ro_paths, rw_paths, wo_paths, intent):
 
     return weights
 
+def normalize_weights(paths, wdict):
+    # return weights normalized to sum to 1.0 over the given paths
+    vals = [max(0.0, float(wdict.get(p, 0.0))) for p in paths]
+    s = sum(vals)
+    if s <= 0:
+        # uniform fallback
+        return {p: 1.0/len(paths) for p in paths} if paths else {}
+    return {p: v/s for p, v in zip(paths, vals)}
+
+def choose_shared_paths_bytes_aware(
+    data_paths, read_file_w, write_file_w,
+    B_read_total, B_write_total,
+    K, B_target_shared
+):
+    """
+    Pick exactly K paths to mark as shared so that the sum of expected bytes
+    is as close as possible to B_target_shared.
+    """
+    if K <= 0 or not data_paths:
+        return set(), set(data_paths)
+    if K >= len(data_paths):
+        return set(data_paths), set()
+
+    # Normalize weights on the full data_paths universe
+    rw = normalize_weights(data_paths, read_file_w)
+    ww = normalize_weights(data_paths, write_file_w)
+
+    # Per-path expected bytes
+    exp_bytes = {p: B_read_total * rw.get(p, 0.0) + B_write_total * ww.get(p, 0.0)
+                 for p in data_paths}
+
+    # --- Greedy initializer: take K items with largest exp_bytes if target is large,
+    #     else K items closest to per-file target (B_target_shared / K).
+    per_file_goal = (B_target_shared / K) if K > 0 else 0.0
+
+    # Heuristic switch: if target is closer to taking the bulk, use top-K;
+    # otherwise use "closest to per-file-goal".
+    total_exp = sum(exp_bytes.values())
+    if B_target_shared >= 0.5 * total_exp:
+        cand = sorted(data_paths, key=lambda p: exp_bytes[p], reverse=True)[:K]
+    else:
+        cand = sorted(data_paths, key=lambda p: abs(exp_bytes[p] - per_file_goal))[:K]
+
+    S = set(cand)                         # shared set
+    U = set(data_paths) - S               # unique set
+    sum_S = sum(exp_bytes[p] for p in S)
+
+    # --- Small 2-opt improvement: swap one in S with one in U if it reduces error
+    target = B_target_shared
+    best_err = abs(sum_S - target)
+    improved = True
+    # Limit passes to keep this cheap (K * |U| can be large)
+    passes = 0
+    MAX_PASSES = 3
+    while improved and passes < MAX_PASSES:
+        improved = False
+        passes += 1
+        # Try a few best candidates only (prune)
+        S_sorted = sorted(S, key=lambda p: exp_bytes[p], reverse=True)[:min(len(S), 64)]
+        U_sorted = sorted(U, key=lambda p: exp_bytes[p])[:min(len(U), 64)]
+        for ps in S_sorted:
+            for pu in U_sorted:
+                new_sum = sum_S - exp_bytes[ps] + exp_bytes[pu]
+                err = abs(new_sum - target)
+                if err + 1e-9 < best_err:
+                    # perform swap
+                    S.remove(ps); U.add(ps)
+                    U.remove(pu); S.add(pu)
+                    sum_S = new_sum
+                    best_err = err
+                    improved = True
+                    break
+            if improved:
+                break
+
+    return S, U
+
 def pick_bin_sizes_for_intent(intent, feats, S_SUBS, M_SUBS, L_CHOICES, minimize_bytes=True):
     """
     Return [(bin_label, xfer_bytes, bin_weight)] (weights sum to 1).
@@ -854,25 +931,43 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
     rw_paths = [str(DATA_RW / f"rw_{i}.dat") for i in range(n_rw)]
     wo_paths = [str(DATA_WO / f"wo_{i}.dat") for i in range(n_wo)]
     data_paths = ro_paths + rw_paths + wo_paths
-    N_data = len(data_paths)
+
     roles_dict = {
         "read":  {"RO": list(ro_paths), "RW": list(rw_paths)},
         "write": {"RW": list(rw_paths), "WO": list(wo_paths)},
     }
+
     read_file_w  = make_file_weights_for_intent(feats, ro_paths, rw_paths, wo_paths, "read")
     write_file_w = make_file_weights_for_intent(feats, ro_paths, rw_paths, wo_paths, "write")
 
+    # Shared file count target (respect your meta-is-shared rule)
     if nprocs <= 1:
-        # Your invariant: single-rank runs have no shared data files
         N_shared_data = 0
     else:
-        # Target shared *file-count* fraction includes the META file when shared
+        # p_shared is the desired fraction of shared *files* (data+meta)
         # We want: (N_shared_data + (1 if meta_is_shared else 0)) / (N_data + 1) ≈ p_shared
+        N_data = len(data_paths)
         N_shared_data = int(round(p_shared * (N_data + 1) - (1 if meta_is_shared else 0)))
         N_shared_data = max(0, min(N_data, N_shared_data))
 
-    shared_paths = set(data_paths[:N_shared_data])
-    unique_paths = set(data_paths[N_shared_data:])
+    # Compute the actual totals you planned for each intent (before rebalancer tweaks)
+    B_read_total  = int(round(io_bytes_target * p_bytes_r))
+    B_write_total = int(round(io_bytes_target * p_bytes_w))
+
+    # Shared *bytes* target over data files only (meta bytes ~ 0)
+    B_total_data = B_read_total + B_write_total
+    B_target_shared = clamp01(feats.get("pct_bytes_shared_files", 0.0)) * B_total_data
+
+    shared_paths, unique_paths = choose_shared_paths_bytes_aware(
+        data_paths,
+        read_file_w, write_file_w,
+        B_read_total, B_write_total,
+        N_shared_data,
+        B_target_shared
+    )
+
+    # Build flags map consumed by emit_* functions
+    path_flags = {p: ("|shared|" if p in shared_paths else "|unique|") for p in data_paths}
 
     # Avg xfer estimates for initial Nio
     avgS = sum(S_SUBS)/len(S_SUBS)
@@ -1031,17 +1126,6 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
     for r in layout_rows:
         if r["file"] in shared_paths: r["flags"] = (r.get("flags","") + "|shared|")
         else:                         r["flags"] = (r.get("flags","") + "|unique|")
-
-    # Build per-path flag suffix so tiny rows inherit the same shared/unique marker.
-    # We take the first seen flags per path from your layout_rows; fallback will be "|unique|".
-    path_flags = {}
-    for r in layout_rows:
-        f = r.get("flags", "")
-        # keep only the suffix (e.g., "|unique|" or "|shared|"); emit_data_phase will prepend "consec"/"seq"/"random"
-        suffix = ""
-        if "|shared|" in f: suffix = "|shared|"
-        elif "|unique|" in f: suffix = "|unique|"
-        path_flags.setdefault(r["file"], suffix if suffix else "|unique|")
 
     # ---------- Tiny bytes accounting (exclude tiny rows from rebalancer) ----------
     from collections import defaultdict
