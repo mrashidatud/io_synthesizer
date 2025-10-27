@@ -1508,53 +1508,67 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
     # ---------- File sizing (truncate) ----------
     from collections import defaultdict
     per_file_span = defaultdict(int)
-    def add_span(rows, pc, ps, pr):
+    def add_span(rows, pc, ps):
         """
         rows: iterable of {"file","xfer","ops"}
-        pc, ps, pr: fractions for consec, seq, random *for this intent* (already clamped [0,1])
+        pc, ps: consec & seq fractions for this intent (already clamped [0,1])
+        Random fraction is inferred as pr = 1 - min(1, ps) with consec ⊂ seq.
         """
-        # aggregate ops per (file, xfer)
         by_fx = defaultdict(lambda: defaultdict(int))  # file -> xfer -> ops
         for r in rows:
             by_fx[r["file"]][r["xfer"]] += int(r["ops"])
 
         for f, sizes in by_fx.items():
+            cov_struct = 0
+            n_rand_total = 0
+
             for xfer, ops in sizes.items():
                 if ops <= 0:
                     continue
 
-                # split ops by structure
                 n_con = int(round(ops * pc))
                 n_seq = int(round(ops * max(0.0, ps - pc)))
                 n_rand = max(0, ops - n_con - n_seq)
 
-                # coverage for consec/seq:
-                # - consec: each op advances by xfer
-                # - seq:    same stride; previous code doubled, but coverage is ~n_seq*xfer
-                #   (If you intentionally want “headroom” for seq, you can add +xfer once.)
-                cov_struct = n_con * xfer + n_seq * xfer
+                # structured coverage: stride by xfer
+                cov_struct += (n_con + n_seq) * xfer
 
-                # coverage for random:
-                # harness uses 128MiB random "chunks" and RR across chunks.
-                # If we try to avoid reusing offsets inside a chunk, the most
-                # new space one chunk can “cover” before reuse is CHUNK_RANDOM.
-                # Number of chunks "needed" if we wanted no reuse:
-                ops_per_chunk = max(1, CHUNK_RANDOM // max(1, xfer))
-                chunks_needed = int(math.ceil(n_rand / float(ops_per_chunk))) if n_rand > 0 else 0
-                cov_random = chunks_needed * CHUNK_RANDOM
+                # random coverage: 1 op per 128 MiB chunk (RR across chunks)
+                n_rand_total += n_rand
 
-                # final required span for this (file,xfer) bucket is the larger of
-                # structured coverage and random-chunk coverage.
-                span = max(cov_struct, cov_random)
+            cov_random = n_rand_total * CHUNK_RANDOM
+            per_file_span[f] += max(cov_struct, cov_random)
+    def add_span_from_tiny(tiny_items, p_con, p_seq):
+        # Aggregate tiny ops per (file,xfer)
+        from collections import defaultdict
+        agg = defaultdict(lambda: defaultdict(lambda: {"con":0, "seq":0, "rnd":0}))
+        for it in tiny_items:
+            f = it["path"]; x = int(it["xfer"])
+            agg[f][x]["con"] += int(it.get("con", 0))
+            agg[f][x]["seq"] += int(it.get("seq", 0))
+            agg[f][x]["rnd"] += int(it.get("rnd", 0))
 
-                # accumulate (multiple xfer buckets for the same file combine)
-                per_file_span[f] += span
+        for f, sizes in agg.items():
+            cov_struct = 0
+            n_rand_total = 0
+            for xfer, a in sizes.items():
+                n_con  = a["con"]
+                n_seq  = a["seq"]
+                n_rand = a["rnd"]
+                # structured coverage
+                cov_struct += (n_con + n_seq) * xfer
+                # random coverage is per-file at 1 op per CHUNK_RANDOM
+                n_rand_total += n_rand
+            cov_random = n_rand_total * CHUNK_RANDOM
+            per_file_span[f] += max(cov_struct, cov_random)
 
-    # NOTE: pass the per-intent random fraction too (usually 1 - seq when pc=0 for random legs)
-    # For reads:
-    add_span([r for r in layout_rows if r["intent"] == "read"],  consec_r, seq_r, pr=1.0 - min(1.0, seq_r))
-    # For writes:
-    add_span([r for r in layout_rows if r["intent"] == "write"], consec_w, seq_w, pr=1.0 - min(1.0, seq_w))
+    # Reads and writes (random fraction implied by consec ⊂ seq model)
+    add_span([r for r in layout_rows if r["intent"] == "read"],  consec_r, seq_r)
+    add_span([r for r in layout_rows if r["intent"] == "write"], consec_w, seq_w)
+
+    # Fold tiny rows (if any)
+    add_span_from_tiny(extra_tiny_rows_read,  consec_r, seq_r)
+    add_span_from_tiny(extra_tiny_rows_write, consec_w, seq_w)
 
     # ---------- Write plan.csv ----------
     os.makedirs(PAYLOAD, exist_ok=True)
@@ -1694,14 +1708,10 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
         f.write("=== FILE LAYOUT & TRUNCATE SIZES ===\n")
         f.write(f"  RO={len(ro_paths)}  RW={len(rw_paths)}  WO={len(wo_paths)} | shared_files≈{len(shared_paths)} unique_files≈{len(unique_paths)}\n")
         for pth in (ro_paths + rw_paths + wo_paths):
-            sz = 0
-            # summarize file size to be truncated
-            for line in lines[1:]:
-                cols = line.split(",")
-                if cols[0]!="data": continue
-                if cols[1]==pth: sz += int(cols[2])
             role = "RO" if pth in ro_paths else ("RW" if pth in rw_paths else "WO")
             su = "shared" if pth in shared_paths else "unique"
+            # NEW (matches prep: use per_file_span computed earlier)
+            sz = int(per_file_span.get(pth, 0))
             f.write(f"    {role:2s} [{su:6s}] {pth} -> truncate {human_bytes(sz)}\n")
         f.write("\n")
 
