@@ -630,54 +630,127 @@ static void run_plan(FILE* fp)
 
         // ===== UNIQUE RUN in waves =====
         int run_len = count_unique_run(phases, (int)nph, (int)idx);
-        int cursor  = 0;
 
-        while (cursor < run_len) {
-            int wave_len = (run_len - cursor < nprocs) ? (run_len - cursor) : nprocs;
+        /* done[i]==1 means phases[idx+i] has executed */
+        char *done = (char*)malloc((size_t)run_len);
+        if (!done) { fprintf(stderr, "OOM done\n"); MPI_Abort(MPI_COMM_WORLD, 1); }
+        for (int i = 0; i < run_len; i++) done[i] = 0;
 
-            MPI_Barrier(MPI_COMM_WORLD);
-            double t_start = MPI_Wtime();
+        int remaining = run_len;
 
-            unsigned long long my_ops_ull = 0ULL;
+        while (remaining > 0) {
+            int  assigned = 0;
+            int *chosen   = (int*)malloc(sizeof(int) * nprocs);   /* global index in [0..run_len), or -1 */
+            if (!chosen) { fprintf(stderr, "OOM chosen\n"); MPI_Abort(MPI_COMM_WORLD, 1); }
+            for (int r = 0; r < nprocs; r++) chosen[r] = -1;
 
-            // every rank looks at exactly one candidate in this wave (if any),
-            // but only the *owner of that candidate's path* executes it.
-            int my_slot = rank;
-            int my_i    = (my_slot < wave_len) ? ((int)idx + cursor + my_slot) : -1;
+            if (rank == 0) {
+                int *owner_used = (int*)malloc(sizeof(int) * nprocs);
+                if (!owner_used) { fprintf(stderr, "OOM owner_used\n"); MPI_Abort(MPI_COMM_WORLD, 1); }
+                for (int r = 0; r < nprocs; r++) owner_used[r] = 0;
 
-            if (my_i >= 0) {
-                phase_t* U = &phases[my_i];
-                int owner = owner_for_path(U->path, nprocs);
-                if (rank == owner) {
-                    uint64_t Nops_u = (U->xfer ? (U->total_bytes / U->xfer) : 0);
-                    my_ops_ull = (unsigned long long)Nops_u;
-                    exec_phase_data_local(U, my_i + 1, Nops_u, 0);
+                /* Walk ALL rows in this UNIQUE run, earliest-first. Give each owner at most one. */
+                for (int i = 0; i < run_len; i++) {
+                    if (done[i]) continue;
+                    phase_t *U = &phases[idx + i];
+                    int owner  = owner_for_path(U->path, nprocs);
+                    if (!owner_used[owner] && chosen[owner] == -1) {
+                        chosen[owner]  = i;     /* this rank runs global row i this round */
+                        owner_used[owner] = 1;
+                        assigned++;
+                        if (assigned == nprocs) break; /* all ranks got work */
+                    }
                 }
-                // Non-owners do *nothing* (do not open).
+                free(owner_used);
             }
 
-            double t_end = MPI_Wtime();
+            /* Share the plan for this round */
+            MPI_Bcast(&assigned, 1, MPI_INT, 0, MPI_COMM_WORLD);
+            MPI_Bcast(chosen,   nprocs, MPI_INT, 0, MPI_COMM_WORLD);
 
+            /* All ranks mark the chosen rows as done (so state stays identical) */
+            for (int r = 0; r < nprocs; r++) {
+                if (chosen[r] >= 0) {
+                    if (!done[chosen[r]]) {
+                        done[chosen[r]] = 1;
+                    }
+                }
+            }
+            remaining -= assigned;
+
+            MPI_Barrier(MPI_COMM_WORLD);
+            double t0 = MPI_Wtime();
+
+            /* Each rank executes at most one row this round */
+            if (chosen[rank] >= 0) {
+                int gi = chosen[rank];                /* global index into the run */
+                phase_t *U = &phases[idx + gi];
+
+                /* derive Nops = total_bytes/xfer (planner semantics) */
+                unsigned long long Nops = 0ULL;
+                if (U->xfer > 0) Nops = (unsigned long long)(U->total_bytes / U->xfer);
+
+                /* 1-based phase number for logs */
+                int phase_no_for_log = (int)(idx + gi + 1);
+                exec_phase_data_local(U, phase_no_for_log, (uint64_t)Nops, 0);
+            }
+
+            double t1 = MPI_Wtime();
+            
+            /* Per-rank round stats */
+            double my_start = 0.0, my_end = 0.0;
+            unsigned long long my_ops_ull = 0ULL;
+
+            if (chosen[rank] >= 0) {
+                my_start = t0;
+                my_end   = t1;
+                /* Nops was computed when we executed the phase */
+                /* Recompute cheaply here for clarity; keep it in a local when you exec if you prefer */
+                {
+                    int gi = chosen[rank];
+                    phase_t *U = &phases[idx + gi];
+                    if (U->xfer > 0) my_ops_ull = (unsigned long long)(U->total_bytes / U->xfer);
+                }
+            } else {
+                /* Sentinels so idle ranks don't disturb MIN/MAX reductions */
+                my_start = 1e300;   /* very large */
+                my_end   = -1e300;  /* very small */
+            }
+
+            /* Round-wide reductions */
             double min_start = 0.0, max_end = 0.0;
             unsigned long long sum_ops_ull = 0ULL;
 
-            MPI_Reduce(&t_start, &min_start, 1, MPI_DOUBLE, MPI_MIN, 0, MPI_COMM_WORLD);
-            MPI_Reduce(&t_end,   &max_end,   1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+            MPI_Reduce(&my_start, &min_start,   1, MPI_DOUBLE,               MPI_MIN, 0, MPI_COMM_WORLD);
+            MPI_Reduce(&my_end,   &max_end,     1, MPI_DOUBLE,               MPI_MAX, 0, MPI_COMM_WORLD);
             MPI_Reduce(&my_ops_ull, &sum_ops_ull, 1, MPI_UNSIGNED_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
 
             MPI_Barrier(MPI_COMM_WORLD);
 
             if (rank == 0) {
-                double wall = max_end - min_start;
+                /* Compute phase-number span for *this round* from chosen[] */
+                long long pmin = -1, pmax = -1;
+                for (int r = 0; r < nprocs; r++) {
+                    if (chosen[r] >= 0) {
+                        long long p = (long long)idx + (long long)chosen[r] + 1; /* 1-based phase number */
+                        if (pmin < 0 || p < pmin) pmin = p;
+                        if (pmax < 0 || p > pmax) pmax = p;
+                    }
+                }
+
+                double wall = (sum_ops_ull > 0) ? (max_end - min_start) : 0.0;
+
+                /* If only one phase ran this round, pmin==pmax, still prints fine */
                 fprintf(stdout,
-                    "UNIQUE wave SUMMARY: phases [%zu..%zu] ops=%llu wall=%.6fs (min_start=%.6f, max_end=%.6f)\n",
-                    idx + cursor + 1, idx + cursor + wave_len,
-                    sum_ops_ull, wall, min_start, max_end);
+                    "UNIQUE wave SUMMARY: phases [%lld..%lld] ops=%llu wall=%.6fs (min_start=%.6f, max_end=%.6f)\n",
+                    (long long)pmin, (long long)pmax,
+                    (unsigned long long)sum_ops_ull, wall, min_start, max_end);
                 fflush(stdout);
             }
-            cursor += wave_len;
+            free(chosen);
         }
-        idx += (size_t)run_len;
+        idx += run_len;
+        free(done);
     }
 
     if (rank == 0) {
