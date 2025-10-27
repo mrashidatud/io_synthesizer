@@ -64,7 +64,7 @@ Notes are comprehensive and list:
 Run script calls your exact Darshan/mpi_synthio paths and runs prep first.
 """
 
-import argparse, json, os, random
+import argparse, json, os, random, math
 from pathlib import Path
 from collections import defaultdict, Counter
 
@@ -104,6 +104,12 @@ L_SIZE       = 16 * (1<<20)  # default stays 16 MiB
 L_SIZE_CHOICES = [mb * (1<<20) for mb in range(10+1, 64+1, 1)]
 
 CHUNK_RANDOM = 128*(1<<20)
+
+# --- Tiny-footprint policy knobs ---
+EPS_OPS_ABS_MIN   = 64          # minimum ops to realize structure (>=64 avoids rounding collapses)
+EPS_OPS_PER_FILE  = 4           # tiny ops per participating file (RW/WO for writes; RO/RW for reads)
+EPS_BYTES_FRAC_CAP = 5e-4       # ≤ 0.05% of total bytes when minimizing bytes
+EPS_OPS_FRAC_CAP   = 5e-4       # ≤ 0.05% of total ops   when minimizing ops
 
 # ---------------- Helpers ----------------
 def human_bytes(n):
@@ -188,6 +194,218 @@ def weighted_extreme_avg(shareS, shareM, shareL, choose_max=True):
     pickM = max(M_SUBS) if choose_max else min(M_SUBS)
     pickL = max(L_SIZE_CHOICES) if choose_max else min(L_SIZE_CHOICES)
     return shareS*pickS + shareM*pickM + shareL*pickL
+
+def pick_bin_sizes_for_intent(intent, feats, S_SUBS, M_SUBS, L_CHOICES, minimize_bytes=True):
+    """
+    Return [(bin_label, xfer_bytes, bin_weight)] (weights sum to 1).
+    Uses the pct_* bin signals. For minimize_bytes pick the smallest xfer in each
+    signaled bin; otherwise pick the largest.
+    """
+    if intent == "write":
+        bS = feats.get("pct_write_0_100K", 0.0)
+        bM = feats.get("pct_write_100K_10M", 0.0)
+        bL = feats.get("pct_write_10M_1G_PLUS", 0.0)
+    else:
+        bS = feats.get("pct_read_0_100K", 0.0)
+        bM = feats.get("pct_read_100K_10M", 0.0)
+        bL = feats.get("pct_read_10M_1G_PLUS", 0.0)
+
+    vec = [("S", bS), ("M", bM), ("L", bL)]
+    total = sum(v for _, v in vec)
+    if total <= 0.0:
+        # default to S if nothing is signaled
+        vec = [("S", 1.0)]
+        total = 1.0
+    vec = [(k, v/total) for k, v in vec if v > 0.0]
+
+    picks = []
+    for k, w in vec:
+        if k == "S":
+            xfer = min(S_SUBS) if minimize_bytes else max(S_SUBS)
+        elif k == "M":
+            xfer = min(M_SUBS) if minimize_bytes else max(M_SUBS)
+        else:
+            xfer = min(L_CHOICES) if minimize_bytes else max(L_CHOICES)
+        picks.append((k, int(xfer), w))
+    return picks
+
+def structure_counts(N, p_consec, p_seq):
+    """
+    Enforce Consec ⊂ Seq. Return (N_con, N_seq_only, N_rand).
+    """
+    p_con = max(0.0, min(1.0, float(p_consec)))
+    p_sq  = max(0.0, min(1.0, float(p_seq)))
+    if p_sq < p_con: p_sq = p_con
+    N_con = int(round(N * p_con))
+    N_seq = int(round(N * (p_sq - p_con)))
+    if N_con > N: N_con = N
+    if N_seq > (N - N_con): N_seq = N - N_con
+    N_rand = N - N_con - N_seq
+    # ε safeguard (donate one from rand if rounding killed a requested class)
+    if p_sq > p_con and N_seq == 0 and N_rand > 0:
+        N_seq += 1; N_rand -= 1
+    if p_con > 0 and N_con == 0 and N_rand > 0:
+        N_con += 1; N_rand -= 1
+    return N_con, N_seq, N_rand
+
+def plan_tiny_intent(intent, feats, Nio, target_total_bytes,
+                     S_SUBS, M_SUBS, L_CHOICES,
+                     file_roles_by_intent,
+                     want_ops, want_bytes,
+                     p_ops_target, p_bytes_target):
+    """
+    Build a tiny-but-structured footprint for one intent ('read'|'write').
+    - If want_ops=False and want_bytes=False: minimize both (tiny N, smallest xfers)
+    - If want_ops=False and want_bytes=True: hit bytes with few ops (large xfers, tiny N)
+    - If want_ops=True and want_bytes=False: hit ops with tiny bytes (small xfers, larger N)
+    - If want_ops=True and want_bytes=True: not used here; caller should use the normal path.
+
+    Returns: (tiny_items, N_ops_total)
+      where tiny_items is a list of dicts:
+        { "path": str, "xfer": int, "con":int, "seq":int, "rnd":int, "role":"RO|RW|WO" }
+    """
+    # 0) structure targets
+    if intent == "write":
+        p_con, p_seq = feats.get("pct_consec_writes", 0.0), feats.get("pct_seq_writes", 0.0)
+        pool_main = file_roles_by_intent["write"].get("RW", [])
+        pool_alt  = file_roles_by_intent["write"].get("WO", [])
+    else:
+        p_con, p_seq = feats.get("pct_consec_reads", 0.0), feats.get("pct_seq_reads", 0.0)
+        pool_main = file_roles_by_intent["read"].get("RO", [])
+        pool_alt  = file_roles_by_intent["read"].get("RW", [])
+
+    pool = (pool_main or []) + (pool_alt or [])
+    if not pool:
+        # planner guarantees files exist, but keep a safe guard
+        pool = ["/dev/null"]
+
+    # 1) decide bin sizes
+    if not want_ops and want_bytes:
+        # bytes-priority → choose largest sizes in signaled bins
+        picks = pick_bin_sizes_for_intent(intent, feats, S_SUBS, M_SUBS, L_CHOICES, minimize_bytes=False)
+    else:
+        # ops-priority (or minimize both) → choose smallest sizes in signaled bins
+        picks = pick_bin_sizes_for_intent(intent, feats, S_SUBS, M_SUBS, L_CHOICES, minimize_bytes=True)
+
+    # 2) decide N_ops_tiny
+    if want_ops and not want_bytes:
+        # realize requested op fraction, bytes ≈ 0 thanks to tiny xfers
+        N_ops_tiny = max(EPS_OPS_ABS_MIN, int(round(p_ops_target * float(Nio))))
+    elif not want_ops and want_bytes:
+        # realize requested bytes with minimal ops: pick a representative "large" xfer
+        # Use the largest xfer among chosen picks as our dominant grain.
+        xfer_max = max(x for (_, x, _) in picks)
+        desired_bytes = int(round(p_bytes_target * float(target_total_bytes)))
+        N_ops_tiny = max(1, int(math.ceil(desired_bytes / float(xfer_max))))
+        # soft-cap ops (prefer increasing xfer via picks rather than growing ops)
+        N_cap = max(1, int(math.floor(EPS_OPS_FRAC_CAP * float(Nio))))
+        if N_ops_tiny > N_cap:
+            N_ops_tiny = N_cap
+    else:
+        # minimize both (0/0 case) or both false → small but nonzero to keep structure alive
+        N_cap = max(1, int(math.floor(EPS_OPS_FRAC_CAP * float(Nio))))
+        # touch at least a few files
+        n_files_tiny = max(1, min(len(pool), int(math.ceil(N_cap / max(EPS_OPS_PER_FILE,1)))))
+        N_ops_tiny = min(max(EPS_OPS_ABS_MIN, EPS_OPS_PER_FILE * n_files_tiny), N_cap)
+
+    # 3) split structure at whole-intent level
+    N_con, N_seq, N_rand = structure_counts(N_ops_tiny, p_con, p_seq)
+
+    # 4) apportion per bin by weight; last bin absorbs remainder
+    rem_con, rem_seq, rem_rand = N_con, N_seq, N_rand
+    bin_plan = []
+    for j, (_, xfer, w) in enumerate(picks):
+        if j < len(picks)-1:
+            c = min(rem_con, int(round(N_con * w)))
+            s = min(rem_seq, int(round(N_seq * w)))
+            r = min(rem_rand, int(round(N_rand * w)))
+        else:
+            c, s, r = rem_con, rem_seq, rem_rand
+        rem_con -= c; rem_seq -= s; rem_rand -= r
+        if c+s+r > 0:
+            bin_plan.append((xfer, c, s, r))
+
+    # 5) spread across files round-robin, preferring main pool first
+    items = []
+    fi = 0
+    for (xfer, c, s, r) in bin_plan:
+        total = c+s+r
+        for _ in range(total):
+            path = pool[fi % len(pool)]
+            role = "RW" if path in pool_main and intent=="write" else \
+                   "RO" if path in pool_main and intent=="read"  else \
+                   ("WO" if intent=="write" else "RW")
+            if c > 0:
+                items.append({"path": path, "xfer": xfer, "con":1, "seq":0, "rnd":0, "role":role}); c -= 1
+            elif s > 0:
+                items.append({"path": path, "xfer": xfer, "con":0, "seq":1, "rnd":0, "role":role}); s -= 1
+            else:
+                items.append({"path": path, "xfer": xfer, "con":0, "seq":0, "rnd":1, "role":role}); r -= 1
+            fi += 1
+
+    # ---- soft-cap tiny bytes when we are minimizing bytes on this intent ----
+    tiny_bytes = sum(it["xfer"] * (it["con"] + it["seq"] + it["rnd"]) for it in items)
+    bytes_cap  = int(EPS_BYTES_FRAC_CAP * float(target_total_bytes))
+
+    # We only enforce the hard cap when BOTH ops and bytes are being minimized.
+    # If ops must be honored (want_ops=True, want_bytes=False), the cap is *soft*:
+    # we try to trim, but if that would break structure/ops floors we stop early.
+    need_hard_cap = (not want_ops) and (not want_bytes)
+
+    if tiny_bytes > bytes_cap and (need_hard_cap or tiny_bytes > 2 * bytes_cap):
+        # proportional downscale across items, preferring to remove from largest-xfer first
+        items.sort(key=lambda z: z["xfer"], reverse=True)
+
+        def take_one_from(it):
+            # drop in the order: rnd -> seq -> con (preserve structure as much as possible)
+            if it["rnd"] > 0: it["rnd"] -= 1; return it["xfer"]
+            if it["seq"] > 0: it["seq"] -= 1; return it["xfer"]
+            if it["con"] > 0: it["con"] -= 1; return it["xfer"]
+            return 0
+
+        # minimum structure floors: keep at least 1 op in any class that’s requested (>0 in features)
+        want_con = (p_con > 0.0)
+        want_seq = (p_seq > p_con)
+        floors = {"con": 1 if want_con else 0,
+                  "seq": 1 if want_seq else 0,
+                  "rnd": 0}
+
+        # enforce floors per (path,xfer) bucket
+        from collections import defaultdict
+        per_bucket = defaultdict(lambda: {"con":0,"seq":0,"rnd":0})
+        for it in items:
+            k = (it["path"], it["xfer"])
+            per_bucket[k]["con"] += it["con"]
+            per_bucket[k]["seq"] += it["seq"]
+            per_bucket[k]["rnd"] += it["rnd"]
+
+        # trimming loop
+        target = bytes_cap if need_hard_cap else 2 * bytes_cap
+        while tiny_bytes > target:
+            progressed = False
+            for it in items:
+                k = (it["path"], it["xfer"])
+                # check floors
+                if it["con"] <= 0 and it["seq"] <= 0 and it["rnd"] <= 0:
+                    continue
+                # do not violate per-bucket floors
+                if it["con"]   <= floors["con"] and it["seq"] == 0 and it["rnd"] == 0: continue
+                if it["seq"]   <= floors["seq"] and it["con"] == 0 and it["rnd"] == 0: continue
+
+                removed = take_one_from(it)
+                if removed:
+                    tiny_bytes -= removed
+                    per_bucket[k]  # (not read—but kept for symmetry/future)
+                    progressed = True
+                    if tiny_bytes <= target:
+                        break
+            if not progressed:
+                break  # stop early—structure/ops floors reached
+
+        # drop empty items
+        items = [it for it in items if (it["con"] + it["seq"] + it["rnd"]) > 0]
+
+    return items, N_ops_tiny
 
 # ---------------- Rebalancer (op-preserving, in-bin, fair) ----------------
 def rebalancer_autotune_fair(rows, target_total_bytes,
@@ -542,6 +760,10 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
     wo_paths = [str(DATA_WO / f"wo_{i}.dat") for i in range(n_wo)]
     data_paths = ro_paths + rw_paths + wo_paths
     N_data = len(data_paths)
+    roles_dict = {
+        "read":  {"RO": list(ro_paths), "RW": list(rw_paths)},
+        "write": {"RW": list(rw_paths), "WO": list(wo_paths)},
+    }
 
     if nprocs <= 1:
         # Your invariant: single-rank runs have no shared data files
@@ -563,10 +785,6 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
     avg_write_xfer = wS*avgS + wM*avgM + wL*avgL if (wS+wM+wL)>0 else avgS
     avg_xfer = p_reads_ops*avg_read_xfer + p_writes_ops*avg_write_xfer
 
-    # ---- Symmetric quadrant policy for reads & writes (replaces ε-ops block) ----
-    EPS_OPS_FRAC   = 1e-3    # target: side_ops / total_ops ≤ 0.1% when ops≈0
-    EPS_BYTES_FRAC = 1e-3    # target: side_bytes / total_bytes ≤ 0.1% when bytes≈0
-
     # Desired presence flags
     want_ops_r   = (p_reads_ops  > 0.0)
     want_bytes_r = (p_bytes_r    > 0.0)
@@ -584,23 +802,6 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
     avg_w_max = weighted_extreme_avg(wS, wM, wL, choose_max=True)
     avg_w_min = weighted_extreme_avg(wS, wM, wL, choose_max=False)
 
-    # Utility: ensure side's ops fraction ≤ eps by increasing the other side's ops.
-    def force_ops_fraction_small(side_ops, other_ops, eps=EPS_OPS_FRAC):
-        if side_ops == 0: return other_ops
-        min_other = int(round(max(0.0, (side_ops/eps) - side_ops)))
-        return max(other_ops, min_other)
-
-    # Utility: ensure side's bytes fraction ≤ eps by inflating other side bytes via ops*avg_xfer
-    def force_bytes_fraction_small(side_ops, side_avg_xfer, other_ops, other_avg_xfer, eps=EPS_BYTES_FRAC):
-        side_bytes = side_ops * max(1.0, side_avg_xfer)
-        if side_bytes == 0 or other_avg_xfer <= 0: return other_ops
-        need_total = side_bytes / max(eps, 1e-9)
-        have_total = side_bytes + other_ops * other_avg_xfer
-        if need_total > have_total:
-            add = int(round((need_total - have_total) / other_avg_xfer))
-            return other_ops + max(0, add)
-        return other_ops
-
     # We may need to choose min/max per bin later when materializing rows:
     read_pick  = {"S": None, "M": None, "L": None}   # None → ladder as-is
     write_pick = {"S": None, "M": None, "L": None}
@@ -608,6 +809,8 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
     # Order of handling when both sides want "ops≈0 & bytes>0":
     # prioritize the side with larger byte share so the other can treat ops≈0 relative to a large denominator.
     sides_order = ["read", "write"]
+    extra_tiny_rows_read = []
+    extra_tiny_rows_write = []
     if (not want_ops_r) and want_bytes_r and (not want_ops_w) and want_bytes_w:
         if p_bytes_w > p_bytes_r:
             sides_order = ["write", "read"]
@@ -615,60 +818,38 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
     for side in sides_order:
         if side == "read":
             # Quadrants for READ
-            if (not want_ops_r) and want_bytes_r:
-                # Few, large reads + inflate writes so read-ops% ≈ 0
-                target_bytes = io_bytes_target * p_bytes_r
-                Nr = max(1, int(round(target_bytes / max(1.0, avg_r_max))))
-                Nw = force_ops_fraction_small(Nr, Nw, eps=EPS_OPS_FRAC)
-                # choose max sizes in each bin for reads
-                read_pick["S"] = max(S_SUBS); read_pick["M"] = max(M_SUBS); read_pick["L"] = max(L_SIZE_CHOICES)
-
-            elif want_ops_r and (not want_bytes_r):
-                # Many, tiny reads; keep read-bytes% ≈ 0 by inflating write bytes if needed
-                # Start from split
-                Nr = max(1, int(round(max(1.0, Nio * p_reads_ops))))
-                Nw = max(0, Nio - Nr)
-                # push bytes ratio small
-                Nw = force_bytes_fraction_small(Nr, avg_r_min, Nw, avg_w_max, eps=EPS_BYTES_FRAC)
-                Nio = Nr + Nw
-                # choose min sizes for reads
-                read_pick["S"] = min(S_SUBS); read_pick["M"] = min(M_SUBS); read_pick["L"] = min(L_SIZE_CHOICES)
-
-            elif (not want_ops_r) and (not want_bytes_r):
-                # ε presence only if read signals exist; else none
-                read_signals = (seq_r>0 or consec_r>0 or feats.get("pct_read_0_100K",0)>0
-                                or feats.get("pct_read_100K_10M",0)>0 or feats.get("pct_read_10M_1G_PLUS",0)>0
-                                or ro_f>0 or feats.get("pct_bytes_read_only_files",0)>0)
-                if Nr == 0 and read_signals:
-                    Nr = 1
-                # keep picks as None (we'll use ladders)
-            else:
-                # normal: keep current Nr/Nw and ladders
+            if want_ops_r and want_bytes_r:
+                # normal path (your existing logic)
                 pass
+            else:
+                tiny_read_rows, Nr = plan_tiny_intent(
+                    "read", feats, Nio, io_bytes_target,
+                    S_SUBS, M_SUBS, L_SIZE_CHOICES,
+                    roles_dict,
+                    want_ops=want_ops_r,
+                    want_bytes=want_bytes_r,
+                    p_ops_target=p_reads_ops,         # feats.get("pct_reads")
+                    p_bytes_target=p_bytes_r          # feats.get("pct_byte_reads")
+                )
+                # Stash for coalescing later:
+                extra_tiny_rows_read = tiny_read_rows
 
         else:
             # Quadrants for WRITE
-            if (not want_ops_w) and want_bytes_w:
-                target_bytes = io_bytes_target * p_bytes_w
-                Nw = max(1, int(round(target_bytes / max(1.0, avg_w_max))))
-                Nr = force_ops_fraction_small(Nw, Nr, eps=EPS_OPS_FRAC)
-                write_pick["S"] = max(S_SUBS); write_pick["M"] = max(M_SUBS); write_pick["L"] = max(L_SIZE_CHOICES)
-
-            elif want_ops_w and (not want_bytes_w):
-                Nw = max(1, int(round(max(1.0, Nio * p_writes_ops))))
-                Nr = max(0, Nio - Nw)
-                Nr = force_bytes_fraction_small(Nw, avg_w_min, Nr, avg_r_max, eps=EPS_BYTES_FRAC)
-                Nio = Nr + Nw
-                write_pick["S"] = min(S_SUBS); write_pick["M"] = min(M_SUBS); write_pick["L"] = min(L_SIZE_CHOICES)
-
-            elif (not want_ops_w) and (not want_bytes_w):
-                write_signals = (seq_w>0 or consec_w>0 or feats.get("pct_write_0_100K",0)>0
-                                 or feats.get("pct_write_100K_10M",0)>0 or feats.get("pct_write_10M_1G_PLUS",0)>0
-                                 or wo_f>0 or feats.get("pct_bytes_write_only_files",0)>0)
-                if Nw == 0 and write_signals:
-                    Nw = 1
-            else:
+            if want_ops_w and want_bytes_w:
+                # normal path (your existing logic)
                 pass
+            else:
+                tiny_write_rows, Nw = plan_tiny_intent(
+                    "write", feats, Nio, io_bytes_target,
+                    S_SUBS, M_SUBS, L_SIZE_CHOICES,
+                    roles_dict,
+                    want_ops=want_ops_w,
+                    want_bytes=want_bytes_w,
+                    p_ops_target=p_writes_ops,        # feats.get("pct_writes")
+                    p_bytes_target=p_bytes_w          # feats.get("pct_byte_writes")
+                )
+                extra_tiny_rows_write = tiny_write_rows
 
         # Keep Nio in sync after each side's adjustment
         Nio = Nr + Nw
@@ -769,11 +950,61 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
     # ---------- Alignment targeting (FILE) ----------
     pua_file_map = compute_rowwise_pua_file(layout_rows, p_file_ua_req, fs_align_bytes)
 
+    # Build per-path flag suffix so tiny rows inherit the same shared/unique marker.
+    # We take the first seen flags per path from your layout_rows; fallback will be "|unique|".
+    path_flags = {}
+    for r in layout_rows:
+        f = r.get("flags", "")
+        # keep only the suffix (e.g., "|unique|" or "|shared|"); emit_data_phase will prepend "consec"/"seq"/"random"
+        suffix = ""
+        if "|shared|" in f: suffix = "|shared|"
+        elif "|unique|" in f: suffix = "|unique|"
+        path_flags.setdefault(r["file"], suffix if suffix else "|unique|")
+
     # ---------- Emit CSV ----------
     header=("type,path,total_bytes,xfer,p_write,p_rand,p_seq_r,p_consec_r,p_seq_w,p_consec_w,"
             "p_ua_file,p_ua_mem,rw_switch,meta_open,meta_stat,meta_seek,meta_sync,seed,flags,"
             "p_rand_fwd_r,p_rand_fwd_w,p_consec_internal,pre_seek_eof,n_ops")
     lines=[header]
+
+    def emit_tiny_items(tiny_items, intent, path_flags, p_ua_file_default, p_mem_ua):
+        """
+        tiny_items: list of {"path","xfer","con","seq","rnd","role"} from plan_tiny_intent()
+        intent: "read"|"write"
+        path_flags: dict path->flags suffix like "|unique|" or "|shared|"
+        p_ua_file_default: float to use for p_ua_file (you already compute p_file_ua_req earlier)
+        p_mem_ua: float (you already have p_mem_ua)
+        """
+        from collections import defaultdict
+        # Coalesce identical (path,xfer,flags) to keep CSV compact
+        agg = defaultdict(lambda: {"con":0, "seq":0, "rnd":0})
+        for it in tiny_items:
+            path = it["path"]
+            xfer = int(it["xfer"])
+            flags_extra = path_flags.get(path, "|unique|")  # fallback sensible default
+            key = (path, xfer, flags_extra)
+            a = agg[key]
+            a["con"] += int(it.get("con", 0))
+            a["seq"] += int(it.get("seq", 0))
+            a["rnd"] += int(it.get("rnd", 0))
+
+        # Emit three phases per (path,xfer,flags): consec, seq, random
+        # Use pre_seek_eof=True for the random leg to match your convention
+        n_emitted_ops = 0
+        for (path, xfer, flags_extra), a in agg.items():
+            if a["con"] > 0:
+                emit_data_phase(path, intent, xfer, a["con"], "consec",
+                                p_ua_file_default, p_mem_ua, False, flags_extra)
+                n_emitted_ops += a["con"]
+            if a["seq"] > 0:
+                emit_data_phase(path, intent, xfer, a["seq"], "seq",
+                                p_ua_file_default, p_mem_ua, False, flags_extra)
+                n_emitted_ops += a["seq"]
+            if a["rnd"] > 0:
+                emit_data_phase(path, intent, xfer, a["rnd"], "random",
+                                p_ua_file_default, p_mem_ua, True, flags_extra)
+                n_emitted_ops += a["rnd"]
+        return n_emitted_ops
 
     def emit_data_phase(path, intent, xfer, ops, phase_kind, p_ua_file_eff, p_ua_mem, pre_seek_eof, flags_extra):
         if ops <= 0:
@@ -857,11 +1088,34 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
             emit_data_phase(path, "read" if is_read else "write", xfer, n_seq, "seq",    p_ua_file_eff, p_mem_ua, False, flags_extra)
             emit_data_phase(path, "read" if is_read else "write", xfer, n_rnd, "random", p_ua_file_eff, p_mem_ua, True,  flags_extra)
 
+    # Optional tiny rows collected earlier per your quadrant logic:
+    # (initialize these to [] earlier in the script if they might be absent)
+    extra_tiny_rows_read  = locals().get("extra_tiny_rows_read",  [])
+    extra_tiny_rows_write = locals().get("extra_tiny_rows_write", [])
+
+    # Emit tiny read/write items with exact consec/seq/rand ratios
+    tiny_ops_total = 0
+    if extra_tiny_rows_read:
+        tiny_ops_total += emit_tiny_items(
+            extra_tiny_rows_read, intent="read",
+            path_flags=path_flags,
+            p_ua_file_default=clamp01(p_file_ua_req),  # same alignment you use elsewhere
+            p_mem_ua=p_mem_ua
+        )
+
+    if extra_tiny_rows_write:
+        tiny_ops_total += emit_tiny_items(
+            extra_tiny_rows_write, intent="write",
+            path_flags=path_flags,
+            p_ua_file_default=clamp01(p_file_ua_req),
+            p_mem_ua=p_mem_ua
+        )
+
     emit_intent_rows([r for r in layout_rows if r["intent"]=="read"],  is_read=True)
     emit_intent_rows([r for r in layout_rows if r["intent"]=="write"], is_read=False)
 
     # ---------- META phase ----------
-    io_ops = sum(r["ops"] for r in layout_rows)
+    io_ops = sum(r["ops"] for r in layout_rows) + tiny_ops_total
     denom = clamp01(feats.get("pct_io_access", 0.18)) or 1.0
     m_open = int(round(clamp01(feats.get("pct_meta_open_access",0.0)) * io_ops / denom))
     m_stat = int(round(clamp01(feats.get("pct_meta_stat_access",0.0)) * io_ops / denom))

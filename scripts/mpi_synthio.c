@@ -56,6 +56,7 @@
 
 #define MAX_LINE  4096
 #define CHUNK_RANDOM (128*1024*1024)
+#define TSBUF_LEN 64
 
 typedef enum { API_POSIX=0, API_MPIIO=1 } io_api_t;
 typedef enum { META_POSIX=0 } meta_api_t;
@@ -182,15 +183,6 @@ static inline int has_flag(const char* flags, const char* needle) {
 static inline int is_shared_row_flags(const char* flags) { return has_flag(flags, "|shared|"); }
 static inline int is_unique_row_flags(const char* flags) { return has_flag(flags, "|unique|"); }
 
-// ISO8601 wallclock for logs
-static inline void wallclock_iso8601(char* buf, size_t n) {
-    struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
-    struct tm tm; gmtime_r(&ts.tv_sec, &tm);
-    snprintf(buf, n, "%04d-%02d-%02dT%02d:%02d:%02d.%03ldZ",
-             tm.tm_year+1900, tm.tm_mon+1, tm.tm_mday,
-             tm.tm_hour, tm.tm_min, tm.tm_sec, ts.tv_nsec/1000000);
-}
-
 /* Wallclock helpers: get now, format ISO8601 UTC */
 static inline void wallclock_now(struct timespec* ts) {
 #if defined(CLOCK_REALTIME)
@@ -203,20 +195,31 @@ static inline void wallclock_now(struct timespec* ts) {
 #endif
 }
 
-static inline void wallclock_iso8601_from(const struct timespec* ts, char* out, size_t n) {
-    time_t s = (time_t)ts->tv_sec;
-    int ms = (int)llround((double)ts->tv_nsec / 1.0e6);
-    if (ms >= 1000) { s += 1; ms = 0; }
+static void wallclock_iso8601_from(struct timespec ts, char *out, size_t n)
+{
+    if (n < 32) {                    // safety: need ~28 bytes
+        if (n) out[0] = '\0';
+        return;
+    }
+
+    // round ns to nearest ms, clamp, and carry if needed
+    long ns = ts.tv_nsec;
+    if (ns < 0) ns = 0;
+    unsigned ms = (unsigned)((ns + 500000L) / 1000000L);  // 0..1000
+
+    time_t tt = ts.tv_sec;
+    if (ms >= 1000U) {
+        ms -= 1000U;
+        tt += 1;                     // carry to next second
+    }
 
     struct tm tm_utc;
-#if defined(_WIN32)
-    gmtime_s(&tm_utc, &s);
-#else
-    gmtime_r(&s, &tm_utc);
-#endif
-    snprintf(out, n, "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ",
-        tm_utc.tm_year + 1900, tm_utc.tm_mon + 1, tm_utc.tm_mday,
-        tm_utc.tm_hour, tm_utc.tm_min, tm_utc.tm_sec, ms);
+    gmtime_r(&tt, &tm_utc);
+
+    // YYYY-MM-DDTHH:MM:SS.mmmZ
+    (void)snprintf(out, n, "%04d-%02d-%02dT%02d:%02d:%02d.%03uZ",
+                   tm_utc.tm_year + 1900, tm_utc.tm_mon + 1, tm_utc.tm_mday,
+                   tm_utc.tm_hour, tm_utc.tm_min, tm_utc.tm_sec, ms);
 }
 
 // even split (for shared rows)
@@ -236,6 +239,10 @@ static int count_unique_run(const phase_t* phases, int nphases, int idx) {
     int k = 0;
     while (idx + k < nphases && is_unique_row_flags(phases[idx + k].flags)) ++k;
     return k;
+}
+
+static int owner_for_path(const char* path, int nprocs){
+    return (int)(fnv1a_64(path) % (unsigned long)nprocs);
 }
 
 /* --- helpers for alignment (C) --- */
@@ -274,9 +281,11 @@ static void exec_phase_data_local(const phase_t* p, int phase_idx,
     double p_con, p_seq;
     if (is_write) { p_con = p->p_consec_w; p_seq = p->p_seq_w; }
     else          { p_con = p->p_consec_r; p_seq = p->p_seq_r; }
-    if (p_con < 0.0) p_con = 0.0; if (p_con > 1.0) p_con = 1.0;
-    if (p_seq < 0.0) p_seq = 0.0; if (p_seq > 1.0) p_seq = 1.0;
-    if (p_seq < p_con) p_seq = p_con;
+    if (p_con < 0.0) { p_con = 0.0; }
+    if (p_con > 1.0) { p_con = 1.0; }
+    if (p_seq < 0.0) { p_seq = 0.0; }
+    if (p_seq > 1.0) { p_seq = 1.0; }
+    if (p_seq < p_con) { p_seq = p_con; }
 
     uint64_t N_con = (uint64_t) llround((double)Nops_local * p_con);
     uint64_t N_seq = (uint64_t) llround((double)Nops_local * (p_seq - p_con));
@@ -432,9 +441,9 @@ static void exec_phase_data_local(const phase_t* p, int phase_idx,
     // ====== END: copy of loops ======
 
     wallclock_now(&ts_end);
-    char ts0[40], ts1[40];
-    wallclock_iso8601_from(&ts_start, ts0, sizeof ts0);
-    wallclock_iso8601_from(&ts_end,   ts1, sizeof ts1);
+    char ts0[TSBUF_LEN], ts1[TSBUF_LEN];
+    wallclock_iso8601_from(ts_start, ts0, sizeof ts0);
+    wallclock_iso8601_from(ts_end,   ts1, sizeof ts1);
 
     // Timestamped, richer phase log (stderr)
     fprintf(stderr,
@@ -519,9 +528,9 @@ static void do_posix_meta(const phase_t* p, int phase_idx)
 
     // === REPLACE: do_posix_meta() final fprintf with timestamped one ===
     wallclock_now(&ts_end);
-    char ts0[40], ts1[40];
-    wallclock_iso8601_from(&ts_start, ts0, sizeof ts0);
-    wallclock_iso8601_from(&ts_end,   ts1, sizeof ts1);
+    char ts0[TSBUF_LEN], ts1[TSBUF_LEN];
+    wallclock_iso8601_from(ts_start, ts0, sizeof ts0);
+    wallclock_iso8601_from(ts_end,   ts1, sizeof ts1);
     
     fprintf(stderr,
         "rank %d: phase %d done [META]: path=%s open=%" PRIu64 " stat=%" PRIu64
@@ -625,18 +634,26 @@ static void run_plan(FILE* fp)
 
         while (cursor < run_len) {
             int wave_len = (run_len - cursor < nprocs) ? (run_len - cursor) : nprocs;
-            int my_slot  = rank;
-            int my_i     = (my_slot < wave_len) ? ((int)idx + cursor + my_slot) : -1;
 
             MPI_Barrier(MPI_COMM_WORLD);
             double t_start = MPI_Wtime();
 
             unsigned long long my_ops_ull = 0ULL;
+
+            // every rank looks at exactly one candidate in this wave (if any),
+            // but only the *owner of that candidate's path* executes it.
+            int my_slot = rank;
+            int my_i    = (my_slot < wave_len) ? ((int)idx + cursor + my_slot) : -1;
+
             if (my_i >= 0) {
                 phase_t* U = &phases[my_i];
-                uint64_t Nops_u = (U->xfer ? (U->total_bytes / U->xfer) : 0);
-                my_ops_ull = (unsigned long long)Nops_u;
-                exec_phase_data_local(U, my_i + 1, Nops_u, 0 /* full row */);
+                int owner = owner_for_path(U->path, nprocs);
+                if (rank == owner) {
+                    uint64_t Nops_u = (U->xfer ? (U->total_bytes / U->xfer) : 0);
+                    my_ops_ull = (unsigned long long)Nops_u;
+                    exec_phase_data_local(U, my_i + 1, Nops_u, 0);
+                }
+                // Non-owners do *nothing* (do not open).
             }
 
             double t_end = MPI_Wtime();
