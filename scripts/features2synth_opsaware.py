@@ -208,68 +208,272 @@ def weighted_extreme_avg(shareS, shareM, shareL, choose_max=True):
     pickL = max(L_SIZE_CHOICES) if choose_max else min(L_SIZE_CHOICES)
     return shareS*pickS + shareM*pickM + shareL*pickL
 
-def ensure_rw_has_both(layout_rows, nprocs):
+def ensure_rw_has_both(layout_rows, feats, nprocs):
     """
     For any file with role 'rw', ensure both intents exist.
-    If one intent is missing, split ops from the other intent
-    (prefer the largest-ops row) to create a new row with >= min_seed ops.
-    """
-    from collections import defaultdict
+    If one intent is missing, split ops from the other intent according to the
+    global op proportions (pct_reads / pct_writes) and seed at least nprocs ops
+    on the missing side when possible (bounded by donor ops).
 
+    Mutates a *copy* of changed rows and returns the updated list.
+    """
+    # Global op split targets
+    p_reads_ops  = clamp01(feats.get("pct_reads", 0.0))
+    p_writes_ops = 1.0 - p_reads_ops
+
+    # Index rows by file and intent (only for role=='rw')
     per_file = defaultdict(lambda: {"read": [], "write": []})
     for idx, r in enumerate(layout_rows):
-        if r["role"] == "rw":
-            per_file[r["file"]][r["intent"]].append((idx, r))
+        if str(r.get("role","")).lower() == "rw":
+            intent = str(r.get("intent","")).lower()
+            if intent in ("read","write"):
+                per_file[r["file"]][intent].append((idx, r))
 
-    # Walk each RW file and fix missing side
-    inserts = []
-    decrements = []
+    # Collect edits so we can apply them safely
+    decrements = []  # (idx, new_row) with reduced ops on donor
+    inserts    = []  # (insert_pos, new_row) for the missing side
+
     for f, sides in per_file.items():
-        has_r = len(sides["read"]) > 0
-        has_w = len(sides["write"]) > 0
-        if has_r and has_w:
-            continue
+        have_r = len(sides["read"])  > 0
+        have_w = len(sides["write"]) > 0
+        if have_r and have_w:
+            continue  # already has both intents
 
-        missing = "read" if not has_r else "write"
+        missing    = "read" if not have_r else "write"
         donor_side = "write" if missing == "read" else "read"
-        donors = sides[donor_side]
-        if not donors:
-            # nothing to do; this file wasn't emitted as RW after all
+        donor_rows = sides[donor_side]
+        if not donor_rows:
+            continue  # nothing to split
+
+        # Total ops currently on the donor side for this file
+        donor_total_ops = sum(int(d[1].get("ops", 0)) for d in donor_rows)
+        if donor_total_ops <= 0:
             continue
 
-        # pick the biggest donor row for this file
-        donors_sorted = sorted(donors, key=lambda t: t[1]["ops"], reverse=True)
-        di, drow = donors_sorted[0]
-        if drow["ops"] <= 1:
-            # can't steal anything meaningful
+        # Desired missing ops based on global proportions, with floors/caps
+        p_missing = p_reads_ops if missing == "read" else p_writes_ops
+        want = int(round(p_missing * donor_total_ops))
+        # At least nprocs for wave packing, but never steal all:
+        want = max(1, min(donor_total_ops - 1, max(nprocs, want)))
+
+        if want <= 0:
+            # Can't seed anything meaningful while leaving ≥1 on donor side
             continue
 
-        seed_ops = max(1, min(nprocs, drow["ops"] // 2))
-        # clone donor row, flip intent, set ops to seed_ops
-        newrow = dict(drow)
-        newrow["intent"] = missing
-        newrow["ops"] = seed_ops
-        if newrow.get("bin") in ("S","M","L"):
-            newrow["total_bytes"] = newrow["xfer"] * newrow["ops"]
+        # Proportional plan: how many ops to take from each donor row
+        donors_sorted = sorted(donor_rows, key=lambda t: int(t[1].get("ops",0)), reverse=True)
+        # Initial proportional allocation
+        plan = []
+        for di, drow in donors_sorted:
+            ops = int(drow.get("ops", 0))
+            take = int(round((ops / float(donor_total_ops)) * want)) if donor_total_ops > 0 else 0
+            plan.append([di, drow, ops, take])
 
-        # schedule: insert right next to donor so intra-file ordering stays tight
-        inserts.append((di + 1, newrow))
-        # decrement donor
-        drow = dict(drow)
-        drow["ops"] -= seed_ops
-        if drow.get("bin") in ("S","M","L"):
-            drow["total_bytes"] = drow["xfer"] * drow["ops"]
-        decrements.append((di, drow))
+        # Fix rounding to match exact 'want', respecting per-row capacity
+        diff = want - sum(p[3] for p in plan)
+        j = 0
+        while diff != 0 and j < len(plan):
+            di, drow, ops, take = plan[j]
+            if diff > 0:
+                # can we take one more here?
+                if take < ops: 
+                    plan[j][3] += 1
+                    diff -= 1
+                else:
+                    j += 1
+            else:  # diff < 0
+                if take > 0:
+                    plan[j][3] -= 1
+                    diff += 1
+                else:
+                    j += 1
 
-    # apply edits (indices from original, so do decrements first)
-    for di, drow in decrements:
-        layout_rows[di] = drow
+        # Apply the plan: decrement donors, insert matching rows for the missing side
+        for di, drow, ops, take in plan:
+            if take <= 0:
+                continue
+            # Decrement donor
+            new_donor = dict(drow)
+            new_donor["ops"] = ops - take
+            if new_donor.get("bin") in ("S","M","L"):
+                new_donor["total_bytes"] = int(new_donor["xfer"]) * int(new_donor["ops"])
+            decrements.append((di, new_donor))
+
+            # Create sibling row for missing side (mirror xfer/bin/flags/etc.)
+            new_row = dict(drow)
+            new_row["intent"] = missing
+            new_row["ops"]    = take
+            if new_row.get("bin") in ("S","M","L"):
+                new_row["total_bytes"] = int(new_row["xfer"]) * int(new_row["ops"])
+
+            # Insert right after donor row to keep file-local ordering tight
+            inserts.append((di + 1, new_row))
+
+    # Apply edits: write decrements first (stable indices), then inserts in order
+    for di, new_donor in decrements:
+        layout_rows[di] = new_donor
+
     offset = 0
-    for ins_idx, newrow in sorted(inserts, key=lambda t: t[0]):
-        layout_rows.insert(ins_idx + offset, newrow)
+    for pos, new_row in sorted(inserts, key=lambda t: t[0]):
+        layout_rows.insert(pos + offset, new_row)
         offset += 1
 
     return layout_rows
+
+def _ops_of(it):
+    return int(it.get("con",0)) + int(it.get("seq",0)) + int(it.get("rnd",0))
+
+def _gather_rw_by_path(items):
+    """
+    Returns: dict[path] -> list of indices in 'items' that belong to that path and have role RW
+    """
+    by_path = defaultdict(list)
+    for i, it in enumerate(items):
+        if str(it.get("role","")).upper() == "RW":
+            by_path[it["path"]].append(i)
+    return by_path
+
+def _proportional_split_triplet(src_con, src_seq, src_rnd, move_ops):
+    """
+    Split 'move_ops' out of (src_con, src_seq, src_rnd) proportionally.
+    Returns (move_con, move_seq, move_rnd).
+    """
+    total = src_con + src_seq + src_rnd
+    if total <= 0 or move_ops <= 0:
+        return (0,0,0)
+
+    # ideal fractional shares
+    f_con = (src_con / total) * move_ops
+    f_seq = (src_seq / total) * move_ops
+    f_rnd = (src_rnd / total) * move_ops
+
+    # integer baseline
+    m_con = int(f_con)
+    m_seq = int(f_seq)
+    m_rnd = int(f_rnd)
+
+    # distribute remainder by largest fractional part
+    remain = move_ops - (m_con + m_seq + m_rnd)
+    fracs = [
+        ("con", f_con - m_con),
+        ("seq", f_seq - m_seq),
+        ("rnd", f_rnd - m_rnd),
+    ]
+    fracs.sort(key=lambda kv: kv[1], reverse=True)
+    for name, _ in fracs:
+        if remain <= 0: break
+        if name == "con" and m_con < src_con: m_con += 1; remain -= 1
+        elif name == "seq" and m_seq < src_seq: m_seq += 1; remain -= 1
+        elif name == "rnd" and m_rnd < src_rnd: m_rnd += 1; remain -= 1
+
+    # clamp just in case
+    m_con = min(m_con, src_con)
+    m_seq = min(m_seq, src_seq)
+    m_rnd = min(m_rnd, src_rnd)
+    return (m_con, m_seq, m_rnd)
+
+def _move_ops_between_sides(src_items, dst_items, path):
+    """
+    For RW 'path' present only on src_items:
+      - If total ops >= 2: move floor(total/2) ops to dst_items (keep xfer+triplet proportions).
+      - If total ops == 1: COPY a 1-op to dst_items (preserve src, to ensure both sides >0).
+    Mutates src_items and dst_items in-place.
+    """
+    # collect all entries for this path
+    idxs = [i for i, it in enumerate(src_items) if it["path"] == path and str(it.get("role","")).upper() == "RW"]
+    if not idxs:
+        return
+
+    # per-xfer buckets to preserve characteristics
+    buckets = []
+    total_ops = 0
+    for i in idxs:
+        it = src_items[i]
+        con, seq, rnd = int(it.get("con",0)), int(it.get("seq",0)), int(it.get("rnd",0))
+        ops = con + seq + rnd
+        if ops <= 0: 
+            continue
+        buckets.append((i, int(it["xfer"]), con, seq, rnd, ops))
+        total_ops += ops
+
+    if total_ops == 0:
+        return
+
+    if total_ops == 1:
+        # duplicate a minimal 1-op on dst to ensure both sides happen
+        # Prefer to mirror the same xfer and class as present
+        i, xfer, con, seq, rnd, _ = buckets[0]
+        new_con = 1 if con > 0 else 0
+        new_seq = 1 if new_con == 0 and seq > 0 else 0
+        new_rnd = 1 if (new_con == 0 and new_seq == 0 and rnd > 0) else 0
+        dst_items.append({"path": path, "xfer": xfer, "con": new_con, "seq": new_seq, "rnd": new_rnd, "role": "RW"})
+        return
+
+    # move floor(total/2) ops from src → dst
+    target_move = total_ops // 2
+    moved = 0
+
+    # Two-pass: compute ideal per-bucket moves, then fix rounding to match target_move
+    plan = []
+    for (i, xfer, con, seq, rnd, ops) in buckets:
+        mops = int(round((ops / total_ops) * target_move))
+        plan.append([i, xfer, con, seq, rnd, ops, mops])  # mops requested from this entry
+    # adjust to exact sum
+    diff = target_move - sum(p[6] for p in plan)
+    if diff != 0:
+        # tweak entries with largest available slack (those with more ops)
+        plan.sort(key=lambda p: p[5], reverse=True)
+        j = 0
+        while diff != 0 and j < len(plan):
+            cap_add = plan[j][5]  # total ops available in that entry
+            # current planned move in this entry:
+            cur = plan[j][6]
+            if diff > 0 and cur < cap_add:
+                plan[j][6] += 1; diff -= 1
+            elif diff < 0 and cur > 0:
+                plan[j][6] -= 1; diff += 1
+            else:
+                j += 1
+
+    # now execute the moves per entry, preserving con/seq/rnd proportions
+    for (i, xfer, con, seq, rnd, ops, mops) in plan:
+        if mops <= 0: 
+            continue
+        m_con, m_seq, m_rnd = _proportional_split_triplet(con, seq, rnd, mops)
+        # subtract from source
+        si = src_items[i]
+        si["con"] = int(si.get("con",0)) - m_con
+        si["seq"] = int(si.get("seq",0)) - m_seq
+        si["rnd"] = int(si.get("rnd",0)) - m_rnd
+        # append to dest (mirror characteristics)
+        if m_con + m_seq + m_rnd > 0:
+            dst_items.append({"path": path, "xfer": xfer, "con": m_con, "seq": m_seq, "rnd": m_rnd, "role": "RW"})
+
+    # Optional cleanup: drop emptied items (all zeros)
+    # (safe to keep too; coalescer can ignore zero-op entries)
+    # src_items[:] = [it for it in src_items if _ops_of(it) > 0]
+
+def ensure_rw_presence_tiny_mirror(tiny_read_items, tiny_write_items):
+    """
+    For each RW path:
+      - If present only on READ: split ops from READ → WRITE proportionally.
+      - If present only on WRITE: split ops from WRITE → READ proportionally.
+    Does NOT enforce any global min-ops. No consec-only assumptions.
+    """
+    r_by = _gather_rw_by_path(tiny_read_items)
+    w_by = _gather_rw_by_path(tiny_write_items)
+    all_rw_paths = set(r_by.keys()) | set(w_by.keys())
+
+    for p in all_rw_paths:
+        r_has = p in r_by and any(_ops_of(tiny_read_items[i]) > 0 for i in r_by[p])
+        w_has = p in w_by and any(_ops_of(tiny_write_items[i]) > 0 for i in w_by[p])
+
+        if r_has and not w_has:
+            _move_ops_between_sides(tiny_read_items, tiny_write_items, p)
+        elif w_has and not r_has:
+            _move_ops_between_sides(tiny_write_items, tiny_read_items, p)
+
+    return tiny_read_items, tiny_write_items
 
 def make_file_weights_for_intent(feats, ro_paths, rw_paths, wo_paths, intent):
     """
@@ -489,30 +693,31 @@ def plan_tiny_intent(intent, feats, Nio, target_total_bytes,
         # ops-priority (or minimize both) → choose smallest sizes in signaled bins
         picks = pick_bin_sizes_for_intent(intent, feats, S_SUBS, M_SUBS, L_CHOICES, minimize_bytes=True)
 
-    # 2) decide N_ops_tiny
+    # 2) decide N_ops_tiny  —— HARD-BOUNDED by N_cap (nprocs ≤ N_ops_tiny ≤ N_cap ≤ Nio)
+    # Cap computed once from Nio and nprocs (EPS only shapes the cap, not the count)
+    base_cap = int(math.floor(EPS_OPS_FRAC_CAP * float(Nio)))        # e.g., 5% of Nio
+    N_cap    = max(1, min(Nio, max(nprocs, base_cap)))               # nprocs ≤ N_cap ≤ Nio
+
+    def _clamp_ops(x):
+        return max(nprocs, min(N_cap, int(x)))
+
     if want_ops and not want_bytes:
-        # realize requested op fraction, bytes ≈ 0 thanks to tiny xfers
-        N_ops_tiny = max(EPS_OPS_ABS_MIN, int(round(p_ops_target * float(Nio))))
+        # Hit op fraction; keep bytes tiny via small xfers
+        # (use p_ops_target*Nio as the *unclamped* target, then clamp to [nprocs, N_cap])
+        N_ops_tiny = _clamp_ops(round(p_ops_target * float(Nio)))
+
     elif not want_ops and want_bytes:
-        # realize requested bytes with minimal ops: pick a representative "large" xfer
-        # Use the largest xfer among chosen picks as our dominant grain.
-        xfer_max = max(x for (_, x, _) in picks)
+        # Hit byte fraction with as few ops as possible: use the largest chosen xfer
+        # (if picks spans multiple bins, we still use the max xfer to minimize ops)
+        xfer_max = max(x for (_, x, _) in picks) if picks else 1
         desired_bytes = int(round(p_bytes_target * float(target_total_bytes)))
-        N_ops_tiny = max(1, int(math.ceil(desired_bytes / float(xfer_max))))
-        # soft-cap ops (prefer increasing xfer via picks rather than growing ops)
-        base_cap = int(math.floor(EPS_OPS_FRAC_CAP * float(Nio)))
-        # ensure at least nprocs, but don't exceed Nio
-        N_cap = max(1, min(Nio, max(nprocs, base_cap)))
-        if N_ops_tiny > N_cap:
-            N_ops_tiny = N_cap
+        need_ops = int(math.ceil(max(0, desired_bytes) / float(max(1, xfer_max))))
+        N_ops_tiny = _clamp_ops(max(1, need_ops))
+
     else:
-        # minimize both (0/0 case) or both false → small but nonzero to keep structure alive
-        base_cap = int(math.floor(EPS_OPS_FRAC_CAP * float(Nio)))
-        # ensure at least nprocs, but don't exceed Nio
-        N_cap = max(1, min(Nio, max(nprocs, base_cap)))
-        # touch at least a few files
-        n_files_tiny = max(1, min(len(pool), int(math.ceil(N_cap / max(EPS_OPS_PER_FILE,1)))))
-        N_ops_tiny = min(max(EPS_OPS_ABS_MIN, EPS_OPS_PER_FILE * n_files_tiny), N_cap)
+        # Minimize both (0/0 case) → keep structure alive, one op per rank at least
+        # (don’t use EPS_* per-file floors here; those can be handled in distribution)
+        N_ops_tiny = _clamp_ops(N_cap)
 
     # 3) split structure at whole-intent level
     N_con, N_seq, N_rand = structure_counts(N_ops_tiny, p_con, p_seq)
@@ -558,9 +763,63 @@ def plan_tiny_intent(intent, feats, Nio, target_total_bytes,
     if not weighted_cycle:
         weighted_cycle = pool[:]  # uniform fallback
 
-    # 5) spread across files round-robin, preferring main pool first
-    items = []
-    fi = 0
+    # 5) distribute c/s/r proportionally per file, then across bins
+    # -------------------------------------------------------------
+    # Build file list + normalized weights (fallback uniform)
+    files = pool[:] if pool else ["/dev/null"]
+    if file_weights:
+        w_raw = [(p, max(0.0, float(file_weights.get(p, 0.0)))) for p in files]
+        s_w   = sum(w for _, w in w_raw)
+        w_norm = [(p, (w / s_w) if s_w > 0 else 1.0/len(files)) for p, w in w_raw]
+    else:
+        w_norm = [(p, 1.0/len(files)) for p in files]
+
+    # Per-file desired counts for each class (with rounding fix to match totals)
+    def _proportional_round(total, weights):
+        if total <= 0 or not weights:
+            return [0]*len(weights)
+        raw = [int(round(total * w)) for _, w in weights]
+        diff = total - sum(raw)
+        # fix rounding by adjusting highest weights first (and cycling if needed)
+        order = sorted(range(len(weights)), key=lambda i: weights[i][1], reverse=True)
+        j = 0
+        while diff != 0:
+            i = order[j % len(order)]
+            if diff > 0:
+                raw[i] += 1; diff -= 1
+            else:
+                if raw[i] > 0:
+                    raw[i] -= 1; diff += 1
+            j += 1
+        return raw
+
+    f_con = _proportional_round(N_con,  w_norm)
+    f_seq = _proportional_round(N_seq,  w_norm)
+    f_rnd = _proportional_round(N_rand, w_norm)
+
+    # Bin weights from picks (already normalized in 'picks' as w; normalize again just in case)
+    bin_ws = [w for (_, _, w) in picks] if picks else []
+    if bin_ws:
+        s_bw = sum(bin_ws)
+        bin_ws = [(bw / s_bw) if s_bw > 0 else (1.0/len(bin_ws)) for bw in bin_ws]
+
+    def _split_across_bins(count, bws):
+        if count <= 0 or not bws:
+            return [0]*len(bws)
+        raw = [int(round(count * bw)) for bw in bws]
+        diff = count - sum(raw)
+        order = sorted(range(len(bws)), key=lambda i: bws[i], reverse=True)
+        k = 0
+        while diff != 0:
+            i = order[k % len(order)]
+            if diff > 0:
+                raw[i] += 1; diff -= 1
+            else:
+                if raw[i] > 0:
+                    raw[i] -= 1; diff += 1
+            k += 1
+        return raw
+
     # Precompute a fast role lookup once (outside the loops):
     role_map = {}
     if intent == "read":
@@ -569,18 +828,43 @@ def plan_tiny_intent(intent, feats, Nio, target_total_bytes,
     else:
         for p in file_roles_by_intent["write"].get("RW", []): role_map[p] = "RW"
         for p in file_roles_by_intent["write"].get("WO", []): role_map[p] = "WO"
-    for (xfer, c, s, r) in bin_plan:
-        total = c+s+r
-        for _ in range(total):
-            path = weighted_cycle[fi % len(weighted_cycle)]
-            role = role_map.get(path, ("RW" if intent=="read" else "WO")) 
-            if c > 0:
-                items.append({"path": path, "xfer": xfer, "con":1, "seq":0, "rnd":0, "role":role}); c -= 1
-            elif s > 0:
-                items.append({"path": path, "xfer": xfer, "con":0, "seq":1, "rnd":0, "role":role}); s -= 1
-            else:
-                items.append({"path": path, "xfer": xfer, "con":0, "seq":0, "rnd":1, "role":role}); r -= 1
-            fi += 1
+
+    # Emit items proportionally per file AND per bin
+    items = []
+    for idx, (path, _) in enumerate(w_norm):
+        role = role_map.get(path, ("RW" if intent == "read" else "WO"))
+        per_bin_con = _split_across_bins(f_con[idx], bin_ws) if bin_ws else [f_con[idx]]
+        per_bin_seq = _split_across_bins(f_seq[idx], bin_ws) if bin_ws else [f_seq[idx]]
+        per_bin_rnd = _split_across_bins(f_rnd[idx], bin_ws) if bin_ws else [f_rnd[idx]]
+
+        if picks:
+            # FIX: correct tuple order → (bin_label, xfer, weight)
+            for b, (bin_lbl, xfer, _) in enumerate(picks):
+                c = per_bin_con[b] if b < len(per_bin_con) else 0
+                s = per_bin_seq[b] if b < len(per_bin_seq) else 0
+                r = per_bin_rnd[b] if b < len(per_bin_rnd) else 0
+                if c + s + r > 0:
+                    # xfer is already an int; no need to cast
+                    items.append({
+                        "path": path,
+                        "xfer": xfer,
+                        "con": int(c),
+                        "seq": int(s),
+                        "rnd": int(r),
+                        "role": role
+                    })
+        else:
+            # no bin picks: still emit a single record if any ops for this file
+            c, s, r = f_con[idx], f_seq[idx], f_rnd[idx]
+            if c + s + r > 0:
+                items.append({
+                    "path": path,
+                    "xfer": 1,
+                    "con": int(c),
+                    "seq": int(s),
+                    "rnd": int(r),
+                    "role": role
+                })
 
     # ---- soft-cap tiny bytes when we are minimizing bytes on this intent ----
     tiny_bytes = sum(it["xfer"] * (it["con"] + it["seq"] + it["rnd"]) for it in items)
@@ -1044,12 +1328,6 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
     avg_write_xfer = wS*avgS + wM*avgM + wL*avgL if (wS+wM+wL)>0 else avgS
     avg_xfer = p_reads_ops*avg_read_xfer + p_writes_ops*avg_write_xfer
 
-    # Desired presence flags
-    want_ops_r   = (p_reads_ops  > 0.0)
-    want_bytes_r = (p_bytes_r    > 0.0)
-    want_ops_w   = (p_writes_ops > 0.0)
-    want_bytes_w = (p_bytes_w    > 0.0)
-
     # Seed based on cap (will adjust)
     Nio = max(1, int(round(io_bytes_target / max(1, avg_xfer))))
     Nr  = int(round(Nio * p_reads_ops))
@@ -1064,58 +1342,6 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
     # We may need to choose min/max per bin later when materializing rows:
     read_pick  = {"S": None, "M": None, "L": None}   # None → ladder as-is
     write_pick = {"S": None, "M": None, "L": None}
-
-    # Order of handling when both sides want "ops≈0 & bytes>0":
-    # prioritize the side with larger byte share so the other can treat ops≈0 relative to a large denominator.
-    sides_order = ["read", "write"]
-    extra_tiny_rows_read = []
-    extra_tiny_rows_write = []
-    if (not want_ops_r) and want_bytes_r and (not want_ops_w) and want_bytes_w:
-        if p_bytes_w > p_bytes_r:
-            sides_order = ["write", "read"]
-
-    for side in sides_order:
-        if side == "read":
-            # Quadrants for READ
-            if want_ops_r and want_bytes_r:
-                # normal path (your existing logic)
-                pass
-            else:
-                tiny_read_rows, Nr = plan_tiny_intent(
-                    "read", feats, Nio, io_bytes_target,
-                    S_SUBS, M_SUBS, L_SIZE_CHOICES,
-                    roles_dict,
-                    want_ops=want_ops_r,
-                    want_bytes=want_bytes_r,
-                    p_ops_target=p_reads_ops,         # feats.get("pct_reads")
-                    p_bytes_target=p_bytes_r,          # feats.get("pct_byte_reads")
-                    file_weights=read_file_w,
-                    nprocs=nprocs
-                )
-                # Stash for coalescing later:
-                extra_tiny_rows_read = tiny_read_rows
-
-        else:
-            # Quadrants for WRITE
-            if want_ops_w and want_bytes_w:
-                # normal path (your existing logic)
-                pass
-            else:
-                tiny_write_rows, Nw = plan_tiny_intent(
-                    "write", feats, Nio, io_bytes_target,
-                    S_SUBS, M_SUBS, L_SIZE_CHOICES,
-                    roles_dict,
-                    want_ops=want_ops_w,
-                    want_bytes=want_bytes_w,
-                    p_ops_target=p_writes_ops,        # feats.get("pct_writes")
-                    p_bytes_target=p_bytes_w,          # feats.get("pct_byte_writes")
-                    file_weights=write_file_w,
-                    nprocs=nprocs
-                )
-                extra_tiny_rows_write = tiny_write_rows
-
-        # Keep Nio in sync after each side's adjustment
-        Nio = Nr + Nw
 
     # Final bin splits from authoritative Nr/Nw
     R_S,R_M,R_L = split_ops_by_bins(Nr, rS,rM,rL)
@@ -1190,7 +1416,7 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
     emit_write_bin(W_L, "L", write_pick["L"])
 
     layout_rows = read_rows + write_rows
-    layout_rows = ensure_rw_has_both(layout_rows, nprocs=nprocs)
+    layout_rows = ensure_rw_has_both(layout_rows, feats, nprocs=nprocs)
 
     # Tag shared/unique by FILE counts
     for r in layout_rows:
@@ -1198,8 +1424,63 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
         else:                         r["flags"] = (r.get("flags","") + "|unique|")
 
     # ---------- Tiny bytes accounting (exclude tiny rows from rebalancer) ----------
-    from collections import defaultdict
+    # Order of handling when both sides want "ops≈0 & bytes>0":
+    # prioritize the side with larger byte share so the other can treat ops≈0 relative to a large denominator.
+    sides_order = ["read", "write"]
+    extra_tiny_rows_read = []
+    extra_tiny_rows_write = []
 
+    # Desired presence flags
+    want_ops_r   = (p_reads_ops  > 0.0)
+    want_bytes_r = (p_bytes_r    > 0.0)
+    want_ops_w   = (p_writes_ops > 0.0)
+    want_bytes_w = (p_bytes_w    > 0.0)
+    
+    if (not want_ops_r) and want_bytes_r and (not want_ops_w) and want_bytes_w:
+        if p_bytes_w > p_bytes_r:
+            sides_order = ["write", "read"]
+
+    for side in sides_order:
+        if side == "read":
+            # Quadrants for READ
+            if want_ops_r and want_bytes_r:
+                # normal path (your existing logic)
+                pass
+            else:
+                tiny_read_rows, _ = plan_tiny_intent(
+                    "read", feats, Nio, io_bytes_target,
+                    S_SUBS, M_SUBS, L_SIZE_CHOICES,
+                    roles_dict,
+                    want_ops=want_ops_r,
+                    want_bytes=want_bytes_r,
+                    p_ops_target=p_reads_ops,         # feats.get("pct_reads")
+                    p_bytes_target=p_bytes_r,          # feats.get("pct_byte_reads")
+                    file_weights=read_file_w,
+                    nprocs=nprocs
+                )
+                # Stash for coalescing later:
+                extra_tiny_rows_read = tiny_read_rows
+
+        else:
+            # Quadrants for WRITE
+            if want_ops_w and want_bytes_w:
+                # normal path (your existing logic)
+                pass
+            else:
+                tiny_write_rows, _ = plan_tiny_intent(
+                    "write", feats, Nio, io_bytes_target,
+                    S_SUBS, M_SUBS, L_SIZE_CHOICES,
+                    roles_dict,
+                    want_ops=want_ops_w,
+                    want_bytes=want_bytes_w,
+                    p_ops_target=p_writes_ops,        # feats.get("pct_writes")
+                    p_bytes_target=p_bytes_w,          # feats.get("pct_byte_writes")
+                    file_weights=write_file_w,
+                    nprocs=nprocs
+                )
+                extra_tiny_rows_write = tiny_write_rows
+    
+    from collections import defaultdict
     def _tiny_stats(tiny_items, intent_label, path_flags):
         """Return tiny bytes split by intent/role/flag for subtraction from targets."""
         by_intent = defaultdict(int)
@@ -1445,6 +1726,9 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
     # (initialize these to [] earlier in the script if they might be absent)
     extra_tiny_rows_read  = locals().get("extra_tiny_rows_read",  [])
     extra_tiny_rows_write = locals().get("extra_tiny_rows_write", [])
+    extra_tiny_rows_read, extra_tiny_rows_write = ensure_rw_presence_tiny_mirror(
+        extra_tiny_rows_read, extra_tiny_rows_write
+    )
 
     # Emit tiny read/write items with exact consec/seq/rand ratios
     tiny_ops_total = 0
