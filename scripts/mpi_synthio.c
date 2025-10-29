@@ -234,10 +234,20 @@ static inline uint64_t split_even(uint64_t total, int nprocs, int rank, uint64_t
     return mine;
 }
 
-// count a consecutive run of UNIQUE rows starting at idx
-static int count_unique_run(const phase_t* phases, int nphases, int idx) {
+/* type equality helper */
+static inline int same_type(const char* a, const char* b) {
+    return (a && b) ? (strcmp(a, b) == 0) : 0;
+}
+
+/* count a consecutive run of UNIQUE rows of a given type starting at idx */
+static int count_unique_run_of_type(const phase_t* phases, int nphases, int idx, const char* type) {
     int k = 0;
-    while (idx + k < nphases && is_unique_row_flags(phases[idx + k].flags)) ++k;
+    while (idx + k < nphases) {
+        const phase_t* p = &phases[idx + k];
+        if (!same_type(p->type, type)) break;              /* stop if type changes */
+        if (!is_unique_row_flags(p->flags)) break;         /* stop if not |unique| */
+        ++k;
+    }
     return k;
 }
 
@@ -629,7 +639,7 @@ static void run_plan(FILE* fp)
         }
 
         // ===== UNIQUE RUN in waves =====
-        int run_len = count_unique_run(phases, (int)nph, (int)idx);
+        int run_len = count_unique_run_of_type(phases, (int)nph, (int)idx, phases[idx].type);
 
         /* done[i]==1 means phases[idx+i] has executed */
         char *done = (char*)malloc((size_t)run_len);

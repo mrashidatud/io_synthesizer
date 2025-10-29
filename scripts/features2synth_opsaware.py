@@ -108,8 +108,7 @@ CHUNK_RANDOM = 128*(1<<20)
 # --- Tiny-footprint policy knobs ---
 EPS_OPS_ABS_MIN   = 64          # minimum ops to realize structure (>=64 avoids rounding collapses)
 EPS_OPS_PER_FILE  = 4           # tiny ops per participating file (RW/WO for writes; RO/RW for reads)
-EPS_BYTES_FRAC_CAP = 5e-4       # ≤ 0.05% of total bytes when minimizing bytes
-EPS_OPS_FRAC_CAP   = 5e-4       # ≤ 0.05% of total ops   when minimizing ops
+EPS_FRAC_CAP   = 5e-4           # ≤ 0.05%
 
 # ---------------- Helpers ----------------
 def human_bytes(n):
@@ -125,36 +124,70 @@ def read_features(path):
 
 def clamp01(x): return max(0.0, min(1.0, float(x)))
 
-def rational_counts(fracs, max_denom=64):
+def rational_counts(fracs, max_denom=64, tol=0.05):
     """
-    Map fractional shares to small integer counts, preferring higher-denominator
-    fits when error ties (so we can realize ratios like 7/1/6).
-    Guarantees: if frac_i>0 → count_i>=1; if all fracs=0 → all counts=0.
+    Map fractional shares to small integer counts with a tolerance-first policy.
+
+    Policy:
+      1) Normalize fracs; if all zero -> all counts zero.
+      2) For denom=1..max_denom: round to counts, enforce presence (frac>0 -> >=1),
+         re-normalize, and check per-component |approx - frac| <= tol.
+         Return the first denom that satisfies this (lowest denom).
+         Tie-break (same denom): smaller L1 error, then smaller total.
+      3) If no denom satisfies tol, choose the overall best by:
+         smaller L1, then smaller L∞, then smaller denom, then smaller total.
+
+    Guarantees:
+      • If any frac_i > 0 → count_i >= 1
+      • If sum(fracs) == 0 → all counts = 0
     """
+    def clamp01(x):  # local to keep function self-contained
+        return 0.0 if x <= 0 else (1.0 if x >= 1 else x)
+
     fracs = [clamp01(float(x)) for x in fracs]
     s = sum(fracs)
     if s <= 0:
         return [0] * len(fracs)
-    fracs = [x/s for x in fracs]
+    fracs = [x / s for x in fracs]
 
-    best = None
+    tol_candidates = None  # (denom, L1, total, counts)
+    best_fallback = None   # (L1, L∞, denom, total, counts)
+
     for denom in range(1, max_denom + 1):
         counts = [int(round(f * denom)) for f in fracs]
-        # ensure presence for positive fracs
+        # presence: ensure at least 1 for positive fracs
         for i, f in enumerate(fracs):
             if f > 0 and counts[i] == 0:
                 counts[i] = 1
         total = sum(counts)
         if total == 0:
             continue
-        approx = [c/total for c in counts]
-        # primary metric: L1 error; tie-break 1) smaller L∞, 2) larger denom, 3) larger total
-        l1 = sum(abs(a - b) for a, b in zip(approx, fracs))
-        linf = max(abs(a - b) for a, b in zip(approx, fracs))
-        cand = (l1, linf, -denom, -total, counts)
-        if best is None or cand < best:
-            best = cand
-    return best[-1]
+
+        approx = [c / total for c in counts]
+        diffs = [abs(a - b) for a, b in zip(approx, fracs)]
+        l1 = sum(diffs)
+        linf = max(diffs)
+
+        # Collect tolerance-satisfying candidates; prefer smallest denom
+        if all(d <= tol for d in diffs):
+            cand = (denom, l1, total, counts)
+            if tol_candidates is None or cand < tol_candidates:
+                tol_candidates = cand
+
+        # Track best fallback (prefer simplicity: lower denom)
+        fallback_key = (l1, linf, denom, total, counts)
+        if best_fallback is None or fallback_key < best_fallback:
+            best_fallback = fallback_key
+
+        # Early exit: exact match and minimal denom
+        if l1 == 0.0:
+            return counts
+
+    if tol_candidates is not None:
+        return tol_candidates[-1]
+
+    # No tol-satisfying candidate: return the best fallback
+    return best_fallback[-1]
 
 def split_uniform(n, k):
     if k<=0: return []
@@ -695,7 +728,7 @@ def plan_tiny_intent(intent, feats, Nio, target_total_bytes,
 
     # 2) decide N_ops_tiny  —— HARD-BOUNDED by N_cap (nprocs ≤ N_ops_tiny ≤ N_cap ≤ Nio)
     # Cap computed once from Nio and nprocs (EPS only shapes the cap, not the count)
-    base_cap = int(math.floor(EPS_OPS_FRAC_CAP * float(Nio)))        # e.g., 5% of Nio
+    base_cap = int(math.floor(EPS_FRAC_CAP * float(Nio)))        # e.g., 5% of Nio
     N_cap    = max(1, min(Nio, max(nprocs, base_cap)))               # nprocs ≤ N_cap ≤ Nio
 
     def _clamp_ops(x):
@@ -868,7 +901,7 @@ def plan_tiny_intent(intent, feats, Nio, target_total_bytes,
 
     # ---- soft-cap tiny bytes when we are minimizing bytes on this intent ----
     tiny_bytes = sum(it["xfer"] * (it["con"] + it["seq"] + it["rnd"]) for it in items)
-    bytes_cap  = int(EPS_BYTES_FRAC_CAP * float(target_total_bytes))
+    bytes_cap  = int(EPS_FRAC_CAP * float(target_total_bytes))
 
     # We only enforce the hard cap when BOTH ops and bytes are being minimized.
     # If ops must be honored (want_ops=True, want_bytes=False), the cap is *soft*:
@@ -1261,7 +1294,7 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
     ro_f = clamp01(feats.get("pct_read_only_files", 0.0))
     rw_f = clamp01(feats.get("pct_read_write_files", 0.0))
     wo_f = clamp01(feats.get("pct_write_only_files", 0.0))
-    counts = rational_counts([ro_f, rw_f, wo_f], max_denom=64)
+    counts = rational_counts([ro_f, rw_f, wo_f], max_denom=64, tol=0.05)
     n_ro, n_rw, n_wo = counts
     if ro_f>0 and n_ro==0: n_ro=1
     if rw_f>0 and n_rw==0: n_rw=1
