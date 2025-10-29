@@ -687,6 +687,43 @@ def structure_counts(N, p_consec, p_seq):
         N_con += 1; N_rand -= 1
     return N_con, N_seq, N_rand
 
+def _pos(x, eps=1e-12):
+    try:
+        return float(x) > eps
+    except Exception:
+        return False
+
+def _has_side_signals(side, feats, *, bins=None, p_consec=None, p_seq=None, ro_f=None, wo_f=None, rw_f=None):
+    """
+    side: "read" or "write"
+    bins: tuple/list of three shares for (S,M,L) for the given side (e.g., (wS,wM,wL))
+    p_consec/p_seq: consecutive/sequence fractions for this side (e.g., feats.get("p_consec_w"), feats.get("p_seq_w"))
+    ro_f/wo_f/rw_f: file-role shares (optional; pass what you track)
+    Returns True if ANY directional signal for this side is present (>0).
+    """
+    s = []
+
+    # Size-bin signals
+    if bins is not None:
+        for b in bins:
+            s.append(_pos(b))
+
+    # Ordering signals
+    if p_consec is not None:
+        s.append(_pos(p_consec))
+    if p_seq is not None:
+        s.append(_pos(p_seq))
+
+    # File-role signals (optional, treat as present if provided and >0)
+    if ro_f is not None:
+        s.append(_pos(ro_f))
+    if wo_f is not None:
+        s.append(_pos(wo_f))
+    if rw_f is not None:
+        s.append(_pos(rw_f))
+
+    return any(s)
+
 def plan_tiny_intent(intent, feats, Nio, target_total_bytes,
                      S_SUBS, M_SUBS, L_CHOICES,
                      file_roles_by_intent,
@@ -1290,11 +1327,28 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
     if wS+wM+wL>0: wS,wM,wL = wS/(wS+wM+wL), wM/(wS+wM+wL), wL/(wS+wM+wL)
     else: wS=wM=wL=0.0
 
+    # Pull directional signals (use your variable names if already computed earlier)
+    # Size-bin shares
+    read_bins  = (rS, rM, rL)
+    write_bins = (wS, wM, wL)
+
     # File-role counts (RO/RW/WO)
     ro_f = clamp01(feats.get("pct_read_only_files", 0.0))
     rw_f = clamp01(feats.get("pct_read_write_files", 0.0))
     wo_f = clamp01(feats.get("pct_write_only_files", 0.0))
+    
+    if _has_side_signals(
+            "read", feats, bins=read_bins, p_consec=consec_r, p_seq=seq_r, ro_f=ro_f, rw_f=rw_f):
+        if (ro_f <= 0.0) and (rw_f <= 0.0):
+            ro_f = min(1.0, ro_f + 0.001)
+    
+    if _has_side_signals(
+            "write", feats, bins=write_bins, p_consec=consec_w, p_seq=seq_w, wo_f=wo_f, rw_f=rw_f):
+        if (wo_f <= 0.0) and (rw_f <= 0.0):
+            wo_f = min(1.0, wo_f + 0.001)
+    
     counts = rational_counts([ro_f, rw_f, wo_f], max_denom=64, tol=0.05)
+    
     n_ro, n_rw, n_wo = counts
     if ro_f>0 and n_ro==0: n_ro=1
     if rw_f>0 and n_rw==0: n_rw=1
@@ -1473,6 +1527,14 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
         if p_bytes_w > p_bytes_r:
             sides_order = ["write", "read"]
 
+    # Gates for tiny intent invocation
+    create_tiny_read  = ((not want_ops_r) or (not want_bytes_r)) and _has_side_signals(
+        "read", feats, bins=read_bins, p_consec=consec_r, p_seq=seq_r, ro_f=ro_f, rw_f=rw_f
+    )
+    create_tiny_write = ((not want_ops_w) or (not want_bytes_w)) and _has_side_signals(
+        "write", feats, bins=write_bins, p_consec=consec_w, p_seq=seq_w, wo_f=wo_f, rw_f=rw_f
+    )
+    
     for side in sides_order:
         if side == "read":
             # Quadrants for READ
@@ -1480,19 +1542,20 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
                 # normal path (your existing logic)
                 pass
             else:
-                tiny_read_rows, _ = plan_tiny_intent(
-                    "read", feats, Nio, io_bytes_target,
-                    S_SUBS, M_SUBS, L_SIZE_CHOICES,
-                    roles_dict,
-                    want_ops=want_ops_r,
-                    want_bytes=want_bytes_r,
-                    p_ops_target=p_reads_ops,         # feats.get("pct_reads")
-                    p_bytes_target=p_bytes_r,          # feats.get("pct_byte_reads")
-                    file_weights=read_file_w,
-                    nprocs=nprocs
-                )
-                # Stash for coalescing later:
-                extra_tiny_rows_read = tiny_read_rows
+                if create_tiny_read:
+                    tiny_read_rows, _ = plan_tiny_intent(
+                        "read", feats, Nio, io_bytes_target,
+                        S_SUBS, M_SUBS, L_SIZE_CHOICES,
+                        roles_dict,
+                        want_ops=want_ops_r,
+                        want_bytes=want_bytes_r,
+                        p_ops_target=p_reads_ops,         # feats.get("pct_reads")
+                        p_bytes_target=p_bytes_r,          # feats.get("pct_byte_reads")
+                        file_weights=read_file_w,
+                        nprocs=nprocs
+                    )
+                    # Stash for coalescing later:
+                    extra_tiny_rows_read = tiny_read_rows
 
         else:
             # Quadrants for WRITE
@@ -1500,18 +1563,19 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
                 # normal path (your existing logic)
                 pass
             else:
-                tiny_write_rows, _ = plan_tiny_intent(
-                    "write", feats, Nio, io_bytes_target,
-                    S_SUBS, M_SUBS, L_SIZE_CHOICES,
-                    roles_dict,
-                    want_ops=want_ops_w,
-                    want_bytes=want_bytes_w,
-                    p_ops_target=p_writes_ops,        # feats.get("pct_writes")
-                    p_bytes_target=p_bytes_w,          # feats.get("pct_byte_writes")
-                    file_weights=write_file_w,
-                    nprocs=nprocs
-                )
-                extra_tiny_rows_write = tiny_write_rows
+                if create_tiny_write:
+                    tiny_write_rows, _ = plan_tiny_intent(
+                        "write", feats, Nio, io_bytes_target,
+                        S_SUBS, M_SUBS, L_SIZE_CHOICES,
+                        roles_dict,
+                        want_ops=want_ops_w,
+                        want_bytes=want_bytes_w,
+                        p_ops_target=p_writes_ops,        # feats.get("pct_writes")
+                        p_bytes_target=p_bytes_w,          # feats.get("pct_byte_writes")
+                        file_weights=write_file_w,
+                        nprocs=nprocs
+                    )
+                    extra_tiny_rows_write = tiny_write_rows
     
     from collections import defaultdict
     def _tiny_stats(tiny_items, intent_label, path_flags):

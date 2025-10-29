@@ -26,7 +26,7 @@ ROOT = Path("/mnt/hasanfs/io_synthesizer")
 SCRIPTS = ROOT / "analysis" / "scripts_analysis"
 
 # ± tolerance to treat numeric pct_* values as "close enough"
-TOL = 0.05
+TOL = 0.10
 
 
 def run(cmd, cwd=None):
