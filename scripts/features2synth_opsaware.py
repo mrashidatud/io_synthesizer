@@ -1290,40 +1290,38 @@ def compute_rowwise_pua_file(rows, target_frac, fs_align_bytes):
 # ---------------- Planner core ----------------
 def plan_from_features(feats, nranks:int, fs_align_bytes:int):
     # Capacity → IO target
-    cap_total_gib = float(feats.get("cap_total_gib", 1.0))
+    cap_total_gib = float(feats.get("cap_total_gib", 64))
     io_bytes_target = int(cap_total_gib * (1<<30))
 
     # Alignment targets (requested)
-    p_file_ua_req = clamp01(feats.get("pct_file_not_aligned", 0.6))
-    p_mem_ua      = clamp01(feats.get("pct_mem_not_aligned", 0.4))
+    p_file_ua_req = clamp01(feats.get("pct_file_not_aligned", 0))
+    p_mem_ua      = clamp01(feats.get("pct_mem_not_aligned", 0))
     mem_align_bytes = int(feats.get("posix_mem_alignment_bytes", 8))
 
     # Intent BYTES targets (fallback to pct_reads if bytes not set)
-    p_bytes_r = clamp01(feats.get("pct_byte_reads", feats.get("pct_reads", 0.5)))
-    p_bytes_w = clamp01(feats.get("pct_byte_writes", 1.0 - p_bytes_r))
-    if p_bytes_r + p_bytes_w == 0.0:
-        p_bytes_r = clamp01(feats.get("pct_reads", 0.5)); p_bytes_w = 1.0 - p_bytes_r
+    p_bytes_r = clamp01(feats.get("pct_byte_reads", 0))
+    p_bytes_w = clamp01(feats.get("pct_byte_writes", 0))
 
     # OPS split (STRICT)
-    p_reads_ops  = clamp01(feats.get("pct_reads", p_bytes_r))
-    p_writes_ops = 1.0 - p_reads_ops
+    p_reads_ops  = clamp01(feats.get("pct_reads", 0))
+    p_writes_ops = clamp01(feats.get("pct_writes", 0))
 
     # Sequence model (consec ⊂ seq)
-    consec_r = clamp01(feats.get("pct_consec_reads", 0.5))
-    seq_r    = clamp01(feats.get("pct_seq_reads", 0.5))
-    consec_w = clamp01(feats.get("pct_consec_writes", 0.0))
-    seq_w    = clamp01(feats.get("pct_seq_writes", 1.0))
+    consec_r = clamp01(feats.get("pct_consec_reads", 0))
+    seq_r    = clamp01(feats.get("pct_seq_reads", 0))
+    consec_w = clamp01(feats.get("pct_consec_writes", 0))
+    seq_w    = clamp01(feats.get("pct_seq_writes", 0))
 
     # Bin shares (ops)
-    rS = clamp01(feats.get("pct_read_0_100K", 0.5))
-    rM = clamp01(feats.get("pct_read_100K_10M", 0.0))
-    rL = clamp01(feats.get("pct_read_10M_1G_PLUS", 0.5))
+    rS = clamp01(feats.get("pct_read_0_100K", 0))
+    rM = clamp01(feats.get("pct_read_100K_10M", 0))
+    rL = clamp01(feats.get("pct_read_10M_1G_PLUS", 0))
     if rS+rM+rL>0: rS,rM,rL = rS/(rS+rM+rL), rM/(rS+rM+rL), rL/(rS+rM+rL)
     else: rS=rM=rL=0.0
 
-    wS = clamp01(feats.get("pct_write_0_100K", 1.0))
-    wM = clamp01(feats.get("pct_write_100K_10M", 0.0))
-    wL = clamp01(feats.get("pct_write_10M_1G_PLUS", 0.0))
+    wS = clamp01(feats.get("pct_write_0_100K", 0))
+    wM = clamp01(feats.get("pct_write_100K_10M", 0))
+    wL = clamp01(feats.get("pct_write_10M_1G_PLUS", 0))
     if wS+wM+wL>0: wS,wM,wL = wS/(wS+wM+wL), wM/(wS+wM+wL), wL/(wS+wM+wL)
     else: wS=wM=wL=0.0
 
@@ -1333,9 +1331,9 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
     write_bins = (wS, wM, wL)
 
     # File-role counts (RO/RW/WO)
-    ro_f = clamp01(feats.get("pct_read_only_files", 0.0))
-    rw_f = clamp01(feats.get("pct_read_write_files", 0.0))
-    wo_f = clamp01(feats.get("pct_write_only_files", 0.0))
+    ro_f = clamp01(feats.get("pct_read_only_files", 0))
+    rw_f = clamp01(feats.get("pct_read_write_files", 0))
+    wo_f = clamp01(feats.get("pct_write_only_files", 0))
     
     if _has_side_signals(
             "read", feats, bins=read_bins, p_consec=consec_r, p_seq=seq_r, ro_f=ro_f, rw_f=rw_f):
