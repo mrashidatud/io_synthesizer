@@ -104,6 +104,14 @@ L_SIZE       = 16 * (1<<20)  # default stays 16 MiB
 L_SIZE_CHOICES = [mb * (1<<20) for mb in range(10+1, 64+1, 1)]
 
 CHUNK_RANDOM = 128*(1<<20)
+TRUNCATE_FALLBACK_SIZES = [
+    (16*(1<<40)) - 1,  # 16 TiB - 1
+    (8*(1<<40)) - 1,   # 8 TiB - 1
+    (4*(1<<40)) - 1,   # 4 TiB - 1
+    (2*(1<<40)) - 1,   # 2 TiB - 1
+    (1*(1<<40)) - 1,   # 1 TiB - 1
+    (512*(1<<30)) - 1, # 512 GiB - 1
+]
 
 # --- Tiny-footprint policy knobs ---
 EPS_OPS_ABS_MIN   = 64          # minimum ops to realize structure (>=64 avoids rounding collapses)
@@ -1962,8 +1970,28 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
     with open(PREP, "w") as f:
         f.write("#!/usr/bin/env bash\nset -euo pipefail\n")
         f.write(f"mkdir -p {DATA_RO} {DATA_RW} {DATA_WO} {META_DIR}\n")
+        f.write("truncate_with_fallback() {\n")
+        f.write("  local path=\"$1\"\n")
+        f.write("  local requested=\"$2\"\n")
+        f.write("  local applied=\"\"\n")
+        f.write(f"  local attempts=(\"$requested\" {' '.join(str(v) for v in TRUNCATE_FALLBACK_SIZES)})\n")
+        f.write("  for s in \"${attempts[@]}\"; do\n")
+        f.write("    [[ \"$s\" -le 0 ]] && continue\n")
+        f.write("    if truncate -s \"$s\" \"$path\" 2>/dev/null; then\n")
+        f.write("      applied=\"$s\"\n")
+        f.write("      break\n")
+        f.write("    fi\n")
+        f.write("  done\n")
+        f.write("  if [[ -z \"$applied\" ]]; then\n")
+        f.write("    echo \"ERROR: truncate failed for $path (requested=$requested)\" >&2\n")
+        f.write("    return 1\n")
+        f.write("  fi\n")
+        f.write("  if [[ \"$applied\" != \"$requested\" ]]; then\n")
+        f.write("    echo \"WARN: truncate fallback for $path (requested=$requested applied=$applied)\" >&2\n")
+        f.write("  fi\n")
+        f.write("}\n")
         for path, size in sorted(per_file_span.items()):
-            f.write(f"truncate -s {size} '{path}'\n")
+            f.write(f"truncate_with_fallback '{path}' {size}\n")
         f.write(f"truncate -s 0 '{META_DIR / 'meta_only.dat'}'\n")
     os.chmod(PREP, 0o755)
 
@@ -2137,6 +2165,7 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
         f.write("=== ASSUMPTIONS & INVARIANTS ===\n")
         f.write("  • Rebalancer: in-bin only, op-preserving, presence floors. L bin uses a bounded ladder 11-64 MiB with 1 MiB increment to auto up/down-tune per intent (read/write) before the fair in-bin nudger; S/M adjust only within their fixed ladders. Keeps 10M+ constraints intact.\n")
         f.write("  • Presence floors: any (file,bin,sub-size) that existed pre-rebalance keeps ≥1 op.\n")
+        f.write("  • Prep truncate safeguard: if a requested sparse size exceeds filesystem limits, prep falls back to smaller tiers (16/8/4/2/1 TiB, then 512 GiB) to avoid aborting the run.\n")
         f.write("  • With nprocs==1, Darshan cannot classify shared files; planner forces shared count to 0.\n")
 
     return {"plan_csv": str(PLAN), "prep_sh": str(PREP), "run_sh": str(RUN), "notes": str(NOTES)}
