@@ -1,0 +1,14 @@
+id,ssh_command,machine_type
+server0,ssh mrashid2@amd209.utah.cloudlab.us,metadata_server
+server1,ssh mrashid2@amd215.utah.cloudlab.us,data_server
+server2,ssh mrashid2@amd240.utah.cloudlab.us,data_server
+server3,ssh mrashid2@amd133.utah.cloudlab.us,data_server
+server4,ssh mrashid2@amd126.utah.cloudlab.us,data_server
+server5,ssh mrashid2@amd148.utah.cloudlab.us,data_server
+server6,ssh mrashid2@amd225.utah.cloudlab.us,data_server
+server7,ssh mrashid2@amd162.utah.cloudlab.us,data_server
+server8,ssh mrashid2@amd117.utah.cloudlab.us,data_server
+node0,ssh mrashid2@amd141.utah.cloudlab.us,client
+node1,ssh mrashid2@amd114.utah.cloudlab.us,client
+node2,ssh mrashid2@amd161.utah.cloudlab.us,client
+node3,ssh mrashid2@amd147.utah.cloudlab.us,client
