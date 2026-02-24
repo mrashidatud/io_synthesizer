@@ -65,11 +65,13 @@ Run script calls your exact Darshan/mpi_synthio paths and runs prep first.
 """
 
 import argparse, json, os, random, math
+from typing import Optional
 from pathlib import Path
 from collections import defaultdict, Counter
 
 # ---------------- Paths & constants ----------------
-OUTROOT   = Path("/mnt/hasanfs/out_synth")
+DEFAULT_OUT_BASE = Path("/mnt/hasanfs/out_synth")
+OUTROOT   = DEFAULT_OUT_BASE
 PAYLOAD   = OUTROOT / "payload"
 PLAN      = PAYLOAD / "plan.csv"
 DATA_RO   = PAYLOAD / "data" / "ro"
@@ -80,11 +82,20 @@ PREP      = OUTROOT / "run_prep.sh"
 RUN       = OUTROOT / "run_from_features.sh"
 NOTES     = OUTROOT / "run_from_features.sh.notes.txt"
 
-def _set_outroot_per_json(json_path: str):
-    """Re-point all output paths to /mnt/hasanfs/out_synth/<json_base>/..."""
+def _set_outroot_per_json(json_path: str, out_root: Optional[str] = None, outdir: Optional[str] = None):
+    """Re-point output paths.
+
+    Behavior:
+      - if outdir is provided: OUTROOT=<outdir>
+      - else: OUTROOT=<out_root>/<json_base> (or default /mnt/hasanfs/out_synth/<json_base>)
+    """
     global OUTROOT, PAYLOAD, PLAN, DATA_RO, DATA_RW, DATA_WO, META_DIR, PREP, RUN, NOTES
     json_base = Path(json_path).stem
-    OUTROOT = Path("/mnt/hasanfs/out_synth") / json_base
+    if outdir:
+        OUTROOT = Path(outdir)
+    else:
+        base = Path(out_root) if out_root else DEFAULT_OUT_BASE
+        OUTROOT = base / json_base
     PAYLOAD = OUTROOT / "payload"
     PLAN    = PAYLOAD / "plan.csv"
     DATA_RO = PAYLOAD / "data" / "ro"
@@ -2012,8 +2023,8 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
     with open(RUNNER, "w") as f:
         f.write("#!/usr/bin/env bash\nset -euo pipefail\n")
         f.write(f"bash {PREP}\n")
-        # Set DARSHAN_LOGFILE for consistent file name/location
-        f.write(f"export DARSHAN_LOGFILE='{darshan_path}'\n")
+        # Allow external override for repeated iterations/config trials.
+        f.write(f"export DARSHAN_LOGFILE=\"${{DARSHAN_LOGFILE:-{darshan_path}}}\"\n")
         # mpiexec: LD_PRELOAD + DARSHAN_LOGFILE for all ranks
         f.write(
             "mpiexec -n {n} "
@@ -2182,11 +2193,13 @@ def main():
     ap.add_argument("--io-api", choices=["posix","mpiio"], default=None, help="Override io_api")
     ap.add_argument("--meta-api", choices=["posix"], default=None, help="Override meta_api")
     ap.add_argument("--mpi-collective-mode", choices=["none","independent","collective"], default=None, help="Override mpi_collective_mode")
+    ap.add_argument("--out-root", default=None, help="Base output root. Final path is <out-root>/<json_base>/")
+    ap.add_argument("--outdir", default=None, help="Exact output directory for this workload (overrides --out-root)")
 
     args = ap.parse_args()
 
     # Per-JSON outroot redirection
-    json_base = _set_outroot_per_json(args.features)
+    json_base = _set_outroot_per_json(args.features, out_root=args.out_root, outdir=args.outdir)
 
     # Read features and apply overrides
     feats = read_features(args.features)

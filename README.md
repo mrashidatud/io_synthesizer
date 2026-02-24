@@ -59,6 +59,39 @@ The template includes:
 python -m io_recommender.run_pipeline --config io_recommender/config.yaml --output-dir artifacts
 ```
 
+### Warm-Start Collection Workflow (Separated)
+
+Use the dedicated script for warm-start data collection:
+
+```bash
+python3 warm_start_pipeline.py --options-csv remote_orchestration/warm_start_options.csv
+```
+
+This workflow is separated from `pipeline.sh` and is designed for recommender warm-start sampling:
+- plan generation once per workload
+- no re-generation of `plan.csv` / `run_prep.sh` / `run_from_features.sh` across iterations
+- run each workload for `iterations` (default `3`)
+- apply warm-start configs each iteration and extract recommender-ready metrics from Darshan
+
+Remote launcher (same style as existing CSV orchestration):
+
+```bash
+remote_orchestration/run_warm_start_from_csv.sh \
+  remote_orchestration/machine_ssh_map.csv \
+  remote_orchestration/warm_start_options.csv
+```
+
+Output layout:
+- root: `/mnt/hasanfs/samples/warm-start`
+- per workload: `/mnt/hasanfs/samples/warm-start/<workload_key>`
+- static artifacts in workload dir: `payload/`, `run_prep.sh`, `run_from_features.sh`
+- per iteration: `iter_01/`, `iter_02/`, `iter_03/`
+- per config-run (inside iteration): `cfg_<idx>_<config_id>/` with darshan + parsed metrics
+- observation tables:
+  - per-iteration: `iter_xx/observations.csv`
+  - per-workload: `<workload>/observations.csv`
+  - global: `/mnt/hasanfs/samples/warm-start/observations_all.csv`
+
 Outputs:
 - `artifacts/summary.json`
 - `artifacts/recommendation_matrix.json`
@@ -74,16 +107,21 @@ The bridge is implemented in `io_recommender/runner_real.py` and selected with:
 
 Runner flow per active-learning trial:
 1. Use `scripts/features2synth_opsaware.py` with selected pattern JSON.
-2. Apply Lustre knobs (`stripe_count`, `stripe_size`, `max_pages_per_rpc`, `max_rpcs_in_flight`).
+2. Apply Lustre knobs from config to both OSC and MDC explicitly:
+   - `osc_max_pages_per_rpc` -> `osc.*.max_pages_per_rpc`
+   - `mdc_max_pages_per_rpc` -> `mdc.*.max_pages_per_rpc`
+   - `osc_max_rpcs_in_flight` -> `osc.*.max_rpcs_in_flight`
+   - `mdc_max_rpcs_in_flight` -> `mdc.*.max_rpcs_in_flight`
+   - `mdc.*.max_rpcs_in_flight` is range-limited to `[2,512]` if needed.
 3. Run generated `run_from_features.sh`.
 4. Run `analysis/scripts_analysis/analyze_darshan_merged.py`.
 5. Read objective metric from `darshan_summary.csv` (default `POSIX_agg_perf_by_slowest`).
 
 Where striping is applied:
 - Data files are created by generated `run_prep.sh` under:
-  - `/mnt/hasanfs/out_synth/<pattern>/payload/data_ro`
-  - `/mnt/hasanfs/out_synth/<pattern>/payload/data_rw`
-  - `/mnt/hasanfs/out_synth/<pattern>/payload/data_wo`
+  - `/mnt/hasanfs/out_synth/<pattern>/payload/data/ro`
+  - `/mnt/hasanfs/out_synth/<pattern>/payload/data/rw`
+  - `/mnt/hasanfs/out_synth/<pattern>/payload/data/wo`
   - `/mnt/hasanfs/out_synth/<pattern>/payload/meta`
 - The bridge applies `lfs setstripe` on these directories before `run_prep.sh` creates files, so files inherit that striping policy.
 

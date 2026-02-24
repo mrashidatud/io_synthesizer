@@ -6,7 +6,7 @@ import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Mapping, Sequence
+from typing import Dict, Sequence
 
 from io_recommender.types import Config, ParameterSpec
 
@@ -77,8 +77,8 @@ class RealSynthRunner:
             mapping[p.stem] = p
         self.pattern_file_by_id = mapping
 
-    def _cmd_lctl_set_param(self, key: str, value: object) -> list[str]:
-        base = ["lctl", "set_param", f"osc.*.{key}={value}"]
+    def _cmd_lctl_set_param(self, target: str, key: str, value: object) -> list[str]:
+        base = ["lctl", "set_param", f"{target}.*.{key}={value}"]
         return ["sudo"] + base if self.use_sudo_for_lustre else base
 
     def _cmd_lfs_setstripe(self, stripe_count: object, stripe_size: object, path: Path) -> list[str]:
@@ -145,9 +145,9 @@ class RealSynthRunner:
 
     def _apply_knobs_before_run(self, run_root: Path, config: Config) -> None:
         payload = run_root / "payload"
-        data_ro = payload / "data_ro"
-        data_rw = payload / "data_rw"
-        data_wo = payload / "data_wo"
+        data_ro = payload / "data" / "ro"
+        data_rw = payload / "data" / "rw"
+        data_wo = payload / "data" / "wo"
         meta = payload / "meta"
         targets = [payload, data_ro, data_rw, data_wo, meta]
 
@@ -164,8 +164,18 @@ class RealSynthRunner:
         for t in targets:
             _run(self._cmd_lfs_setstripe(config["stripe_count"], config["stripe_size"], t))
 
-        _run(self._cmd_lctl_set_param("max_pages_per_rpc", config["max_pages_per_rpc"]))
-        _run(self._cmd_lctl_set_param("max_rpcs_in_flight", config["max_rpcs_in_flight"]))
+        osc_pages = int(config.get("osc_max_pages_per_rpc", config.get("max_pages_per_rpc", 1)))
+        mdc_pages_raw = int(config.get("mdc_max_pages_per_rpc", osc_pages))
+        osc_rpcs = int(config.get("osc_max_rpcs_in_flight", config.get("max_rpcs_in_flight", 1)))
+        mdc_rpcs_raw = int(config.get("mdc_max_rpcs_in_flight", osc_rpcs))
+
+        mdc_pages = max(1, min(1024, mdc_pages_raw))
+        mdc_rpcs = max(2, min(512, mdc_rpcs_raw))
+
+        _run(self._cmd_lctl_set_param("osc", "max_pages_per_rpc", osc_pages))
+        _run(self._cmd_lctl_set_param("osc", "max_rpcs_in_flight", osc_rpcs))
+        _run(self._cmd_lctl_set_param("mdc", "max_pages_per_rpc", mdc_pages))
+        _run(self._cmd_lctl_set_param("mdc", "max_rpcs_in_flight", mdc_rpcs))
 
     @staticmethod
     def _metric_from_csv(csv_path: Path, metric_key: str, metric_fallback: str) -> float:
