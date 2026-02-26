@@ -1,0 +1,340 @@
+{
+  "input_dir": "/Users/user/dirlab/repos/io_synthesizer/inputs/exemplar_jsons",
+  "top_n": 25,
+  "reference_top_k": 4,
+  "include_references": false,
+  "metric": "weighted_euclidean_l2",
+  "priority_weights": {
+    "high": 4.0,
+    "medium": 2.0,
+    "low": 1.0
+  },
+  "priority_feature_counts": {
+    "high": 8,
+    "medium": 10,
+    "low": 14
+  },
+  "feature_count": 32,
+  "features": [
+    "pct_byte_reads",
+    "pct_byte_writes",
+    "pct_bytes_read_only_files",
+    "pct_bytes_read_write_files",
+    "pct_bytes_shared_files",
+    "pct_bytes_unique_files",
+    "pct_bytes_write_only_files",
+    "pct_consec_reads",
+    "pct_consec_writes",
+    "pct_file_not_aligned",
+    "pct_io_access",
+    "pct_mem_not_aligned",
+    "pct_meta_open_access",
+    "pct_meta_seek_access",
+    "pct_meta_stat_access",
+    "pct_meta_sync_access",
+    "pct_read_0_100K",
+    "pct_read_100K_10M",
+    "pct_read_10M_1G_PLUS",
+    "pct_read_only_files",
+    "pct_read_write_files",
+    "pct_reads",
+    "pct_rw_switches",
+    "pct_seq_reads",
+    "pct_seq_writes",
+    "pct_shared_files",
+    "pct_unique_files",
+    "pct_write_0_100K",
+    "pct_write_100K_10M",
+    "pct_write_10M_1G_PLUS",
+    "pct_write_only_files",
+    "pct_writes"
+  ],
+  "best_match": {
+    "candidate": "top21_258",
+    "candidate_rank": 21,
+    "closest_reference": "top3_18",
+    "closest_reference_rank": 3,
+    "weighted_distance": 1.4223923509355638,
+    "unweighted_distance": 0.9420721840708386,
+    "priority_squared_error": {
+      "high": 0.2631,
+      "medium": 0.34640000000000004,
+      "low": 0.278
+    }
+  },
+  "ranked_matches": [
+    {
+      "candidate": "top21_258",
+      "candidate_rank": 21,
+      "closest_reference": "top3_18",
+      "closest_reference_rank": 3,
+      "weighted_distance": 1.4223923509355638,
+      "unweighted_distance": 0.9420721840708386,
+      "priority_squared_error": {
+        "high": 0.2631,
+        "medium": 0.34640000000000004,
+        "low": 0.278
+      }
+    },
+    {
+      "candidate": "top10_252",
+      "candidate_rank": 10,
+      "closest_reference": "top1_101",
+      "closest_reference_rank": 1,
+      "weighted_distance": 2.0128338232452276,
+      "unweighted_distance": 1.1483466375620213,
+      "priority_squared_error": {
+        "high": 0.733,
+        "medium": 0.5338,
+        "low": 0.051900000000000016
+      }
+    },
+    {
+      "candidate": "top23_193",
+      "candidate_rank": 23,
+      "closest_reference": "top4_192",
+      "closest_reference_rank": 4,
+      "weighted_distance": 2.0255863348670182,
+      "unweighted_distance": 1.0209799214480175,
+      "priority_squared_error": {
+        "high": 1.0202,
+        "medium": 0.0,
+        "low": 0.0222
+      }
+    },
+    {
+      "candidate": "top24_138",
+      "candidate_rank": 24,
+      "closest_reference": "top1_101",
+      "closest_reference_rank": 1,
+      "weighted_distance": 2.464589215264889,
+      "unweighted_distance": 1.4750593208410299,
+      "priority_squared_error": {
+        "high": 1.1026,
+        "medium": 0.5905999999999999,
+        "low": 0.4826
+      }
+    },
+    {
+      "candidate": "top12_236",
+      "candidate_rank": 12,
+      "closest_reference": "top2_20",
+      "closest_reference_rank": 2,
+      "weighted_distance": 2.517637781731121,
+      "unweighted_distance": 1.7084788555905512,
+      "priority_squared_error": {
+        "high": 0.5662,
+        "medium": 1.721,
+        "low": 0.6317
+      }
+    },
+    {
+      "candidate": "top5_74",
+      "candidate_rank": 5,
+      "closest_reference": "top1_101",
+      "closest_reference_rank": 1,
+      "weighted_distance": 2.632945119063441,
+      "unweighted_distance": 2.0394607130317564,
+      "priority_squared_error": {
+        "high": 0.5519000000000001,
+        "medium": 1.1173,
+        "low": 2.4901999999999997
+      }
+    },
+    {
+      "candidate": "top22_207",
+      "candidate_rank": 22,
+      "closest_reference": "top4_192",
+      "closest_reference_rank": 4,
+      "weighted_distance": 2.6869499437094095,
+      "unweighted_distance": 2.1463923220138486,
+      "priority_squared_error": {
+        "high": 0.5201000000000001,
+        "medium": 1.0524,
+        "low": 3.0345
+      }
+    },
+    {
+      "candidate": "top16_225",
+      "candidate_rank": 16,
+      "closest_reference": "top4_192",
+      "closest_reference_rank": 4,
+      "weighted_distance": 2.7780208782512776,
+      "unweighted_distance": 2.230560467685196,
+      "priority_squared_error": {
+        "high": 0.8873,
+        "medium": 0.08009999999999999,
+        "low": 4.008
+      }
+    },
+    {
+      "candidate": "top13_237",
+      "candidate_rank": 13,
+      "closest_reference": "top1_101",
+      "closest_reference_rank": 1,
+      "weighted_distance": 2.8227823153760903,
+      "unweighted_distance": 1.6243460222501855,
+      "priority_squared_error": {
+        "high": 1.6096000000000001,
+        "medium": 0.5008,
+        "low": 0.5281
+      }
+    },
+    {
+      "candidate": "top11_249",
+      "candidate_rank": 11,
+      "closest_reference": "top4_192",
+      "closest_reference_rank": 4,
+      "weighted_distance": 2.8314307337457505,
+      "unweighted_distance": 1.4164038971988182,
+      "priority_squared_error": {
+        "high": 2.0036,
+        "medium": 0.0,
+        "low": 0.0026
+      }
+    },
+    {
+      "candidate": "top17_41",
+      "candidate_rank": 17,
+      "closest_reference": "top2_20",
+      "closest_reference_rank": 2,
+      "weighted_distance": 3.0335128152028634,
+      "unweighted_distance": 2.193672719436516,
+      "priority_squared_error": {
+        "high": 0.49770000000000003,
+        "medium": 2.8968999999999996,
+        "low": 1.4175999999999997
+      }
+    },
+    {
+      "candidate": "top15_50",
+      "candidate_rank": 15,
+      "closest_reference": "top2_20",
+      "closest_reference_rank": 2,
+      "weighted_distance": 3.0411839799656972,
+      "unweighted_distance": 2.1141192019372985,
+      "priority_squared_error": {
+        "high": 0.5547000000000001,
+        "medium": 3.1151999999999997,
+        "low": 0.7995999999999999
+      }
+    },
+    {
+      "candidate": "top7_28",
+      "candidate_rank": 7,
+      "closest_reference": "top2_20",
+      "closest_reference_rank": 2,
+      "weighted_distance": 3.061878508367045,
+      "unweighted_distance": 2.0821623375712086,
+      "priority_squared_error": {
+        "high": 0.7067000000000001,
+        "medium": 2.9195999999999995,
+        "low": 0.7091
+      }
+    },
+    {
+      "candidate": "top14_344",
+      "candidate_rank": 14,
+      "closest_reference": "top2_20",
+      "closest_reference_rank": 2,
+      "weighted_distance": 3.153014430667896,
+      "unweighted_distance": 2.596324324887012,
+      "priority_squared_error": {
+        "high": 0.20979999999999996,
+        "medium": 2.5712000000000006,
+        "low": 3.9598999999999998
+      }
+    },
+    {
+      "candidate": "top18_7",
+      "candidate_rank": 18,
+      "closest_reference": "top1_101",
+      "closest_reference_rank": 1,
+      "weighted_distance": 3.3427084826529523,
+      "unweighted_distance": 2.476065427245411,
+      "priority_squared_error": {
+        "high": 1.4876000000000003,
+        "medium": 0.5800000000000001,
+        "low": 4.0633
+      }
+    },
+    {
+      "candidate": "top6_331",
+      "candidate_rank": 6,
+      "closest_reference": "top1_101",
+      "closest_reference_rank": 1,
+      "weighted_distance": 3.3477156390589684,
+      "unweighted_distance": 2.4477744994177875,
+      "priority_squared_error": {
+        "high": 1.5452000000000001,
+        "medium": 0.5800000000000001,
+        "low": 3.8664
+      }
+    },
+    {
+      "candidate": "top8_48",
+      "candidate_rank": 8,
+      "closest_reference": "top2_20",
+      "closest_reference_rank": 2,
+      "weighted_distance": 3.3495671362132753,
+      "unweighted_distance": 2.229910312097776,
+      "priority_squared_error": {
+        "high": 1.0263,
+        "medium": 3.1681999999999997,
+        "low": 0.7779999999999999
+      }
+    },
+    {
+      "candidate": "top20_322",
+      "candidate_rank": 20,
+      "closest_reference": "top4_192",
+      "closest_reference_rank": 4,
+      "weighted_distance": 3.404717315725345,
+      "unweighted_distance": 2.499359918059022,
+      "priority_squared_error": {
+        "high": 1.4734999999999998,
+        "medium": 0.9248000000000001,
+        "low": 3.8484999999999996
+      }
+    },
+    {
+      "candidate": "top9_47",
+      "candidate_rank": 9,
+      "closest_reference": "top2_20",
+      "closest_reference_rank": 2,
+      "weighted_distance": 3.548844882493457,
+      "unweighted_distance": 2.3352087701102873,
+      "priority_squared_error": {
+        "high": 1.2203,
+        "medium": 3.4802,
+        "low": 0.7526999999999999
+      }
+    },
+    {
+      "candidate": "top25_64",
+      "candidate_rank": 25,
+      "closest_reference": "top1_101",
+      "closest_reference_rank": 1,
+      "weighted_distance": 3.9021276247708765,
+      "unweighted_distance": 2.733386178350948,
+      "priority_squared_error": {
+        "high": 2.1325000000000003,
+        "medium": 1.3577000000000001,
+        "low": 3.9812
+      }
+    },
+    {
+      "candidate": "top19_83",
+      "candidate_rank": 19,
+      "closest_reference": "top2_20",
+      "closest_reference_rank": 2,
+      "weighted_distance": 4.323598038671033,
+      "unweighted_distance": 3.3886575513025803,
+      "priority_squared_error": {
+        "high": 1.5149,
+        "medium": 2.6658000000000004,
+        "low": 7.302299999999999
+      }
+    }
+  ]
+}
