@@ -47,7 +47,7 @@
 #include <time.h>
 
 #ifndef LUSTRE_FILE_ALIGN
-#define LUSTRE_FILE_ALIGN (1<<20) /* 1 MiB default; planner sets alignment policy via p_ua_file */
+#define LUSTRE_FILE_ALIGN 4096 /* 4 KiB default; planner sets alignment policy via p_ua_file */
 #endif
 
 #ifndef MEM_ALIGN
