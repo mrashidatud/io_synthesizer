@@ -1,0 +1,2 @@
+Compared=32 exact=23 within=9 outside=0
+nprocs_input=1 nprocs_used=2

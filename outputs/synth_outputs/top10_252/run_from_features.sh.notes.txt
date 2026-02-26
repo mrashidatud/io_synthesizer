@@ -1,0 +1,116 @@
+=== INPUT FEATURES (verbatim) ===
+  _json_base: top10_252
+  cluster: 252
+  filename: 2024/4/27/1878627-15452128528381693113.txt
+  io_api: posix
+  jobid: 1878627
+  meta_api: posix
+  mpi_collective_mode: none
+  nprocs: 2
+  pct_byte_reads: 1.0
+  pct_byte_writes: 0.0
+  pct_bytes_read_only_files: 1.0
+  pct_bytes_read_write_files: 0.0
+  pct_bytes_shared_files: 1.0
+  pct_bytes_unique_files: 0.0
+  pct_bytes_write_only_files: 0.0
+  pct_consec_reads: 0.0
+  pct_consec_writes: 0.0
+  pct_file_not_aligned: 0.33
+  pct_io_access: 0.17
+  pct_mem_not_aligned: 0.0
+  pct_meta_open_access: 0.5
+  pct_meta_seek_access: 0.33
+  pct_meta_stat_access: 0.0
+  pct_meta_sync_access: 0.0
+  pct_read_0_100K: 0.0
+  pct_read_100K_10M: 0.0
+  pct_read_10M_1G_PLUS: 1.0
+  pct_read_only_files: 0.67
+  pct_read_write_files: 0.0
+  pct_reads: 0.67
+  pct_rw_switches: 0.0
+  pct_seq_reads: 0.0
+  pct_seq_writes: 1.0
+  pct_shared_files: 1.0
+  pct_unique_files: 0.0
+  pct_write_0_100K: 1.0
+  pct_write_100K_10M: 0.0
+  pct_write_10M_1G_PLUS: 0.0
+  pct_write_only_files: 0.33
+  pct_writes: 0.33
+
+=== PLANNER OVERVIEW ===
+  Mode: OPS-first; S/M fixed ladders; L:11-64 MiB with 1 MiB increment;
+  Bins:
+    S_SUBS=[100, 1024, 4096, 65536]  M_SUBS=[262144, 1048576, 4194304]  L_CHOICES=[11534336, 12582912, 13631488, 14680064, 15728640, 16777216, 17825792, 18874368, 19922944, 20971520, 22020096, 23068672, 24117248, 25165824, 26214400, 27262976, 28311552, 29360128, 30408704, 31457280, 32505856, 33554432, 34603008, 35651584, 36700160, 37748736, 38797312, 39845888, 40894464, 41943040, 42991616, 44040192, 45088768, 46137344, 47185920, 48234496, 49283072, 50331648, 51380224, 52428800, 53477376, 54525952, 55574528, 56623104, 57671680, 58720256, 59768832, 60817408, 61865984, 62914560, 63963136, 65011712, 66060288, 67108864]
+  Phase split inside each (file,bin,sub-size,intent): Consec ⊂ Seq; remainder Random
+  Random placement: descending 128 MiB chunk RR; pre_seek_eof=1 for random phases
+  Rebalancer: in-bin only for S/M; preserves op counts; L moves within the 11–64 MiB ladder per intent; presence floors.
+  RW-switches: planner interleaves segments on eligible RW paths when pct_rw_switches>0
+  Shared vs Unique: file counts from pct_shared_files/pct_unique_files; byte targets from pct_bytes_* (enforced via flags)
+
+=== CAPACITY → BYTES & INTENT TARGETS ===
+  cap_total_gib=1.00 → IO bytes target=64.00 GiB
+  intent bytes target: read=1.00 write=0.00
+  realized after rebalance: read=64.02 GiB write=265.58 KiB
+
+=== INTENT FRACTION RECONCILE (fraction-first) ===
+  requested fractions: read=1.00  write=0.00
+  realized bytes: read=64.02 GiB write=265.58 KiB
+  realized fractions: read=1.0000  write=0.0000
+  produced_total=64.02 GiB  target_total=64.00 GiB  Δ_total=+16.26 MiB
+  L ladder choices (MiB): [11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64]
+  L min adjacent step: 1.00 MiB
+  method: intent bytes rebalanced in S/M (ops-preserving),
+          then L-size nudges per intent (ops preserved) to satisfy requested split,
+          followed by a small S/M fair pass to polish residuals.
+
+=== ROLE & SHARED/UNIQUE BYTE TARGETS ===
+  role byte targets (fractions):
+    RO=1.0  RW=0.0  WO=0.0
+  realized bytes after rebalance:
+    RO=64.02 GiB  RW=0.00 B  WO=265.58 KiB
+  shared/unique byte targets (fractions):
+    shared=1.0  unique=0.0
+  realized bytes after rebalance:
+    shared=64.02 GiB  unique=0.00 B
+
+=== FILE LAYOUT & TRUNCATE SIZES ===
+  RO=2  RW=0  WO=1 | shared_files≈3 unique_files≈0
+    RO [shared] /Users/user/dirlab/repos/io_synthesizer/outputs/audit_top25_after_fix_v8_round_rank2_verif/top10_252/payload/data/ro/ro_0.dat -> truncate 255.88 GiB
+    RO [shared] /Users/user/dirlab/repos/io_synthesizer/outputs/audit_top25_after_fix_v8_round_rank2_verif/top10_252/payload/data/ro/ro_1.dat -> truncate 255.88 GiB
+    WO [shared] /Users/user/dirlab/repos/io_synthesizer/outputs/audit_top25_after_fix_v8_round_rank2_verif/top10_252/payload/data/wo/wo_0.dat -> truncate 265.88 KiB
+
+=== OPS BUDGET (BEFORE META) ===
+  Nio=6113  |  Nr=4094  |  Nw=2019
+
+=== ZERO-FRACTION POLICY (ops vs bytes) ===
+  requested fractions: READ(op=0.6700, bytes=1.0000)  |  WRITE(op=0.3300, bytes=0.0000)
+  READ mode:  normal
+  WRITE mode: BYTES≈0, OPS>0 (many, tiny ops)
+
+=== ALIGNMENT TARGETING (FILE vs Darshan File-Alignment) ===
+  Requested pct_file_not_aligned=0.33
+  fs_align_bytes=4096  (mem_align_bytes=8)
+  Intrinsic file-unaligned ops (xfer % fs_align != 0): 2014 of 6110  (floor=0.3296)
+  Eligible ops (xfer % fs_align == 0): 4096
+  Predicted overall file-unaligned fraction: ~0.5508
+  Distribution of extra unaligned: split equally across eligible S/M/L bins; proportional within-bin by ops.
+
+=== RW SWITCHES ===
+  pct_rw_switches=0.00 → planner interleaves ≤64-op segments on same RW paths; harness simply executes rows.
+
+=== META OPS MAPPING ===
+  pct_io_access=0.17
+  meta_kind_count ≈ (pct_meta_kind_access / pct_io_access) * (Nr+Nw)
+  planned: open=17980, stat=0, seek=11866, sync=0
+  Data phases use pread/pwrite only; META-only phase performs POSIX open/stat/seek/sync.
+  META scope = shared if nprocs>1 else unique; counts in plan are GLOBAL; harness shards evenly per rank when shared.
+  Shared-file targeting accounts for META when shared: (shared_data + 1) / (data + 1) ≈ pct_shared_files.
+
+=== ASSUMPTIONS & INVARIANTS ===
+  • Rebalancer: in-bin only, op-preserving, presence floors. L bin uses a bounded ladder 11-64 MiB with 1 MiB increment to auto up/down-tune per intent (read/write) before the fair in-bin nudger; S/M adjust only within their fixed ladders. Keeps 10M+ constraints intact.
+  • Presence floors: any (file,bin,sub-size) that existed pre-rebalance keeps ≥1 op.
+  • Prep truncate safeguard: if a requested sparse size exceeds filesystem limits, prep falls back to smaller tiers (16/8/4/2/1 TiB, then 512 GiB) to avoid aborting the run.
+  • With nprocs==1, Darshan cannot classify shared files; planner forces shared count to 0.

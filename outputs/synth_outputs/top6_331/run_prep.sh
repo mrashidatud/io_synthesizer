@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+set -euo pipefail
+mkdir -p /Users/user/dirlab/repos/io_synthesizer/outputs/audit_top25_after_fix_v8_round_rank2_verif/top6_331/payload/data/ro /Users/user/dirlab/repos/io_synthesizer/outputs/audit_top25_after_fix_v8_round_rank2_verif/top6_331/payload/data/rw /Users/user/dirlab/repos/io_synthesizer/outputs/audit_top25_after_fix_v8_round_rank2_verif/top6_331/payload/data/wo /Users/user/dirlab/repos/io_synthesizer/outputs/audit_top25_after_fix_v8_round_rank2_verif/top6_331/payload/meta
+truncate_with_fallback() {
+  local path="$1"
+  local requested="$2"
+  local applied=""
+  local attempts=("$requested" 17592186044415 8796093022207 4398046511103 2199023255551 1099511627775 549755813887)
+  for s in "${attempts[@]}"; do
+    [[ "$s" -le 0 ]] && continue
+    if truncate -s "$s" "$path" 2>/dev/null; then
+      applied="$s"
+      break
+    fi
+  done
+  if [[ -z "$applied" ]]; then
+    echo "ERROR: truncate failed for $path (requested=$requested)" >&2
+    return 1
+  fi
+  if [[ "$applied" != "$requested" ]]; then
+    echo "WARN: truncate fallback for $path (requested=$requested applied=$applied)" >&2
+  fi
+}
+truncate_with_fallback '/Users/user/dirlab/repos/io_synthesizer/outputs/audit_top25_after_fix_v8_round_rank2_verif/top6_331/payload/data/ro/ro_0.dat' 244437548
+truncate_with_fallback '/Users/user/dirlab/repos/io_synthesizer/outputs/audit_top25_after_fix_v8_round_rank2_verif/top6_331/payload/data/ro/ro_1.dat' 244436524
+truncate_with_fallback '/Users/user/dirlab/repos/io_synthesizer/outputs/audit_top25_after_fix_v8_round_rank2_verif/top6_331/payload/data/ro/ro_2.dat' 244436424
+truncate_with_fallback '/Users/user/dirlab/repos/io_synthesizer/outputs/audit_top25_after_fix_v8_round_rank2_verif/top6_331/payload/data/ro/ro_3.dat' 244436424
+truncate_with_fallback '/Users/user/dirlab/repos/io_synthesizer/outputs/audit_top25_after_fix_v8_round_rank2_verif/top6_331/payload/data/ro/ro_4.dat' 244436424
+truncate_with_fallback '/Users/user/dirlab/repos/io_synthesizer/outputs/audit_top25_after_fix_v8_round_rank2_verif/top6_331/payload/data/ro/ro_5.dat' 244436424
+truncate_with_fallback '/Users/user/dirlab/repos/io_synthesizer/outputs/audit_top25_after_fix_v8_round_rank2_verif/top6_331/payload/data/ro/ro_6.dat' 244436424
+truncate_with_fallback '/Users/user/dirlab/repos/io_synthesizer/outputs/audit_top25_after_fix_v8_round_rank2_verif/top6_331/payload/data/ro/ro_7.dat' 244436424
+truncate_with_fallback '/Users/user/dirlab/repos/io_synthesizer/outputs/audit_top25_after_fix_v8_round_rank2_verif/top6_331/payload/data/ro/ro_8.dat' 244436424
+truncate_with_fallback '/Users/user/dirlab/repos/io_synthesizer/outputs/audit_top25_after_fix_v8_round_rank2_verif/top6_331/payload/data/rw/rw_0.dat' 31406948352
+truncate_with_fallback '/Users/user/dirlab/repos/io_synthesizer/outputs/audit_top25_after_fix_v8_round_rank2_verif/top6_331/payload/data/wo/wo_0.dat' 4563402752
+truncate_with_fallback '/Users/user/dirlab/repos/io_synthesizer/outputs/audit_top25_after_fix_v8_round_rank2_verif/top6_331/payload/data/wo/wo_1.dat' 4429185024
+truncate_with_fallback '/Users/user/dirlab/repos/io_synthesizer/outputs/audit_top25_after_fix_v8_round_rank2_verif/top6_331/payload/data/wo/wo_2.dat' 4429185024
+truncate_with_fallback '/Users/user/dirlab/repos/io_synthesizer/outputs/audit_top25_after_fix_v8_round_rank2_verif/top6_331/payload/data/wo/wo_3.dat' 4429185024
+truncate_with_fallback '/Users/user/dirlab/repos/io_synthesizer/outputs/audit_top25_after_fix_v8_round_rank2_verif/top6_331/payload/data/wo/wo_4.dat' 4429185024
+truncate_with_fallback '/Users/user/dirlab/repos/io_synthesizer/outputs/audit_top25_after_fix_v8_round_rank2_verif/top6_331/payload/data/wo/wo_5.dat' 4429185024
+truncate_with_fallback '/Users/user/dirlab/repos/io_synthesizer/outputs/audit_top25_after_fix_v8_round_rank2_verif/top6_331/payload/data/wo/wo_6.dat' 4429185024
+truncate -s 0 '/Users/user/dirlab/repos/io_synthesizer/outputs/audit_top25_after_fix_v8_round_rank2_verif/top6_331/payload/meta/meta_only.dat'
