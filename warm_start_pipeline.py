@@ -192,6 +192,29 @@ def append_csv(path: Path, row: Dict[str, object], fieldnames: Iterable[str]) ->
         w.writerow(row)
 
 
+def read_iteration_observation_index(iter_csv: Path) -> tuple[set[tuple[str, str]], set[str]]:
+    cfg_keys: set[tuple[str, str]] = set()
+    analysis_dirs: set[str] = set()
+    if not iter_csv.exists():
+        return cfg_keys, analysis_dirs
+    with iter_csv.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            cfg_idx = (row.get("config_index") or "").strip()
+            cfg_id = (row.get("config_id") or "").strip()
+            if cfg_idx and cfg_id:
+                cfg_keys.add((cfg_idx, cfg_id))
+            adir_raw = (row.get("analysis_dir") or "").strip()
+            if adir_raw:
+                adir = Path(adir_raw)
+                analysis_dirs.add(str(adir))
+                try:
+                    analysis_dirs.add(str(adir.resolve()))
+                except Exception:
+                    pass
+    return cfg_keys, analysis_dirs
+
+
 def build_warm_start_configs(recommender_config: Path, warm_target_override: str, seed_override: str) -> list[dict]:
     cfg = yaml.safe_load(recommender_config.read_text(encoding="utf-8"))
     specs = parse_specs(cfg)
@@ -236,7 +259,7 @@ def main() -> None:
     warm_target_override = opts.get("warm_start_target", "")
     seed_override = opts.get("seed", "")
 
-    metric_key = opts.get("metric_key", "POSIX_agg_perf_by_slowest") or "POSIX_agg_perf_by_slowest"
+    metric_key = opts.get("metric_key", "agg_perf_by_slowest") or "agg_perf_by_slowest"
     bin_dir = Path(opts.get("bin_dir", "/mnt/hasanfs/bin"))
 
     print(f"{ts()}  Warm-start workflow starting")
@@ -319,12 +342,26 @@ def main() -> None:
             iter_dir = workload_dir / f"iter_{it:02d}"
             iter_dir.mkdir(parents=True, exist_ok=True)
             iter_csv = iter_dir / "observations.csv"
+            logged_cfg_keys, logged_analysis_dirs = read_iteration_observation_index(iter_csv)
 
             print(f"{ts()}  ---- iteration {it}/{iterations}")
             for cfg_idx, cfg_entry in enumerate(warm_configs):
                 cfg = cfg_entry["params"]
                 cfg_id = cfg_entry["config_id"]
                 cfg_dir = iter_dir / f"cfg_{cfg_idx:03d}_{cfg_id}"
+                cfg_key = (str(cfg_idx), cfg_id)
+                cfg_dir_s = str(cfg_dir)
+                cfg_dir_resolved = str(cfg_dir.resolve())
+
+                if cfg_key in logged_cfg_keys or cfg_dir_s in logged_analysis_dirs or cfg_dir_resolved in logged_analysis_dirs:
+                    print(f"{ts()}  SKIP existing iteration={it} cfg={cfg_idx:03d} ({cfg_id})")
+                    continue
+
+                if cfg_dir.exists():
+                    print(
+                        f"{ts()}  Removing stale cfg dir without logged observation: {cfg_dir}"
+                    )
+                    shutil.rmtree(cfg_dir)
                 cfg_dir.mkdir(parents=True, exist_ok=True)
 
                 darshan_path = cfg_dir / f"{wkey}__{cfg_id}.darshan"
@@ -377,6 +414,9 @@ def main() -> None:
                 append_csv(iter_csv, row, fieldnames)
                 append_csv(workload_csv, row, fieldnames)
                 append_csv(global_csv, row, fieldnames)
+                logged_cfg_keys.add(cfg_key)
+                logged_analysis_dirs.add(cfg_dir_s)
+                logged_analysis_dirs.add(cfg_dir_resolved)
 
     print(f"{ts()}  Warm-start workflow complete")
     print(f"{ts()}  Global observations: {global_csv}")

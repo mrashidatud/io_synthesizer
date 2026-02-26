@@ -1,11 +1,11 @@
 option,value
-cap,512
+cap,128
 nprocs,
-nprocs_cap,64
+nprocs_cap,2
 inputs,/mnt/hasanfs/io_synthesizer/inputs/exemplar_jsons
 force_build,0
 delete_darshan,1
-filters,1-4
+filters,1
 iterations,3
 io_api,posix
 meta_api,posix
@@ -14,7 +14,7 @@ flush_wait_sec,10
 use_sudo_lustre,0
 output_root,/mnt/hasanfs/samples/warm-start
 recommender_config,/mnt/hasanfs/io_synthesizer/io_recommender/config.yaml
-warm_start_target,45
+warm_start_target,60
 seed,7
-metric_key,POSIX_agg_perf_by_slowest
+metric_key,agg_perf_by_slowest
 bin_dir,/mnt/hasanfs/bin
