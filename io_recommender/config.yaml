@@ -65,6 +65,7 @@ runner:
   io_api: posix
   meta_api: posix
   mpi_collective_mode: none
+  meta_scope: separate   # separate | data_files
   nprocs_cap: 64
   metric_key: POSIX_agg_perf_by_slowest
   metric_fallback: bytes_over_f_time

@@ -28,8 +28,10 @@ from warm_start_pipeline import (
     apply_lustre_knobs,
     collect_workload_jsons,
     ensure_mpi_binary,
+    load_manifest_meta_scope,
     load_nprocs_from_json,
     parse_bool,
+    parse_meta_scope,
     parse_options_csv,
     read_iteration_observation_index,
     run_cmd,
@@ -260,6 +262,7 @@ def main() -> None:
     io_api = opts.get("io_api", str(runner_cfg.get("io_api", "posix"))) or "posix"
     meta_api = opts.get("meta_api", str(runner_cfg.get("meta_api", "posix"))) or "posix"
     coll = opts.get("mpi_collective_mode", str(runner_cfg.get("mpi_collective_mode", "none"))) or "none"
+    meta_scope = parse_meta_scope(opts.get("meta_scope", runner_cfg.get("meta_scope", "separate")))
     flush_wait_sec = float(opts.get("flush_wait_sec", str(runner_cfg.get("flush_wait_sec", 10.0))) or str(runner_cfg.get("flush_wait_sec", 10.0)))
     use_sudo_lustre = parse_bool(opts.get("use_sudo_lustre"), default=bool(runner_cfg.get("use_sudo_for_lustre", False)))
     force_build = parse_bool(opts.get("force_build"), default=False)
@@ -331,8 +334,16 @@ def main() -> None:
         workload_dir.mkdir(parents=True, exist_ok=True)
         run_sh = workload_dir / "run_from_features.sh"
         plan_csv = workload_dir / "payload" / "plan.csv"
+        plan_exists = run_sh.exists() and plan_csv.exists()
+        existing_meta_scope = load_manifest_meta_scope(workload_dir)
+        regenerate_for_meta_scope = plan_exists and existing_meta_scope != meta_scope
 
-        if not run_sh.exists() or not plan_csv.exists():
+        if not plan_exists or regenerate_for_meta_scope:
+            if regenerate_for_meta_scope:
+                print(
+                    f"{ts()}  Regenerating plan for {wkey} due to meta_scope change: "
+                    f"{existing_meta_scope} -> {meta_scope}"
+                )
             cmd = [
                 "python3",
                 str(root / "scripts" / "features2synth_opsaware.py"),
@@ -346,6 +357,8 @@ def main() -> None:
                 meta_api,
                 "--mpi-collective-mode",
                 coll,
+                "--meta-scope",
+                meta_scope,
                 "--nprocs",
                 str(desired_nprocs),
                 "--outdir",
@@ -354,6 +367,19 @@ def main() -> None:
             run_cmd(cmd, cwd=root)
         else:
             print(f"{ts()}  Reusing existing plan/scripts for {wkey}")
+
+        workload_manifest = {
+            "workload_key": wkey,
+            "workload_json": str(workload_json),
+            "workload_dir": str(workload_dir),
+            "nprocs": desired_nprocs,
+            "cap_total_gib": cap_total_gib,
+            "io_api": io_api,
+            "meta_api": meta_api,
+            "mpi_collective_mode": coll,
+            "meta_scope": meta_scope,
+        }
+        (workload_dir / "workload_manifest.json").write_text(json.dumps(workload_manifest, indent=2), encoding="utf-8")
 
         contexts[pattern_id] = WorkloadContext(
             pattern_id=pattern_id,

@@ -51,6 +51,7 @@ class RealSynthRunner:
     io_api: str = "posix"
     meta_api: str = "posix"
     mpi_collective_mode: str = "none"
+    meta_scope: str = "separate"
     nprocs_cap: int = 64
     metric_key: str = "POSIX_agg_perf_by_slowest"
     metric_fallback: str = "bytes_over_f_time"
@@ -67,6 +68,9 @@ class RealSynthRunner:
         self.io_synth_root = Path(self.io_synth_root)
         self.input_dir = Path(self.input_dir)
         self.out_root = Path(self.out_root)
+        self.meta_scope = str(self.meta_scope).strip().lower() or "separate"
+        if self.meta_scope not in {"separate", "data_files"}:
+            raise ValueError(f"Unsupported runner meta_scope='{self.meta_scope}'")
         self._discover_pattern_files()
 
     def _discover_pattern_files(self) -> None:
@@ -118,6 +122,8 @@ class RealSynthRunner:
             self.meta_api,
             "--mpi-collective-mode",
             self.mpi_collective_mode,
+            "--meta-scope",
+            self.meta_scope,
             "--nprocs",
             str(desired_nprocs),
         ]
@@ -165,12 +171,9 @@ class RealSynthRunner:
             _run(self._cmd_lfs_setstripe(config["stripe_count"], config["stripe_size"], t))
 
         osc_pages = int(config.get("osc_max_pages_per_rpc", config.get("max_pages_per_rpc", 1)))
-        mdc_pages_raw = int(config.get("mdc_max_pages_per_rpc", osc_pages))
+        mdc_pages = int(config.get("mdc_max_pages_per_rpc", osc_pages))
         osc_rpcs = int(config.get("osc_max_rpcs_in_flight", config.get("max_rpcs_in_flight", 1)))
-        mdc_rpcs_raw = int(config.get("mdc_max_rpcs_in_flight", osc_rpcs))
-
-        mdc_pages = max(1, min(1024, mdc_pages_raw))
-        mdc_rpcs = max(2, min(512, mdc_rpcs_raw))
+        mdc_rpcs = int(config.get("mdc_max_rpcs_in_flight", osc_rpcs))
 
         _run(self._cmd_lctl_set_param("osc", "max_pages_per_rpc", osc_pages))
         _run(self._cmd_lctl_set_param("osc", "max_rpcs_in_flight", osc_rpcs))

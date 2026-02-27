@@ -9,6 +9,7 @@ filters,1-4
 io_api,posix
 meta_api,posix
 mpi_collective_mode,none
+meta_scope,separate
 flush_wait_sec,10
 use_sudo_lustre,0
 warm_start_root,/mnt/hasanfs/samples/warm-start

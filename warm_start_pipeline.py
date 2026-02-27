@@ -34,6 +34,14 @@ def parse_bool(v: str | None, default: bool = False) -> bool:
     return default
 
 
+def parse_meta_scope(v: object, default: str = "separate") -> str:
+    raw = str(v).strip().lower() if v is not None else default
+    scope = raw or default
+    if scope not in {"separate", "data_files"}:
+        raise ValueError(f"Invalid meta_scope '{v}'. Expected one of: separate, data_files")
+    return scope
+
+
 def parse_options_csv(path: Path) -> Dict[str, str]:
     out: Dict[str, str] = {}
     with path.open("r", encoding="utf-8") as f:
@@ -144,17 +152,9 @@ def apply_lustre_knobs(workload_dir: Path, cfg: Dict[str, object], use_sudo: boo
         run_cmd(prefix + ["lfs", "setstripe", "-c", str(stripe_count), "-S", stripe_size, str(t)])
 
     osc_pages = int(cfg.get("osc_max_pages_per_rpc", cfg.get("max_pages_per_rpc", 1)))
-    mdc_pages_raw = int(cfg.get("mdc_max_pages_per_rpc", osc_pages))
+    mdc_pages = int(cfg.get("mdc_max_pages_per_rpc", osc_pages))
     osc_rpcs = int(cfg.get("osc_max_rpcs_in_flight", cfg.get("max_rpcs_in_flight", 1)))
-    mdc_rpcs_raw = int(cfg.get("mdc_max_rpcs_in_flight", osc_rpcs))
-
-    mdc_pages = max(1, min(1024, mdc_pages_raw))
-    mdc_rpcs = max(2, min(512, mdc_rpcs_raw))
-    if mdc_rpcs != mdc_rpcs_raw:
-        print(
-            f"{ts()}  NOTE: mdc.max_rpcs_in_flight adjusted from {mdc_rpcs_raw} to {mdc_rpcs} "
-            "to satisfy MDC range [2,512]"
-        )
+    mdc_rpcs = int(cfg.get("mdc_max_rpcs_in_flight", osc_rpcs))
 
     run_cmd(prefix + ["lctl", "set_param", f"osc.*.max_pages_per_rpc={osc_pages}"])
     run_cmd(prefix + ["lctl", "set_param", f"osc.*.max_rpcs_in_flight={osc_rpcs}"])
@@ -215,6 +215,20 @@ def read_iteration_observation_index(iter_csv: Path) -> tuple[set[tuple[str, str
     return cfg_keys, analysis_dirs
 
 
+def load_manifest_meta_scope(workload_dir: Path) -> str:
+    manifest_path = workload_dir / "workload_manifest.json"
+    if not manifest_path.exists():
+        return "separate"
+    try:
+        obj = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception:
+        return "separate"
+    try:
+        return parse_meta_scope(obj.get("meta_scope", "separate"))
+    except Exception:
+        return "separate"
+
+
 def build_warm_start_configs(recommender_config: Path, warm_target_override: str, seed_override: str) -> list[dict]:
     cfg = yaml.safe_load(recommender_config.read_text(encoding="utf-8"))
     specs = parse_specs(cfg)
@@ -251,6 +265,7 @@ def main() -> None:
     io_api = opts.get("io_api", "posix") or "posix"
     meta_api = opts.get("meta_api", "posix") or "posix"
     coll = opts.get("mpi_collective_mode", "none") or "none"
+    meta_scope = parse_meta_scope(opts.get("meta_scope", "separate"))
     flush_wait_sec = float(opts.get("flush_wait_sec", "10") or "10")
     use_sudo_lustre = parse_bool(opts.get("use_sudo_lustre"), default=False)
 
@@ -297,8 +312,16 @@ def main() -> None:
 
         run_sh = workload_dir / "run_from_features.sh"
         plan_csv = workload_dir / "payload" / "plan.csv"
+        existing_meta_scope = load_manifest_meta_scope(workload_dir)
+        plan_exists = run_sh.exists() and plan_csv.exists()
+        regenerate_for_meta_scope = plan_exists and existing_meta_scope != meta_scope
 
-        if not run_sh.exists() or not plan_csv.exists():
+        if not plan_exists or regenerate_for_meta_scope:
+            if regenerate_for_meta_scope:
+                print(
+                    f"{ts()}  Regenerating plan for {wkey} due to meta_scope change: "
+                    f"{existing_meta_scope} -> {meta_scope}"
+                )
             cmd = [
                 "python3",
                 str(root / "scripts" / "features2synth_opsaware.py"),
@@ -312,6 +335,8 @@ def main() -> None:
                 meta_api,
                 "--mpi-collective-mode",
                 coll,
+                "--meta-scope",
+                meta_scope,
                 "--nprocs",
                 str(desired_nprocs),
                 "--outdir",
@@ -330,6 +355,7 @@ def main() -> None:
             "io_api": io_api,
             "meta_api": meta_api,
             "mpi_collective_mode": coll,
+            "meta_scope": meta_scope,
             "iterations": iterations,
             "warm_configs": len(warm_configs),
         }

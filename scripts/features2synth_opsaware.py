@@ -262,6 +262,38 @@ def allocate_counts_for_total(fracs, total):
             out[i] += 1
     return out
 
+
+def allocate_weighted_total(total, paths, weights=None):
+    """Allocate integer counts summing to total across paths using optional non-negative weights."""
+    paths = list(paths or [])
+    if total <= 0 or not paths:
+        return {p: 0 for p in paths}
+
+    # Stable ordering for deterministic plans.
+    paths = sorted(paths)
+    if weights is None:
+        weights = {}
+
+    w = [max(0.0, float(weights.get(p, 0.0))) for p in paths]
+    s = sum(w)
+    if s <= 0.0:
+        base = total // len(paths)
+        rem = total % len(paths)
+        return {p: base + (1 if i < rem else 0) for i, p in enumerate(paths)}
+
+    raw = [(wi / s) * total for wi in w]
+    out = [int(math.floor(x)) for x in raw]
+    rem = total - sum(out)
+    if rem > 0:
+        order = sorted(
+            range(len(paths)),
+            key=lambda i: (raw[i] - out[i], w[i], paths[i]),
+            reverse=True,
+        )
+        for i in order[:rem]:
+            out[i] += 1
+    return {p: out[i] for i, p in enumerate(paths)}
+
 def split_uniform(n, k):
     if k<=0: return []
     base = n//k; rem = n%k
@@ -1611,6 +1643,10 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
     if wo_f > 0 and n_wo == 0: n_wo = 1
     if n_ro + n_rw + n_wo == 0: n_ro = 1
 
+    meta_scope = str(feats.get("_meta_scope", feats.get("meta_scope", "separate"))).strip().lower()
+    if meta_scope not in {"separate", "data_files"}:
+        raise ValueError(f"Unsupported meta_scope='{meta_scope}'. Use 'separate' or 'data_files'.")
+
     # Scale data-file count to reduce coarse quantization of file-type features.
     p_shared = clamp01(feats.get("pct_shared_files", 0.0))
     p_bytes_sh = clamp01(feats.get("pct_bytes_shared_files", 0.0))
@@ -1651,31 +1687,43 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
     read_file_w  = make_file_weights_for_intent(feats, ro_paths, rw_paths, wo_paths, "read")
     write_file_w = make_file_weights_for_intent(feats, ro_paths, rw_paths, wo_paths, "write")
 
-    # Shared file-count target (jointly choose whether META is shared).
+    # Shared file-count target.
+    # In 'separate' mode, include META file in shared-count fit.
+    # In 'data_files' mode, META rows are attached to data files (no +1 file adjustment).
     N_data = len(data_paths)
     if nprocs <= 1:
         meta_is_shared = False
         N_shared_data = 0
     else:
-        candidates = []
-        for m in (0, 1):  # m=1 -> meta shared
-            K = int(round(p_shared * (N_data + 1) - m))
-            K = max(0, min(N_data, K))
+        if meta_scope == "separate":
+            candidates = []
+            for m in (0, 1):  # m=1 -> meta shared
+                K = int(round(p_shared * (N_data + 1) - m))
+                K = max(0, min(N_data, K))
 
-            # Keep at least one file in each class when byte fractions request both.
+                # Keep at least one file in each class when byte fractions request both.
+                if p_bytes_sh > 0.0 and K <= 0 and N_data > 0:
+                    K = 1
+                if p_bytes_uq > 0.0 and K >= N_data and N_data > 1:
+                    K = N_data - 1
+
+                frac = (K + m) / float(max(1, N_data + 1))
+                err = abs(frac - p_shared)
+                candidates.append((err, m, K))
+
+            candidates.sort(key=lambda t: t[0])
+            _, m_best, K_best = candidates[0]
+            meta_is_shared = bool(m_best)
+            N_shared_data = K_best
+        else:
+            K = int(round(p_shared * N_data))
+            K = max(0, min(N_data, K))
             if p_bytes_sh > 0.0 and K <= 0 and N_data > 0:
                 K = 1
             if p_bytes_uq > 0.0 and K >= N_data and N_data > 1:
                 K = N_data - 1
-
-            frac = (K + m) / float(max(1, N_data + 1))
-            err = abs(frac - p_shared)
-            candidates.append((err, m, K))
-
-        candidates.sort(key=lambda t: t[0])
-        _, m_best, K_best = candidates[0]
-        meta_is_shared = bool(m_best)
-        N_shared_data = K_best
+            meta_is_shared = False
+            N_shared_data = K
 
     meta_flag = "meta_only|shared|" if meta_is_shared else "meta_only|unique|"
 
@@ -2358,15 +2406,55 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
     m_seek = int(round(meta_total_target * k_fracs[2]))
     m_sync = int(round(meta_total_target * k_fracs[3]))
 
-    # emit one META row using these finalized counts
+    # Emit META rows.
+    # - separate: legacy single-row on meta_only.dat
+    # - data_files: distribute global counts across existing data-file paths
     seed = 777
-    meta_row = ["meta", str(META_DIR / "meta_only.dat"), "0","1","0","0","0","0","0","0",
+    if meta_scope == "separate":
+        meta_row = [
+            "meta", str(META_DIR / "meta_only.dat"), "0", "1", "0", "0", "0", "0", "0", "0",
+            f"{clamp01(p_file_ua_req):.6f}", f"{p_mem_ua:.6f}",
+            "0.0",
+            str(m_open), str(m_stat), str(m_seek), str(m_sync),
+            str(seed), meta_flag,
+            "0.0", "0.0", "0.0", "0", "0",
+        ]
+        lines.append(",".join(meta_row))
+    else:
+        # Build deterministic weights for distributing metadata counts.
+        all_meta_paths = sorted(data_paths)
+        seek_meta_paths = sorted(ro_paths + rw_paths) or all_meta_paths
+        sync_meta_paths = sorted(rw_paths + wo_paths) or all_meta_paths
+
+        combined_weights = {
+            p: max(0.0, float(read_file_w.get(p, 0.0))) + max(0.0, float(write_file_w.get(p, 0.0)))
+            for p in all_meta_paths
+        }
+        seek_weights = {p: max(0.0, float(read_file_w.get(p, 0.0))) for p in seek_meta_paths}
+        sync_weights = {p: max(0.0, float(write_file_w.get(p, 0.0))) for p in sync_meta_paths}
+
+        open_by_path = allocate_weighted_total(m_open, all_meta_paths, combined_weights)
+        stat_by_path = allocate_weighted_total(m_stat, all_meta_paths, combined_weights)
+        seek_by_path = allocate_weighted_total(m_seek, seek_meta_paths, seek_weights)
+        sync_by_path = allocate_weighted_total(m_sync, sync_meta_paths, sync_weights)
+
+        for pth in all_meta_paths:
+            open_cnt = int(open_by_path.get(pth, 0))
+            stat_cnt = int(stat_by_path.get(pth, 0))
+            seek_cnt = int(seek_by_path.get(pth, 0))
+            sync_cnt = int(sync_by_path.get(pth, 0))
+            if (open_cnt + stat_cnt + seek_cnt + sync_cnt) <= 0:
+                continue
+            row_flag = "meta_only" + path_flags.get(pth, "|unique|")
+            meta_row = [
+                "meta", pth, "0", "1", "0", "0", "0", "0", "0", "0",
                 f"{clamp01(p_file_ua_req):.6f}", f"{p_mem_ua:.6f}",
                 "0.0",
-                str(m_open), str(m_stat), str(m_seek), str(m_sync),
-                str(seed), meta_flag,
-                "0.0","0.0","0.0","0","0"]
-    lines.append(",".join(meta_row))
+                str(open_cnt), str(stat_cnt), str(seek_cnt), str(sync_cnt),
+                str(seed), row_flag,
+                "0.0", "0.0", "0.0", "0", "0",
+            ]
+            lines.append(",".join(meta_row))
 
     # ---------- File sizing (truncate) ----------
     from collections import defaultdict
@@ -2468,7 +2556,8 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
         f.write("}\n")
         for path, size in sorted(per_file_span.items()):
             f.write(f"truncate_with_fallback '{path}' {size}\n")
-        f.write(f"truncate -s 0 '{META_DIR / 'meta_only.dat'}'\n")
+        if meta_scope == "separate":
+            f.write(f"truncate -s 0 '{META_DIR / 'meta_only.dat'}'\n")
     os.chmod(PREP, 0o755)
 
     # ---------- Runner (EXACT paths; run prep first) ----------
@@ -2530,6 +2619,7 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
         f.write("  Random placement: descending 128 MiB chunk RR; pre_seek_eof=1 for random phases\n")
         f.write("  Rebalancer: in-bin only for S/M; preserves op counts; L moves within the 11–64 MiB ladder per intent; presence floors.\n")
         f.write("  RW-switches: planner interleaves segments on eligible RW paths when pct_rw_switches>0\n")
+        f.write(f"  META scope: {meta_scope}\n")
         f.write("  Shared vs Unique: file counts from pct_shared_files/pct_unique_files; byte targets from pct_bytes_* (enforced via flags)\n\n")
 
         # Capacity to bytes & intent bytes target
@@ -2633,9 +2723,14 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
         f.write(f"  pct_io_access={clamp01(feats.get('pct_io_access',0.18)):.2f}\n")
         f.write("  meta_kind_count ≈ (pct_meta_kind_access / pct_io_access) * (Nr+Nw)\n")
         f.write(f"  planned: open={m_open}, stat={m_stat}, seek={m_seek}, sync={m_sync}\n")
-        f.write("  Data phases use pread/pwrite only; META-only phase performs POSIX open/stat/seek/sync.\n")
-        f.write("  META scope = shared if nprocs>1 else unique; counts in plan are GLOBAL; harness shards evenly per rank when shared.\n")
-        f.write("  Shared-file targeting accounts for META when shared: (shared_data + 1) / (data + 1) ≈ pct_shared_files.\n\n")
+        if meta_scope == "separate":
+            f.write("  Data phases use pread/pwrite only; META-only phase performs POSIX open/stat/seek/sync.\n")
+            f.write("  META scope = shared if nprocs>1 else unique; counts in plan are GLOBAL; harness shards evenly per rank when shared.\n")
+            f.write("  Shared-file targeting accounts for META when shared: (shared_data + 1) / (data + 1) ≈ pct_shared_files.\n\n")
+        else:
+            f.write("  Data phases use pread/pwrite only; META phases are attached to existing data-file paths.\n")
+            f.write("  Each META row inherits its path's |shared|/|unique| flag; counts are GLOBAL per row and shared rows are sharded by rank.\n")
+            f.write("  Shared-file targeting is based on data files only (no dedicated META file adjustment).\n\n")
 
         # Assumptions & invariants
         f.write("=== ASSUMPTIONS & INVARIANTS ===\n")
@@ -2658,6 +2753,12 @@ def main():
     ap.add_argument("--io-api", choices=["posix","mpiio"], default=None, help="Override io_api")
     ap.add_argument("--meta-api", choices=["posix"], default=None, help="Override meta_api")
     ap.add_argument("--mpi-collective-mode", choices=["none","independent","collective"], default=None, help="Override mpi_collective_mode")
+    ap.add_argument(
+        "--meta-scope",
+        choices=["separate", "data_files"],
+        default=None,
+        help="Where to apply metadata ops: legacy separate meta file, or existing data files",
+    )
     ap.add_argument("--out-root", default=None, help="Base output root. Final path is <out-root>/<json_base>/")
     ap.add_argument("--outdir", default=None, help="Exact output directory for this workload (overrides --out-root)")
 
@@ -2682,6 +2783,8 @@ def main():
         feats["meta_api"] = args.meta_api
     if args.mpi_collective_mode is not None:
         feats["mpi_collective_mode"] = args.mpi_collective_mode
+    if args.meta_scope is not None:
+        feats["_meta_scope"] = args.meta_scope
 
     # Keep align pref
     fs_align_bytes = int(feats.get("posix_file_alignment_bytes", args.fs_align))
