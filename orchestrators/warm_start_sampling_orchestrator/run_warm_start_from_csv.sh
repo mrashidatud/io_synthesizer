@@ -5,7 +5,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 OPTIONS_FILE="${1:-${SCRIPT_DIR}/warm_start_options.csv}"
-LOCAL_LOG_DIR="${LOCAL_LOG_DIR:-${REPO_ROOT}/logs}"
+LOCAL_LOG_DIR="${LOCAL_LOG_DIR:-/mnt/hasanfs/samples/warm-start/logs}"
 WARM_SCRIPT="${SCRIPT_DIR}/warm_start_pipeline.py"
 
 if [[ ! -f "${OPTIONS_FILE}" ]]; then
