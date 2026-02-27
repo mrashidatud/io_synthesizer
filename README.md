@@ -59,6 +59,27 @@ The template includes:
 python -m io_recommender.run_pipeline --config io_recommender/config.yaml --output-dir artifacts
 ```
 
+### Workload Synthesizer Orchestrator
+
+Use the workload orchestrator to generate/run/analyze synthesized workloads from CSV options:
+
+```bash
+orchestrators/workload_synthesizer_orchestrator/run_pipeline_from_csv.sh \
+  orchestrators/workload_synthesizer_orchestrator/pipeline_options.csv
+```
+
+Direct Python entrypoint:
+
+```bash
+python3 orchestrators/workload_synthesizer_orchestrator/workload_synthesizer_pipeline.py \
+  --options-csv orchestrators/workload_synthesizer_orchestrator/pipeline_options.csv
+```
+
+Logging:
+- `run_pipeline_from_csv.sh` owns local logging.
+- `LOCAL_LOG_DIR` defaults to `/mnt/hasanfs/out_synth`.
+- log file pattern: `workload_synthesizer_<timestamp>.log`.
+
 ### Warm-Start Collection Workflow (Separated)
 
 Use the dedicated script for warm-start data collection:
@@ -68,7 +89,7 @@ python3 orchestrators/warm_start_sampling_orchestrator/warm_start_pipeline.py \
   --options-csv orchestrators/warm_start_sampling_orchestrator/warm_start_options.csv
 ```
 
-This workflow is separated from `pipeline.sh` and is designed for recommender warm-start sampling:
+This workflow is separate from the workload synthesizer orchestrator and is designed for recommender warm-start sampling:
 - plan generation once per workload
 - no re-generation of `plan.csv` / `run_prep.sh` / `run_from_features.sh` across iterations
 - run each workload for `iterations` (default `3`)
