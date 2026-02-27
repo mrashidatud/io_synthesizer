@@ -57,7 +57,8 @@ def parse_options_csv(path: Path) -> Dict[str, str]:
                 continue
             if not key:
                 continue
-            val = row[1].strip() if len(row) > 1 else ""
+            # Keep all trailing CSV segments in the value, mirroring shell read behavior.
+            val = ",".join(row[1:]).strip() if len(row) > 1 else ""
             out[key] = val
     return out
 
@@ -117,16 +118,37 @@ def load_nprocs_from_json(path: Path) -> int | None:
     return None
 
 
-def extract_darshan_logfile(run_sh: Path) -> Path | None:
-    pattern = re.compile(r"^export\s+DARSHAN_LOGFILE=['\"]([^'\"]+)['\"]")
+def resolve_darshan_export_value(raw: str, run_root: Path) -> Path | None:
+    s = raw.strip()
+    for p in (
+        re.compile(r"^\$\{[A-Za-z_][A-Za-z0-9_]*:-(.+)\}$"),
+        re.compile(r"^\$\{[A-Za-z_][A-Za-z0-9_]*-(.+)\}$"),
+    ):
+        m = p.match(s)
+        if m:
+            s = m.group(1).strip()
+            break
+
+    if "$" in s:
+        return None
+
+    path = Path(s)
+    if not path.is_absolute():
+        path = (run_root / path).resolve()
+    return path
+
+
+def extract_darshan_logfile(run_sh: Path) -> tuple[Path | None, str | None]:
+    pattern = re.compile(r"^export\s+DARSHAN_LOGFILE=(['\"])(.+)\1$")
     try:
         for line in run_sh.read_text(encoding="utf-8").splitlines():
             m = pattern.match(line.strip())
             if m:
-                return Path(m.group(1))
+                raw = m.group(2).strip()
+                return resolve_darshan_export_value(raw, run_sh.parent), raw
     except Exception:
-        return None
-    return None
+        return None, None
+    return None, None
 
 
 def cleanup_payload_subdirs(run_root: Path) -> None:
@@ -257,6 +279,7 @@ def main() -> None:
     if not workloads:
         print(f"{ts()}  No JSON inputs selected/found (INPUT_DIR={input_dir}).")
         return
+    print(f"{ts()}  Selected workloads: {len(workloads)}")
 
     print(f"{ts()}  === STEP 1..N: Plan, run, validate, analyze for each input ===")
     for workload_json in workloads:
@@ -314,7 +337,9 @@ def main() -> None:
             for p in run_root.glob("*.darshan"):
                 p.unlink(missing_ok=True)
 
-        expected = extract_darshan_logfile(run_sh)
+        expected, expected_raw = extract_darshan_logfile(run_sh)
+        if expected_raw and expected is None:
+            print(f"{ts()}  WARN: Could not fully resolve DARSHAN_LOGFILE export: {expected_raw}")
 
         if (not delete_darshan) and expected and expected.is_file():
             print(f"{ts()}  SKIP: Found existing Darshan artifact: {expected}")
@@ -331,11 +356,15 @@ def main() -> None:
             elif expected and not expected.is_file():
                 print(f"{ts()}  WARN: Expected Darshan not found: {expected}")
                 present = sorted(run_root.glob("*.darshan"))
-                if present:
-                    for p in present:
-                        print(f"{ts()}    Present: {p}")
-                cleanup_payload_subdirs(run_root)
-                continue
+                if len(present) == 1:
+                    expected = present[0]
+                    print(f"{ts()}  INFO: Using discovered Darshan file: {expected}")
+                else:
+                    if present:
+                        for p in present:
+                            print(f"{ts()}    Present: {p}")
+                    cleanup_payload_subdirs(run_root)
+                    continue
             else:
                 found = sorted(run_root.glob("*.darshan"))
                 if len(found) == 1:
