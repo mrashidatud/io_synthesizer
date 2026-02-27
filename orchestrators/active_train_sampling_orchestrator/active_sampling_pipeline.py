@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import statistics
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,6 +15,12 @@ from typing import Dict, List, Mapping, Sequence
 
 import numpy as np
 import yaml
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+WARM_ORCH_DIR = REPO_ROOT / "orchestrators" / "warm_start_sampling_orchestrator"
+for _p in (str(REPO_ROOT), str(WARM_ORCH_DIR)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 from io_recommender.active import ActiveLoopConfig
 from io_recommender.active.acquisition import select_hybrid
@@ -221,13 +228,15 @@ def _ndcg3_from_observed(obs: Sequence[Observation], oracle_best: Mapping[str, f
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Active-sampling orchestration using existing warm-start observations")
-    ap.add_argument("--options-csv", default="remote_orchestration/active_sampling_options.csv", help="CSV with option,value rows")
+    ap.add_argument("--options-csv", default="active_sampling_options.csv", help="CSV with option,value rows")
     args = ap.parse_args()
 
-    root = Path(__file__).resolve().parent
+    script_dir = Path(__file__).resolve().parent
+    root = REPO_ROOT
     options_path = Path(args.options_csv)
     if not options_path.is_absolute():
-        options_path = (root / options_path).resolve()
+        in_script_dir = (script_dir / options_path).resolve()
+        options_path = in_script_dir if in_script_dir.exists() else (root / options_path).resolve()
     opts = parse_options_csv(options_path)
 
     recommender_cfg_path = Path(opts.get("recommender_config", "/mnt/hasanfs/io_synthesizer/io_recommender/config.yaml"))

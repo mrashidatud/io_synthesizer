@@ -64,7 +64,8 @@ python -m io_recommender.run_pipeline --config io_recommender/config.yaml --outp
 Use the dedicated script for warm-start data collection:
 
 ```bash
-python3 warm_start_pipeline.py --options-csv remote_orchestration/warm_start_options.csv
+python3 orchestrators/warm_start_sampling_orchestrator/warm_start_pipeline.py \
+  --options-csv orchestrators/warm_start_sampling_orchestrator/warm_start_options.csv
 ```
 
 This workflow is separated from `pipeline.sh` and is designed for recommender warm-start sampling:
@@ -76,9 +77,8 @@ This workflow is separated from `pipeline.sh` and is designed for recommender wa
 Remote launcher (same style as existing CSV orchestration):
 
 ```bash
-remote_orchestration/run_warm_start_from_csv.sh \
-  remote_orchestration/machine_ssh_map.csv \
-  remote_orchestration/warm_start_options.csv
+orchestrators/warm_start_sampling_orchestrator/run_warm_start_from_csv.sh \
+  orchestrators/warm_start_sampling_orchestrator/warm_start_options.csv
 ```
 
 Output layout:

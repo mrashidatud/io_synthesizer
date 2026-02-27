@@ -3,10 +3,10 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 OPTIONS_FILE="${1:-${SCRIPT_DIR}/active_sampling_options.csv}"
 LOCAL_LOG_DIR="${LOCAL_LOG_DIR:-${REPO_ROOT}/logs}"
-ACTIVE_SCRIPT="${REPO_ROOT}/active_sampling_pipeline.py"
+ACTIVE_SCRIPT="${SCRIPT_DIR}/active_sampling_pipeline.py"
 
 if [[ ! -f "${OPTIONS_FILE}" ]]; then
   echo "ERROR: active-sampling options CSV not found: ${OPTIONS_FILE}" >&2

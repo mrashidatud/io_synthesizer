@@ -7,12 +7,17 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List
 
 import yaml
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from io_recommender.pipeline import baseline_from_specs, parse_specs
 from io_recommender.sampling import build_warm_start_set
@@ -245,13 +250,15 @@ def build_warm_start_configs(recommender_config: Path, warm_target_override: str
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Warm-start data collection pipeline for recommender")
-    ap.add_argument("--options-csv", default="remote_orchestration/warm_start_options.csv", help="CSV with option,value rows")
+    ap.add_argument("--options-csv", default="warm_start_options.csv", help="CSV with option,value rows")
     args = ap.parse_args()
 
-    root = Path(__file__).resolve().parent
+    script_dir = Path(__file__).resolve().parent
+    root = REPO_ROOT
     options_path = Path(args.options_csv)
     if not options_path.is_absolute():
-        options_path = (root / options_path).resolve()
+        in_script_dir = (script_dir / options_path).resolve()
+        options_path = in_script_dir if in_script_dir.exists() else (root / options_path).resolve()
     opts = parse_options_csv(options_path)
 
     cap_total_gib = float(opts.get("cap", "512") or "512")

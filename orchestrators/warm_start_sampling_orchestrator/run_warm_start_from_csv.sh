@@ -3,10 +3,10 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 OPTIONS_FILE="${1:-${SCRIPT_DIR}/warm_start_options.csv}"
 LOCAL_LOG_DIR="${LOCAL_LOG_DIR:-${REPO_ROOT}/logs}"
-WARM_SCRIPT="${REPO_ROOT}/warm_start_pipeline.py"
+WARM_SCRIPT="${SCRIPT_DIR}/warm_start_pipeline.py"
 
 if [[ ! -f "${OPTIONS_FILE}" ]]; then
   echo "ERROR: warm-start options CSV not found: ${OPTIONS_FILE}" >&2
