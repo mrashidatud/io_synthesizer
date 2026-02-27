@@ -18,7 +18,7 @@ recommender_config,/mnt/hasanfs/io_synthesizer/io_recommender/config.yaml
 seed,7
 metric_key,agg_perf_by_slowest
 bin_dir,/mnt/hasanfs/bin
-cfg.active.iterations,8
+cfg.active.iterations,12
 cfg.active.batch_per_iter,3
 cfg.active.beta_start,1.2
 cfg.active.beta_end,0.4
