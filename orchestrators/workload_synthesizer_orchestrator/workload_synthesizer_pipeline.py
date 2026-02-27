@@ -37,6 +37,14 @@ def parse_bool(v: str | None, default: bool = False) -> bool:
     return default
 
 
+def parse_meta_scope(v: object, default: str = "separate") -> str:
+    raw = str(v).strip().lower() if v is not None else default
+    scope = raw or default
+    if scope not in {"separate", "data_files"}:
+        raise ValueError(f"Invalid meta_scope '{v}'. Expected one of: separate, data_files")
+    return scope
+
+
 def parse_options_csv(path: Path) -> Dict[str, str]:
     out: Dict[str, str] = {}
     with path.open("r", encoding="utf-8", newline="") as f:
@@ -222,6 +230,7 @@ def main() -> None:
     delete_darshan = parse_bool(opts.get("delete_darshan"), default=False)
     filters_raw = (opts.get("filters", "") or "").strip()
     flush_wait_sec = float(opts.get("flush_wait_sec", "10") or "10")
+    meta_scope = parse_meta_scope(opts.get("meta_scope", "separate"))
 
     if nprocs_override and not nprocs_override.isdigit():
         raise ValueError(f"Invalid nprocs '{nprocs_override}': expected integer")
@@ -240,6 +249,7 @@ def main() -> None:
     print(f"{ts()}  Repo root: {root}")
     print(f"{ts()}  Input dir: {input_dir}")
     print(f"{ts()}  Output root: {out_root}")
+    print(f"{ts()}  Meta scope: {meta_scope}")
 
     ensure_mpi_binary(root, bin_dir, force_build)
 
@@ -277,6 +287,8 @@ def main() -> None:
             "posix",
             "--mpi-collective-mode",
             "none",
+            "--meta-scope",
+            meta_scope,
         ]
         if desired_nprocs is not None:
             cmd.extend(["--nprocs", str(desired_nprocs)])

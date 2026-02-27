@@ -5,4 +5,5 @@ nprocs_cap,
 inputs,/mnt/hasanfs/io_synthesizer/inputs/exemplar_jsons
 force_build,1
 delete_darshan,1
-filters, 6-10
+filters,1-25
+meta_scope,data_files
