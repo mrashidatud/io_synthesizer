@@ -21,7 +21,7 @@ if [[ "$(basename "${REPO_ROOT}")" != "io_synthesizer" ]]; then
   exit 1
 fi
 
-pipeline_cmd=( python3 "${PIPELINE_SCRIPT}" --options-csv "${OPTIONS_FILE}" )
+pipeline_cmd=( python3 -u "${PIPELINE_SCRIPT}" --options-csv "${OPTIONS_FILE}" )
 printf -v pipeline_cmd_quoted '%q ' "${pipeline_cmd[@]}"
 pipeline_cmd_quoted="${pipeline_cmd_quoted% }"
 

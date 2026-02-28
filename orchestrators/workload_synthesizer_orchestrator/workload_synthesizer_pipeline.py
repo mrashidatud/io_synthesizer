@@ -8,6 +8,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -234,6 +235,14 @@ def resolve_path(raw: str, *, fallback: Path) -> Path:
 
 
 def main() -> None:
+    # Ensure all orchestrator prints are emitted immediately when stdout/stderr
+    # are piped through tee into workload_synthesizer_*.log.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+        sys.stderr.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+
     ap = argparse.ArgumentParser(description="Workload synthesizer orchestration")
     ap.add_argument("--options-csv", default="pipeline_options.csv", help="CSV with option,value rows")
     args = ap.parse_args()
