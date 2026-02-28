@@ -38,6 +38,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
@@ -47,7 +48,7 @@
 #include <time.h>
 
 #ifndef LUSTRE_FILE_ALIGN
-#define LUSTRE_FILE_ALIGN 4096 /* 4 KiB default; planner sets alignment policy via p_ua_file */
+#define LUSTRE_FILE_ALIGN (1<<20) /* 1 MiB default; planner sets alignment policy via p_ua_file */
 #endif
 
 #ifndef MEM_ALIGN
@@ -255,6 +256,164 @@ static int owner_for_path(const char* path, int nprocs){
     return (int)(fnv1a_64(path) % (unsigned long)nprocs);
 }
 
+/* Reuse data fds across phases to avoid injecting unplanned open/stat metadata ops. */
+typedef struct {
+    char path[1024];
+    int fd;
+    int mode_write;
+    off_t fsz;
+    int valid;
+} fd_cache_entry_t;
+
+static fd_cache_entry_t* g_fd_cache = NULL;
+static size_t g_fd_cache_n = 0;
+static size_t g_fd_cache_cap = 0;
+static unsigned long long g_fd_cache_hits = 0ULL;
+static unsigned long long g_fd_cache_misses = 0ULL;
+static unsigned long long g_fd_cache_opens = 0ULL;
+static unsigned long long g_fd_cache_upgrades = 0ULL;
+
+typedef struct {
+    char path[1024];
+    off_t cursor;
+    int mode_write;
+    int valid;
+} cursor_cache_entry_t;
+
+static cursor_cache_entry_t* g_cursor_cache = NULL;
+static size_t g_cursor_cache_n = 0;
+static size_t g_cursor_cache_cap = 0;
+
+static off_t cursor_cache_get(const char* path, int mode_write, int* found)
+{
+    for (size_t i = 0; i < g_cursor_cache_n; i++) {
+        cursor_cache_entry_t* e = &g_cursor_cache[i];
+        if (!e->valid) continue;
+        if (e->mode_write != (mode_write ? 1 : 0)) continue;
+        if (strcmp(e->path, path) == 0) {
+            if (found) *found = 1;
+            return e->cursor;
+        }
+    }
+    if (found) *found = 0;
+    if (g_cursor_cache_n == g_cursor_cache_cap) {
+        size_t new_cap = g_cursor_cache_cap ? (g_cursor_cache_cap * 2) : 32;
+        cursor_cache_entry_t* tmp =
+            (cursor_cache_entry_t*)realloc(g_cursor_cache, new_cap * sizeof(cursor_cache_entry_t));
+        if (!tmp) return 0;
+        g_cursor_cache = tmp;
+        g_cursor_cache_cap = new_cap;
+    }
+    cursor_cache_entry_t* e = &g_cursor_cache[g_cursor_cache_n++];
+    memset(e, 0, sizeof(*e));
+    (void)snprintf(e->path, sizeof(e->path), "%s", path);
+    e->mode_write = mode_write ? 1 : 0;
+    e->cursor = 0;
+    e->valid = 1;
+    return 0;
+}
+
+static void cursor_cache_set(const char* path, int mode_write, off_t cursor)
+{
+    for (size_t i = 0; i < g_cursor_cache_n; i++) {
+        cursor_cache_entry_t* e = &g_cursor_cache[i];
+        if (!e->valid) continue;
+        if (e->mode_write != (mode_write ? 1 : 0)) continue;
+        if (strcmp(e->path, path) == 0) {
+            e->cursor = cursor;
+            return;
+        }
+    }
+    if (g_cursor_cache_n == g_cursor_cache_cap) {
+        size_t new_cap = g_cursor_cache_cap ? (g_cursor_cache_cap * 2) : 32;
+        cursor_cache_entry_t* tmp =
+            (cursor_cache_entry_t*)realloc(g_cursor_cache, new_cap * sizeof(cursor_cache_entry_t));
+        if (!tmp) return;
+        g_cursor_cache = tmp;
+        g_cursor_cache_cap = new_cap;
+    }
+    cursor_cache_entry_t* e = &g_cursor_cache[g_cursor_cache_n++];
+    memset(e, 0, sizeof(*e));
+    (void)snprintf(e->path, sizeof(e->path), "%s", path);
+    e->mode_write = mode_write ? 1 : 0;
+    e->cursor = cursor;
+    e->valid = 1;
+}
+
+static void cursor_cache_close_all(void)
+{
+    free(g_cursor_cache);
+    g_cursor_cache = NULL;
+    g_cursor_cache_n = 0;
+    g_cursor_cache_cap = 0;
+}
+
+static int fd_cache_open_entry(fd_cache_entry_t* e, const char* path, int need_write)
+{
+    int fd = open(path, need_write ? (O_RDWR | O_CREAT) : O_RDONLY, 0644);
+    if (fd < 0) return -1;
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        close(fd);
+        return -1;
+    }
+    e->fd = fd;
+    e->mode_write = need_write ? 1 : 0;
+    e->fsz = st.st_size;
+    e->valid = 1;
+    g_fd_cache_opens++;
+    return 0;
+}
+
+static int fd_cache_get(const char* path, int need_write, int* fd_out, off_t* fsz_out)
+{
+    for (size_t i = 0; i < g_fd_cache_n; i++) {
+        fd_cache_entry_t* e = &g_fd_cache[i];
+        if (!e->valid) continue;
+        if (strcmp(e->path, path) != 0) continue;
+        if (e->mode_write != (need_write ? 1 : 0)) continue;
+        g_fd_cache_hits++;
+        *fd_out = e->fd;
+        *fsz_out = e->fsz;
+        return 0;
+    }
+
+    if (g_fd_cache_n == g_fd_cache_cap) {
+        size_t new_cap = g_fd_cache_cap ? (g_fd_cache_cap * 2) : 32;
+        fd_cache_entry_t* tmp = (fd_cache_entry_t*)realloc(g_fd_cache, new_cap * sizeof(fd_cache_entry_t));
+        if (!tmp) return -1;
+        g_fd_cache = tmp;
+        g_fd_cache_cap = new_cap;
+    }
+
+    fd_cache_entry_t* e = &g_fd_cache[g_fd_cache_n++];
+    memset(e, 0, sizeof(*e));
+    (void)snprintf(e->path, sizeof(e->path), "%s", path);
+    if (fd_cache_open_entry(e, path, need_write ? 1 : 0) != 0) {
+        e->valid = 0;
+        return -1;
+    }
+    g_fd_cache_misses++;
+    *fd_out = e->fd;
+    *fsz_out = e->fsz;
+    return 0;
+}
+
+static void fd_cache_close_all(void)
+{
+    for (size_t i = 0; i < g_fd_cache_n; i++) {
+        if (g_fd_cache[i].valid && g_fd_cache[i].fd >= 0) {
+            close(g_fd_cache[i].fd);
+            g_fd_cache[i].fd = -1;
+            g_fd_cache[i].valid = 0;
+        }
+    }
+    free(g_fd_cache);
+    g_fd_cache = NULL;
+    g_fd_cache_n = 0;
+    g_fd_cache_cap = 0;
+}
+
 /* --- helpers for alignment (C) --- */
 static inline off_t force_aligned_start(off_t s)
 {
@@ -275,14 +434,28 @@ static void exec_phase_data_local(const phase_t* p, int phase_idx,
     int world_rank=0;
     MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
 
-    // Open (participants only)
+    // Reuse per-path file descriptors across data phases to keep metadata overhead low.
     int is_write = (p->p_write > 0.5);
-    int fd = open(p->path, is_write ? O_RDWR|O_CREAT : O_RDONLY, 0644);
-    if (fd < 0) { perror("open"); return; }
+    int fd = -1;
+    off_t fsz = 0;
+    if (fd_cache_get(p->path, is_write, &fd, &fsz) != 0) {
+        perror("fd_cache_get");
+        return;
+    }
 
-    struct stat st;
-    if (fstat(fd, &st) != 0) { perror("fstat"); close(fd); return; }
-    off_t fsz = st.st_size;
+    // Keep continuity across phases on the same path/op-intent.
+    int cur_found = 0;
+    off_t cur = cursor_cache_get(p->path, is_write, &cur_found);
+    if (!cur_found) {
+        // For first shared phase on this rank, seed with this rank's shard start.
+        if (p->xfer > 0 && start_idx > 0) {
+            __uint128_t prod = ((__uint128_t)start_idx) * ((__uint128_t)p->xfer);
+            cur = (prod > (__uint128_t)LLONG_MAX) ? (off_t)LLONG_MAX : (off_t)prod;
+        } else {
+            cur = 0;
+        }
+    }
+    cur = clamp_range(cur, fsz, p->xfer);
 
     struct timespec ts_start, ts_end;
     wallclock_now(&ts_start);
@@ -321,7 +494,7 @@ static void exec_phase_data_local(const phase_t* p, int phase_idx,
     uint64_t mis_left = N_mem_mis;
 
     buf_t b = alloc_buffer((size_t)p->xfer);
-    if (!b.base) { perror("alloc_buffer"); close(fd); return; }
+    if (!b.base) { perror("alloc_buffer"); return; }
     void* aligned_ptr = b.base;
     void* mis_ptr     = (void*)((uintptr_t)b.base + 1);
 
@@ -335,7 +508,6 @@ static void exec_phase_data_local(const phase_t* p, int phase_idx,
     //     Replace the final fprintf with the expanded one below to add timestamps & alignment info.
 
     // ====== BEGIN: copy of your loops (unchanged apart from counters) ======
-    off_t cur = 0;
     if (N_con > 0) {
         if (large) {
             uint64_t U = (unaligned_left > N_con) ? N_con : unaligned_left;
@@ -468,8 +640,8 @@ static void exec_phase_data_local(const phase_t* p, int phase_idx,
         (int)LUSTRE_FILE_ALIGN, (int)MEM_ALIGN, start_idx, ts0, ts1);
     fflush(stderr);
 
+    cursor_cache_set(p->path, is_write, cur);
     free(b.base);
-    close(fd);
 }
 
 static void do_posix_meta(const phase_t* p, int phase_idx)
@@ -762,6 +934,18 @@ static void run_plan(FILE* fp)
         idx += run_len;
         free(done);
     }
+
+    fd_cache_close_all();
+    cursor_cache_close_all();
+
+    fprintf(stderr,
+        "rank %d: fd_cache stats hits=%llu misses=%llu opens=%llu upgrades=%llu\n",
+        rank,
+        (unsigned long long)g_fd_cache_hits,
+        (unsigned long long)g_fd_cache_misses,
+        (unsigned long long)g_fd_cache_opens,
+        (unsigned long long)g_fd_cache_upgrades);
+    fflush(stderr);
 
     if (rank == 0) {
         fprintf(stderr, "Loaded %zu phases\n", nph);

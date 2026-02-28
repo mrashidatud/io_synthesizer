@@ -2745,7 +2745,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--features", required=True, help="features.json")
     ap.add_argument("--nranks", type=int, default=1, help="mpiexec -n to use in the generated runner if 'nprocs' absent in features")
-    ap.add_argument("--fs-align", type=int, default=4096, help="Darshan POSIX_FILE_ALIGNMENT to target (bytes). Default: 4 KiB")
+    ap.add_argument("--fs-align", type=int, default=1<<20, help="Darshan POSIX_FILE_ALIGNMENT to target (bytes). Default: 1 MiB")
 
     # NEW: optional overrides
     ap.add_argument("--cap-total-gib", type=float, default=None, help="Override cap_total_gib (GiB)")

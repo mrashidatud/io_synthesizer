@@ -176,9 +176,15 @@ def apply_lustre_knobs(workload_dir: Path, cfg: Dict[str, object], use_sudo: boo
 
 def ensure_mpi_binary(root: Path, bin_dir: Path, force_build: bool) -> None:
     target = bin_dir / "mpi_synthio"
+    src_c = root / "scripts" / "mpi_synthio.c"
+    src_make = root / "scripts" / "Makefile"
     if target.exists() and not force_build:
-        print(f"{ts()}  SKIP build: {target} already exists")
-        return
+        src_mtimes = [p.stat().st_mtime for p in (src_c, src_make) if p.exists()]
+        newest_src = max(src_mtimes) if src_mtimes else 0.0
+        if target.stat().st_mtime >= newest_src:
+            print(f"{ts()}  SKIP build: {target} already exists and is up-to-date")
+            return
+        print(f"{ts()}  REBUILD: source newer than {target}")
     print(f"{ts()}  BUILD mpi_synthio")
     run_cmd(["make", "clean"], cwd=root / "scripts")
     run_cmd(["make"], cwd=root / "scripts")
