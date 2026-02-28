@@ -1548,33 +1548,51 @@ def interleave_rw_segments(rows, switch_frac=0.0, seg_ops=64):
 
 # ---------------- Alignment targeting (file) ----------------
 def compute_rowwise_pua_file(rows, target_frac, fs_align_bytes):
-    """Global ops-weighted targeting with intrinsic floor from sizes not % fs_align."""
-    total_ops = sum(r["ops"] for r in rows)
-    if total_ops == 0: return {}
-    target_unaligned_ops = clamp01(target_frac) * total_ops
+    """
+    Global ops-weighted targeting for file-start misalignment.
+    Runtime now enforces p_ua_file for all xfer sizes, so there is no xfer-mod floor here.
+    """
+    del fs_align_bytes  # kept for interface compatibility
+    total_ops = sum(int(r.get("ops", 0)) for r in rows if int(r.get("ops", 0)) > 0)
+    if total_ops <= 0:
+        return {}
 
-    intrinsic, eligible = [], []
-    for r in rows:
-        if r["ops"]<=0: continue
-        if (r["xfer"] % fs_align_bytes) != 0: intrinsic.append(r)
-        else: eligible.append(r)
-
-    intrinsic_ops = sum(r["ops"] for r in intrinsic)
-    remaining = max(0.0, target_unaligned_ops - intrinsic_ops)
+    tgt = clamp01(target_frac)
+    target_unaligned_ops = int(round(tgt * float(total_ops)))
+    target_unaligned_ops = max(0, min(total_ops, target_unaligned_ops))
 
     p_map = {id(r): 0.0 for r in rows}
-    for r in intrinsic: p_map[id(r)] = 1.0
-    if remaining <= 1e-9 or not eligible: return p_map
-
-    eligible_ops = float(sum(r["ops"] for r in eligible))
-    if eligible_ops <= 0.0:
+    active = [(idx, r) for idx, r in enumerate(rows) if int(r.get("ops", 0)) > 0]
+    if not active:
         return p_map
 
-    # Uniform probability over all eligible ops to hit the requested global fraction
-    # whenever feasible (without bin-level quotas that can under-shoot).
-    p_elig = min(1.0, remaining / eligible_ops)
-    for r in eligible:
-        p_map[id(r)] = min(1.0, p_elig)
+    alloc = {}
+    frac_order = []
+    base_sum = 0
+    for idx, r in active:
+        ops = int(r["ops"])
+        raw = tgt * float(ops)
+        base = int(math.floor(raw))
+        if base > ops:
+            base = ops
+        alloc[idx] = base
+        base_sum += base
+        frac_order.append((raw - float(base), idx))
+
+    rem = target_unaligned_ops - base_sum
+    if rem > 0:
+        frac_order.sort(key=lambda t: (t[0], -t[1]), reverse=True)
+        for _, idx in frac_order:
+            if rem <= 0:
+                break
+            ops = int(rows[idx]["ops"])
+            if alloc[idx] < ops:
+                alloc[idx] += 1
+                rem -= 1
+
+    for idx, r in active:
+        ops = int(r["ops"])
+        p_map[id(r)] = float(alloc[idx]) / float(ops) if ops > 0 else 0.0
     return p_map
 
 # ---------------- Planner core ----------------
@@ -1668,83 +1686,138 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
         n_ro + n_rw + n_wo,
         min(64, max(min_data_from_roles, min_data_from_shared)),
     )
+    target_data_files_initial = int(target_data_files)
+    max_data_files_for_alignment = int(feats.get("max_data_files_for_alignment", 8192))
+    if max_data_files_for_alignment < 1:
+        max_data_files_for_alignment = 1
+    filecount_alignment_multiplier = float(feats.get("filecount_alignment_multiplier", 2.0))
+    if filecount_alignment_multiplier < 1.0:
+        filecount_alignment_multiplier = 1.0
 
-    n_ro, n_rw, n_wo = allocate_counts_for_total([ro_f, rw_f, wo_f], target_data_files)
-    if n_ro + n_rw + n_wo == 0:
-        n_ro = 1
+    filecount_heuristic_applied = False
+    filecount_heuristic_intrinsic_ops_est = 0
+    filecount_heuristic_intrinsic_frac_est = 0.0
+    filecount_heuristic_gap_est = 0.0
+    filecount_heuristic_cap = max_data_files_for_alignment
+    filecount_heuristic_note = "not_needed"
 
-    # Paths
-    ro_paths = [str(DATA_RO / f"ro_{i}.dat") for i in range(n_ro)]
-    rw_paths = [str(DATA_RW / f"rw_{i}.dat") for i in range(n_rw)]
-    wo_paths = [str(DATA_WO / f"wo_{i}.dat") for i in range(n_wo)]
-    data_paths = ro_paths + rw_paths + wo_paths
+    def materialize_file_layout(total_data_files):
+        n_ro_local, n_rw_local, n_wo_local = allocate_counts_for_total(
+            [ro_f, rw_f, wo_f], int(total_data_files)
+        )
+        if n_ro_local + n_rw_local + n_wo_local == 0:
+            n_ro_local = 1
 
-    roles_dict = {
-        "read":  {"RO": list(ro_paths), "RW": list(rw_paths)},
-        "write": {"RW": list(rw_paths), "WO": list(wo_paths)},
-    }
+        ro_paths_local = [str(DATA_RO / f"ro_{i}.dat") for i in range(n_ro_local)]
+        rw_paths_local = [str(DATA_RW / f"rw_{i}.dat") for i in range(n_rw_local)]
+        wo_paths_local = [str(DATA_WO / f"wo_{i}.dat") for i in range(n_wo_local)]
+        data_paths_local = ro_paths_local + rw_paths_local + wo_paths_local
 
-    read_file_w  = make_file_weights_for_intent(feats, ro_paths, rw_paths, wo_paths, "read")
-    write_file_w = make_file_weights_for_intent(feats, ro_paths, rw_paths, wo_paths, "write")
+        roles_dict_local = {
+            "read": {"RO": list(ro_paths_local), "RW": list(rw_paths_local)},
+            "write": {"RW": list(rw_paths_local), "WO": list(wo_paths_local)},
+        }
 
-    # Shared file-count target.
-    # In 'separate' mode, include META file in shared-count fit.
-    # In 'data_files' mode, META rows are attached to data files (no +1 file adjustment).
-    N_data = len(data_paths)
-    if nprocs <= 1:
-        meta_is_shared = False
-        N_shared_data = 0
-    else:
-        if meta_scope == "separate":
-            candidates = []
-            for m in (0, 1):  # m=1 -> meta shared
-                K = int(round(p_shared * (N_data + 1) - m))
-                K = max(0, min(N_data, K))
+        read_file_w_local = make_file_weights_for_intent(
+            feats, ro_paths_local, rw_paths_local, wo_paths_local, "read"
+        )
+        write_file_w_local = make_file_weights_for_intent(
+            feats, ro_paths_local, rw_paths_local, wo_paths_local, "write"
+        )
 
-                # Keep at least one file in each class when byte fractions request both.
-                if p_bytes_sh > 0.0 and K <= 0 and N_data > 0:
-                    K = 1
-                if p_bytes_uq > 0.0 and K >= N_data and N_data > 1:
-                    K = N_data - 1
-
-                frac = (K + m) / float(max(1, N_data + 1))
-                err = abs(frac - p_shared)
-                candidates.append((err, m, K))
-
-            candidates.sort(key=lambda t: t[0])
-            _, m_best, K_best = candidates[0]
-            meta_is_shared = bool(m_best)
-            N_shared_data = K_best
+        # Shared file-count target.
+        # In 'separate' mode, include META file in shared-count fit.
+        # In 'data_files' mode, META rows are attached to data files (no +1 file adjustment).
+        n_data_local = len(data_paths_local)
+        if nprocs <= 1:
+            meta_is_shared_local = False
+            n_shared_data_local = 0
         else:
-            K = int(round(p_shared * N_data))
-            K = max(0, min(N_data, K))
-            if p_bytes_sh > 0.0 and K <= 0 and N_data > 0:
-                K = 1
-            if p_bytes_uq > 0.0 and K >= N_data and N_data > 1:
-                K = N_data - 1
-            meta_is_shared = False
-            N_shared_data = K
+            if meta_scope == "separate":
+                candidates = []
+                for m in (0, 1):  # m=1 -> meta shared
+                    k = int(round(p_shared * (n_data_local + 1) - m))
+                    k = max(0, min(n_data_local, k))
 
-    meta_flag = "meta_only|shared|" if meta_is_shared else "meta_only|unique|"
+                    # Keep at least one file in each class when byte fractions request both.
+                    if p_bytes_sh > 0.0 and k <= 0 and n_data_local > 0:
+                        k = 1
+                    if p_bytes_uq > 0.0 and k >= n_data_local and n_data_local > 1:
+                        k = n_data_local - 1
 
-    # Compute the actual totals you planned for each intent (before rebalancer tweaks)
-    B_read_total  = int(round(io_bytes_target * p_bytes_r))
-    B_write_total = int(round(io_bytes_target * p_bytes_w))
+                    frac = (k + m) / float(max(1, n_data_local + 1))
+                    err = abs(frac - p_shared)
+                    candidates.append((err, m, k))
 
-    # Shared *bytes* target over data files only (meta bytes ~ 0)
-    B_total_data = B_read_total + B_write_total
-    B_target_shared = p_bytes_sh * B_total_data
+                candidates.sort(key=lambda t: t[0])
+                _, m_best, k_best = candidates[0]
+                meta_is_shared_local = bool(m_best)
+                n_shared_data_local = k_best
+            else:
+                k = int(round(p_shared * n_data_local))
+                k = max(0, min(n_data_local, k))
+                if p_bytes_sh > 0.0 and k <= 0 and n_data_local > 0:
+                    k = 1
+                if p_bytes_uq > 0.0 and k >= n_data_local and n_data_local > 1:
+                    k = n_data_local - 1
+                meta_is_shared_local = False
+                n_shared_data_local = k
 
-    shared_paths, unique_paths = choose_shared_paths_bytes_aware(
-        data_paths,
-        read_file_w, write_file_w,
-        B_read_total, B_write_total,
-        N_shared_data,
-        B_target_shared
-    )
+        # Compute the actual totals you planned for each intent (before rebalancer tweaks)
+        b_read_total = int(round(io_bytes_target * p_bytes_r))
+        b_write_total = int(round(io_bytes_target * p_bytes_w))
 
-    # Build flags map consumed by emit_* functions
-    path_flags = {p: ("|shared|" if p in shared_paths else "|unique|") for p in data_paths}
+        # Shared *bytes* target over data files only (meta bytes ~ 0)
+        b_total_data = b_read_total + b_write_total
+        b_target_shared = p_bytes_sh * b_total_data
+
+        shared_paths_local, unique_paths_local = choose_shared_paths_bytes_aware(
+            data_paths_local,
+            read_file_w_local,
+            write_file_w_local,
+            b_read_total,
+            b_write_total,
+            n_shared_data_local,
+            b_target_shared,
+        )
+
+        path_flags_local = {
+            p: ("|shared|" if p in shared_paths_local else "|unique|")
+            for p in data_paths_local
+        }
+
+        return {
+            "n_ro": n_ro_local,
+            "n_rw": n_rw_local,
+            "n_wo": n_wo_local,
+            "ro_paths": ro_paths_local,
+            "rw_paths": rw_paths_local,
+            "wo_paths": wo_paths_local,
+            "data_paths": data_paths_local,
+            "roles_dict": roles_dict_local,
+            "read_file_w": read_file_w_local,
+            "write_file_w": write_file_w_local,
+            "meta_flag": "meta_only|shared|" if meta_is_shared_local else "meta_only|unique|",
+            "shared_paths": shared_paths_local,
+            "unique_paths": unique_paths_local,
+            "path_flags": path_flags_local,
+        }
+
+    layout_cfg = materialize_file_layout(target_data_files)
+    n_ro = layout_cfg["n_ro"]
+    n_rw = layout_cfg["n_rw"]
+    n_wo = layout_cfg["n_wo"]
+    ro_paths = layout_cfg["ro_paths"]
+    rw_paths = layout_cfg["rw_paths"]
+    wo_paths = layout_cfg["wo_paths"]
+    data_paths = layout_cfg["data_paths"]
+    roles_dict = layout_cfg["roles_dict"]
+    read_file_w = layout_cfg["read_file_w"]
+    write_file_w = layout_cfg["write_file_w"]
+    meta_flag = layout_cfg["meta_flag"]
+    shared_paths = layout_cfg["shared_paths"]
+    unique_paths = layout_cfg["unique_paths"]
+    path_flags = layout_cfg["path_flags"]
 
     # Avg xfer estimates for initial Nio
     avgS = sum(S_SUBS)/len(S_SUBS)
@@ -1850,7 +1923,15 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
                 base[i] += 1
         return base
 
-    def per_file_subsizes_weighted(Nbin, subs, files, file_weights, sub_weights=None):
+    def per_file_subsizes_weighted(
+        Nbin,
+        subs,
+        files,
+        file_weights,
+        sub_weights=None,
+        spread_rr=False,
+        spread_seed=0,
+    ):
         """
         Split Nbin ops across 'subs' (sizes) first (uniform by sub),
         then across files proportionally to 'file_weights' (same for each sub).
@@ -1876,9 +1957,18 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
         else:
             w = [x/s for x in w]
         out = []
-        for sub_ops, sz in zip(per_sub, subs):
-            per_file_ops = _int_round_allocation(sub_ops, w)
-            for f, k in zip(files, per_file_ops):
+        spread_cursor = int(spread_seed)
+        for j, (sub_ops, sz) in enumerate(zip(per_sub, subs)):
+            if spread_rr and len(files) > 1:
+                shift = int((spread_cursor + j) % len(files))
+                files_j = files[shift:] + files[:shift]
+                w_j = w[shift:] + w[:shift]
+                spread_cursor += max(1, int(sub_ops))
+            else:
+                files_j = files
+                w_j = w
+            per_file_ops = _int_round_allocation(sub_ops, w_j)
+            for f, k in zip(files_j, per_file_ops):
                 if k > 0:
                     out.append((f, sz, k))
         return out
@@ -1907,13 +1997,107 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
             w[i] = w_a
         return w
 
+    def _estimate_intrinsic_ops_for_bin(nbin, subs):
+        if nbin <= 0 or not subs or fs_align_bytes <= 0:
+            return 0
+        sw = sub_weights_for_alignment(subs)
+        if sw is None:
+            per_sub = split_uniform(nbin, len(subs))
+        else:
+            sw = [max(0.0, float(x)) for x in sw]
+            ssw = sum(sw)
+            if ssw <= 0.0:
+                per_sub = split_uniform(nbin, len(subs))
+            else:
+                sw = [x / ssw for x in sw]
+                per_sub = _int_round_allocation(nbin, sw)
+        return sum(
+            int(opc) for opc, sz in zip(per_sub, subs)
+            if int(sz) % fs_align_bytes != 0
+        )
+
+    # One-shot file-count heuristic for offset-driven misalignment:
+    # if intrinsic xfer-floor overshoots target by >0.05, estimate the
+    # number of files needed to "rescue" one intrinsic op per file start.
+    read_bin_specs = (
+        (R_S, [read_pick["S"]] if read_pick["S"] is not None else list(S_SUBS)),
+        (R_M, [read_pick["M"]] if read_pick["M"] is not None else list(M_SUBS)),
+        (R_L, [read_pick["L"]] if read_pick["L"] is not None else [L_SIZE]),
+    )
+    write_bin_specs = (
+        (W_S, [write_pick["S"]] if write_pick["S"] is not None else list(S_SUBS)),
+        (W_M, [write_pick["M"]] if write_pick["M"] is not None else list(M_SUBS)),
+        (W_L, [write_pick["L"]] if write_pick["L"] is not None else [L_SIZE]),
+    )
+    filecount_heuristic_intrinsic_ops_est = int(
+        sum(_estimate_intrinsic_ops_for_bin(nbin, subs) for nbin, subs in read_bin_specs)
+        + sum(_estimate_intrinsic_ops_for_bin(nbin, subs) for nbin, subs in write_bin_specs)
+    )
+    filecount_heuristic_intrinsic_frac_est = (
+        float(filecount_heuristic_intrinsic_ops_est) / float(Nio)
+        if Nio > 0 else 0.0
+    )
+    filecount_heuristic_gap_est = filecount_heuristic_intrinsic_frac_est - p_file_ua_req
+    filecount_heuristic_cap = max(
+        int(target_data_files),
+        min(int(max_data_files_for_alignment), int(Nio))
+    )
+    if (
+        filecount_heuristic_gap_est > 0.05 and
+        filecount_heuristic_intrinsic_ops_est > 0 and
+        fs_align_bytes > 0
+    ):
+        target_unaligned_ops_est = int(round(p_file_ua_req * float(Nio)))
+        intrinsic_to_flip = max(
+            0,
+            filecount_heuristic_intrinsic_ops_est - target_unaligned_ops_est
+        )
+        needed_data_files = max(
+            int(target_data_files),
+            int(math.ceil(float(intrinsic_to_flip) * filecount_alignment_multiplier))
+        )
+        needed_data_files = min(needed_data_files, int(filecount_heuristic_cap))
+        if needed_data_files > int(target_data_files):
+            target_data_files = int(needed_data_files)
+            layout_cfg = materialize_file_layout(target_data_files)
+            n_ro = layout_cfg["n_ro"]
+            n_rw = layout_cfg["n_rw"]
+            n_wo = layout_cfg["n_wo"]
+            ro_paths = layout_cfg["ro_paths"]
+            rw_paths = layout_cfg["rw_paths"]
+            wo_paths = layout_cfg["wo_paths"]
+            data_paths = layout_cfg["data_paths"]
+            roles_dict = layout_cfg["roles_dict"]
+            read_file_w = layout_cfg["read_file_w"]
+            write_file_w = layout_cfg["write_file_w"]
+            meta_flag = layout_cfg["meta_flag"]
+            shared_paths = layout_cfg["shared_paths"]
+            unique_paths = layout_cfg["unique_paths"]
+            path_flags = layout_cfg["path_flags"]
+            filecount_heuristic_applied = True
+            filecount_heuristic_note = "applied"
+        else:
+            filecount_heuristic_note = "gap_detected_no_growth"
+    elif filecount_heuristic_gap_est > 0.05:
+        filecount_heuristic_note = "gap_detected_not_applicable"
+    spread_seed_read = 0
+    spread_seed_write = 0
+
     def emit_read_bin(Nbin, binname, pick):
+        nonlocal spread_seed_read
         if Nbin <= 0: return
         subs = [pick] if pick is not None else (S_SUBS if binname=="S" else (M_SUBS if binname=="M" else [L_SIZE]))
         files = list(read_file_w.keys())  # files that actually have weights
         triples = per_file_subsizes_weighted(
-            Nbin, subs, files, read_file_w, sub_weights=sub_weights_for_alignment(subs)
+            Nbin,
+            subs,
+            files,
+            read_file_w,
+            sub_weights=sub_weights_for_alignment(subs),
+            spread_rr=filecount_heuristic_applied,
+            spread_seed=spread_seed_read,
         )
+        spread_seed_read += max(1, int(Nbin))
         for (f, sz, k) in triples:
             read_rows.append({"role": role_of_path(f), "file": f, "bin": binname, "xfer": sz, "ops": k, "intent": "read"})
 
@@ -1926,12 +2110,20 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
     write_files = wo_paths + rw_paths if (wo_paths and rw_paths) else (wo_paths if wo_paths else rw_paths)
 
     def emit_write_bin(Nbin, binname, pick):
+        nonlocal spread_seed_write
         if Nbin <= 0: return
         subs = [pick] if pick is not None else (S_SUBS if binname=="S" else (M_SUBS if binname=="M" else [L_SIZE]))
         files = list(write_file_w.keys())
         triples = per_file_subsizes_weighted(
-            Nbin, subs, files, write_file_w, sub_weights=sub_weights_for_alignment(subs)
+            Nbin,
+            subs,
+            files,
+            write_file_w,
+            sub_weights=sub_weights_for_alignment(subs),
+            spread_rr=filecount_heuristic_applied,
+            spread_seed=spread_seed_write,
         )
+        spread_seed_write += max(1, int(Nbin))
         for (f, sz, k) in triples:
             write_rows.append({"role": role_of_path(f), "file": f, "bin": binname, "xfer": sz, "ops": k, "intent": "write"})
 
@@ -2584,8 +2776,8 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
             "mpiexec -n {n} "
             "-genv LD_PRELOAD /mnt/hasanfs/darshan-3.4.7/darshan-runtime/install/lib/libdarshan.so "
             "-genv DARSHAN_LOGFILE \"$DARSHAN_LOGFILE\" "
-            "/mnt/hasanfs/bin/mpi_synthio --plan {plan} --io-api {iapi} --meta-api {mapi} --collective {coll}\n"
-            .format(n=nprocs, plan=str(PLAN), iapi=iapi, mapi=mapi, coll=coll)
+            "/mnt/hasanfs/bin/mpi_synthio --plan {plan} --io-api {iapi} --meta-api {mapi} --collective {coll} --fs-align {fs_align}\n"
+            .format(n=nprocs, plan=str(PLAN), iapi=iapi, mapi=mapi, coll=coll, fs_align=fs_align_bytes)
         )
     os.chmod(RUNNER, 0o755)
 
@@ -2593,14 +2785,19 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
     total_bytes, by_role, by_intent, by_file, by_flag = summarize(layout_rows)
 
     # Alignment accounting (for Notes)
-    total_ops = sum(r["ops"] for r in layout_rows)
-    intrinsic_ops = sum(r["ops"] for r in layout_rows if r["xfer"] % fs_align_bytes != 0)
-    eligible_ops  = total_ops - intrinsic_ops
-    # approximate extra-unaligned ops allocated (eligible only)
-    allocated_ops = sum( (compute_rowwise_pua_file([r], p_file_ua_req, fs_align_bytes).get(id(r),0.0) * r["ops"])
-                         for r in layout_rows if r["xfer"] % fs_align_bytes == 0 )
-    predicted_unaligned_ops = intrinsic_ops + allocated_ops
-    predicted_unaligned_frac = (predicted_unaligned_ops / total_ops) if total_ops>0 else 0.0
+    total_ops = sum(int(r.get("ops", 0)) for r in layout_rows)
+    legacy_xfer_not_multiple_ops = sum(
+        int(r.get("ops", 0))
+        for r in layout_rows
+        if fs_align_bytes > 0 and (int(r.get("xfer", 0)) % fs_align_bytes) != 0
+    )
+    pua_layout_map = compute_rowwise_pua_file(layout_rows, p_file_ua_req, fs_align_bytes)
+    predicted_unaligned_ops = sum(
+        float(pua_layout_map.get(id(r), 0.0)) * float(int(r.get("ops", 0)))
+        for r in layout_rows
+        if int(r.get("ops", 0)) > 0
+    )
+    predicted_unaligned_frac = (predicted_unaligned_ops / float(total_ops)) if total_ops > 0 else 0.0
 
     with open(NOTES,"w") as f:
         # Inputs (verbatim)
@@ -2709,10 +2906,22 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
         f.write("=== ALIGNMENT TARGETING (FILE vs Darshan File-Alignment) ===\n")
         f.write(f"  Requested pct_file_not_aligned={p_file_ua_req:.2f}\n")
         f.write(f"  fs_align_bytes={fs_align_bytes}  (mem_align_bytes={mem_align_bytes})\n")
-        f.write(f"  Intrinsic file-unaligned ops (xfer % fs_align != 0): {intrinsic_ops} of {total_ops}  (floor={intrinsic_ops/total_ops if total_ops>0 else 0.0:.4f})\n")
-        f.write(f"  Eligible ops (xfer % fs_align == 0): {eligible_ops}\n")
+        f.write(
+            f"  Legacy xfer-not-multiple count (diagnostic only): "
+            f"{legacy_xfer_not_multiple_ops} of {total_ops}  "
+            f"(~{legacy_xfer_not_multiple_ops/total_ops if total_ops>0 else 0.0:.4f})\n"
+        )
         f.write(f"  Predicted overall file-unaligned fraction: ~{predicted_unaligned_frac:.4f}\n")
-        f.write("  Distribution of extra unaligned: split equally across eligible S/M/L bins; proportional within-bin by ops.\n\n")
+        f.write("  Distribution of unaligned ops: largest-remainder allocation across data rows by ops.\n\n")
+        f.write("  File-count heuristic (single-shot, only if intrinsic gap > 0.05):\n")
+        f.write(f"    initial_data_files={target_data_files_initial} final_data_files={target_data_files}\n")
+        f.write(
+            f"    intrinsic_est_from_bins={filecount_heuristic_intrinsic_ops_est}/{Nio} "
+            f"(~{filecount_heuristic_intrinsic_frac_est:.4f}), "
+            f"gap_vs_target={filecount_heuristic_gap_est:.4f}, "
+            f"multiplier={filecount_alignment_multiplier:.2f}, "
+            f"cap={filecount_heuristic_cap}, note={filecount_heuristic_note}\n\n"
+        )
 
         # RW-switches details
         f.write("=== RW SWITCHES ===\n")

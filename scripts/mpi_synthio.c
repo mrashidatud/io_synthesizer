@@ -6,7 +6,7 @@
  * Enforced behavior:
  *   - MPI job so Darshan records MPI context.
  *   - DATA phases (pread/pwrite only; no lseek for data):
- *       * p_ua_file: for xfer >= FILE_ALIGN, enforce the exact fraction of NOT-aligned starts
+ *       * p_ua_file: enforce the exact fraction of NOT-aligned starts for all xfer sizes
  *         (unaligned quota via +1B skew; the rest snapped to align).
  *       * p_ua_mem: per-op buffer misalignment by 1B for the planned fraction.
  *       * Consec: adjacent; Seq remainder: fixed gap=xfer; Random: descending 128MiB chunks
@@ -58,6 +58,9 @@
 #define MAX_LINE  4096
 #define CHUNK_RANDOM (128*1024*1024)
 #define TSBUF_LEN 64
+
+/* Runtime-overridable file alignment (default 1 MiB). */
+static uint64_t g_file_align_bytes = (uint64_t)LUSTRE_FILE_ALIGN;
 
 typedef enum { API_POSIX=0, API_MPIIO=1 } io_api_t;
 typedef enum { META_POSIX=0 } meta_api_t;
@@ -415,14 +418,30 @@ static void fd_cache_close_all(void)
 }
 
 /* --- helpers for alignment (C) --- */
+static inline off_t align_down_off(off_t s)
+{
+    off_t a = (off_t)g_file_align_bytes;
+    if (a <= 1) return s;
+    off_t rem = s % a;
+    if (rem < 0) rem += a;
+    return s - rem;
+}
+
 static inline off_t force_aligned_start(off_t s)
 {
-    off_t a = (s + (LUSTRE_FILE_ALIGN-1)) & ~(LUSTRE_FILE_ALIGN-1);
-    return a;
+    off_t a = (off_t)g_file_align_bytes;
+    if (a <= 1) return s;
+    off_t rem = s % a;
+    if (rem < 0) rem += a;
+    return (rem == 0) ? s : (s + (a - rem));
 }
 static inline off_t force_unaligned_start(off_t s)
 {
-    if ((s % LUSTRE_FILE_ALIGN) == 0) s += 1; /* skew by 1B */
+    off_t a = (off_t)g_file_align_bytes;
+    if (a <= 1) return s;
+    off_t rem = s % a;
+    if (rem < 0) rem += a;
+    if (rem == 0) s += 1; /* skew by 1B */
     return s;
 }
 
@@ -478,14 +497,10 @@ static void exec_phase_data_local(const phase_t* p, int phase_idx,
     if ((p_seq > p_con) && N_seq == 0 && N_rnd > 0) { N_seq++; N_rnd--; }
     if (p_con > 0.0 && N_con == 0 && N_rnd > 0)     { N_con++; N_rnd--; }
 
-    // Large-op alignment quotas
-    int large = (p->xfer >= LUSTRE_FILE_ALIGN);
-    uint64_t N_unaligned_total = 0, N_aligned_total = 0;
-    if (large) {
-        N_unaligned_total = (uint64_t)llround(p->p_ua_file * (double)Nops_local);
-        if (N_unaligned_total > Nops_local) N_unaligned_total = Nops_local;
-        N_aligned_total = Nops_local - N_unaligned_total;
-    }
+    // File-alignment quotas (applied for all xfer sizes).
+    uint64_t N_unaligned_total = (uint64_t)llround(p->p_ua_file * (double)Nops_local);
+    if (N_unaligned_total > Nops_local) N_unaligned_total = Nops_local;
+    uint64_t N_aligned_total = Nops_local - N_unaligned_total;
     uint64_t unaligned_left = N_unaligned_total;
     uint64_t aligned_left   = N_aligned_total;
 
@@ -501,86 +516,74 @@ static void exec_phase_data_local(const phase_t* p, int phase_idx,
     // Seed randomness per rank for random-phase, stable across runs
     srand(p->seed + (unsigned int)world_rank * 1337u + (unsigned int)(start_idx % 7919u));
 
-    // The execution body is identical to your existing do_posix_data(),
-    // except we use local counters (N_con/N_seq/N_rnd) and keep its offset math.
-    // --- paste the consecutive/seq/random loops from do_posix_data here verbatim ---
-    //     (from: "/* ----- Consecutive ----- */" down to the final log+free+close)
-    //     Replace the final fprintf with the expanded one below to add timestamps & alignment info.
-
-    // ====== BEGIN: copy of your loops (unchanged apart from counters) ======
+    // ====== BEGIN: loops using local counters with per-op file-alignment enforcement ======
     if (N_con > 0) {
-        if (large) {
-            uint64_t U = (unaligned_left > N_con) ? N_con : unaligned_left;
-            uint64_t A = N_con - U;
-            if (U > 0) {
-                off_t start = force_unaligned_start(cur);
-                start = clamp_range(start, fsz, p->xfer);
-                for (uint64_t i = 0; i < U; i++) {
-                    void* use_ptr = (mis_left>0) ? mis_ptr : aligned_ptr;
-                    if (mis_left>0) mis_left--;
-                    if (do_prw(fd, use_ptr, (size_t)p->xfer, start, is_write) < 0) { perror(is_write?"pwrite":"pread"); U = 0; break; }
-                    start += (off_t)p->xfer;
-                }
-                cur = (off_t)start; unaligned_left -= U;
-            }
-            if (A > 0) {
-                off_t start = force_aligned_start(cur);
-                start = clamp_range(start, fsz, p->xfer);
-                for (uint64_t i = 0; i < A; i++) {
-                    void* use_ptr = (mis_left>0) ? mis_ptr : aligned_ptr;
-                    if (mis_left>0) mis_left--;
-                    if (do_prw(fd, use_ptr, (size_t)p->xfer, start, is_write) < 0) { perror(is_write?"pwrite":"pread"); break; }
-                    start += (off_t)p->xfer;
-                }
-                cur = (off_t)start; if (aligned_left >= A) aligned_left -= A; else aligned_left = 0;
-            }
-        } else {
+        uint64_t U = (unaligned_left > N_con) ? N_con : unaligned_left;
+        uint64_t A = N_con - U;
+        if (U > 0) {
             off_t start = clamp_range(cur, fsz, p->xfer);
-            for (uint64_t i=0; i<N_con; i++) {
+            uint64_t done = 0;
+            for (uint64_t i = 0; i < U; i++) {
+                off_t op_start = force_unaligned_start(start);
+                op_start = clamp_range(op_start, fsz, p->xfer);
                 void* use_ptr = (mis_left>0) ? mis_ptr : aligned_ptr;
                 if (mis_left>0) mis_left--;
-                if (do_prw(fd, use_ptr, (size_t)p->xfer, start, is_write) < 0) { perror(is_write?"pwrite":"pread"); break; }
-                start += (off_t)p->xfer;
+                if (do_prw(fd, use_ptr, (size_t)p->xfer, op_start, is_write) < 0) { perror(is_write?"pwrite":"pread"); break; }
+                start = op_start + (off_t)p->xfer;
+                done++;
             }
             cur = start;
+            if (unaligned_left >= done) unaligned_left -= done; else unaligned_left = 0;
+        }
+        if (A > 0) {
+            off_t start = clamp_range(cur, fsz, p->xfer);
+            uint64_t done = 0;
+            for (uint64_t i = 0; i < A; i++) {
+                off_t op_start = force_aligned_start(start);
+                op_start = clamp_range(op_start, fsz, p->xfer);
+                void* use_ptr = (mis_left>0) ? mis_ptr : aligned_ptr;
+                if (mis_left>0) mis_left--;
+                if (do_prw(fd, use_ptr, (size_t)p->xfer, op_start, is_write) < 0) { perror(is_write?"pwrite":"pread"); break; }
+                start = op_start + (off_t)p->xfer;
+                done++;
+            }
+            cur = start;
+            if (aligned_left >= done) aligned_left -= done; else aligned_left = 0;
         }
     }
 
     if (N_seq > 0) {
-        if (large) {
-            uint64_t U = (unaligned_left > N_seq) ? N_seq : unaligned_left;
-            uint64_t A = N_seq - U;
-            if (U > 0) {
-                off_t start = force_unaligned_start(cur + (off_t)p->xfer);
-                start = clamp_range(start, fsz, p->xfer);
-                for (uint64_t i=0; i<U; i++) {
-                    void* use_ptr = (mis_left>0) ? mis_ptr : aligned_ptr;
-                    if (mis_left>0) mis_left--;
-                    if (do_prw(fd, use_ptr, (size_t)p->xfer, start, is_write) < 0) { perror(is_write?"pwrite":"pread"); U = 0; break; }
-                    start += (off_t)(p->xfer * 2);
-                }
-                cur = start - (off_t)p->xfer; unaligned_left -= U;
-            }
-            if (A > 0) {
-                off_t start = force_aligned_start(cur + (off_t)p->xfer);
-                start = clamp_range(start, fsz, p->xfer);
-                for (uint64_t i=0; i<A; i++) {
-                    void* use_ptr = (mis_left>0) ? mis_ptr : aligned_ptr;
-                    if (mis_left>0) mis_left--;
-                    if (do_prw(fd, use_ptr, (size_t)p->xfer, start, is_write) < 0) { perror(is_write?"pwrite":"pread"); break; }
-                    start += (off_t)(p->xfer * 2);
-                }
-                cur = start - (off_t)p->xfer; if (aligned_left >= A) aligned_left -= A; else aligned_left = 0;
-            }
-        } else {
+        uint64_t U = (unaligned_left > N_seq) ? N_seq : unaligned_left;
+        uint64_t A = N_seq - U;
+        if (U > 0) {
             off_t start = clamp_range(cur + (off_t)p->xfer, fsz, p->xfer);
-            for (uint64_t i=0; i<N_seq; i++) {
+            uint64_t done = 0;
+            for (uint64_t i = 0; i < U; i++) {
+                off_t op_start = force_unaligned_start(start);
+                op_start = clamp_range(op_start, fsz, p->xfer);
                 void* use_ptr = (mis_left>0) ? mis_ptr : aligned_ptr;
                 if (mis_left>0) mis_left--;
-                if (do_prw(fd, use_ptr, (size_t)p->xfer, start, is_write) < 0) { perror(is_write?"pwrite":"pread"); break; }
-                start += (off_t)(p->xfer * 2);
+                if (do_prw(fd, use_ptr, (size_t)p->xfer, op_start, is_write) < 0) { perror(is_write?"pwrite":"pread"); break; }
+                start = op_start + (off_t)(p->xfer * 2);
+                done++;
             }
             cur = start - (off_t)p->xfer;
+            if (unaligned_left >= done) unaligned_left -= done; else unaligned_left = 0;
+        }
+        if (A > 0) {
+            off_t start = clamp_range(cur + (off_t)p->xfer, fsz, p->xfer);
+            uint64_t done = 0;
+            for (uint64_t i = 0; i < A; i++) {
+                off_t op_start = force_aligned_start(start);
+                op_start = clamp_range(op_start, fsz, p->xfer);
+                void* use_ptr = (mis_left>0) ? mis_ptr : aligned_ptr;
+                if (mis_left>0) mis_left--;
+                if (do_prw(fd, use_ptr, (size_t)p->xfer, op_start, is_write) < 0) { perror(is_write?"pwrite":"pread"); break; }
+                start = op_start + (off_t)(p->xfer * 2);
+                done++;
+            }
+            cur = start - (off_t)p->xfer;
+            if (aligned_left >= done) aligned_left -= done; else aligned_left = 0;
         }
     }
 
@@ -604,15 +607,15 @@ static void exec_phase_data_local(const phase_t* p, int phase_idx,
             off_t delta = (off_t)(r % (uint64_t)(span - (off_t)p->xfer + 1));
             start = chunk_start + delta;
         }
-        if (large) {
-            if (unaligned_left>0) { start = force_unaligned_start(start); unaligned_left--; }
-            else if (aligned_left>0) {
-                off_t aligned = start & ~(off_t)(LUSTRE_FILE_ALIGN-1);
-                if (aligned < chunk_start) aligned = chunk_start;
-                if (aligned + (off_t)p->xfer <= chunk_end) start = aligned;
-                else start = force_aligned_start(start);
-                aligned_left--;
-            }
+        if (unaligned_left > 0) {
+            start = force_unaligned_start(start);
+            unaligned_left--;
+        } else if (aligned_left > 0) {
+            off_t aligned = align_down_off(start);
+            if (aligned < chunk_start) aligned = force_aligned_start(chunk_start);
+            if (aligned + (off_t)p->xfer <= chunk_end) start = aligned;
+            else start = force_aligned_start(start);
+            aligned_left--;
         }
         start = clamp_range(start, fsz, p->xfer);
         void* use_ptr = (mis_left>0) ? mis_ptr : aligned_ptr;
@@ -637,7 +640,7 @@ static void exec_phase_data_local(const phase_t* p, int phase_idx,
         (is_unique_row_flags(p->flags) ? "[UNIQUE]" : "[LEGACY]"),
         p->path, p->xfer, Nops_local, N_con, N_seq, N_rnd,
         is_write ? "[WRITE]" : "[READ]", p->flags,
-        (int)LUSTRE_FILE_ALIGN, (int)MEM_ALIGN, start_idx, ts0, ts1);
+        (int)g_file_align_bytes, (int)MEM_ALIGN, start_idx, ts0, ts1);
     fflush(stderr);
 
     cursor_cache_set(p->path, is_write, cur);
@@ -982,12 +985,16 @@ int main(int argc, char** argv)
             if(!strcmp(v,"none")) cm=COL_NONE;
             else if(!strcmp(v,"independent")) cm=COL_INDEP;
             else if(!strcmp(v,"collective")) cm=COL_COLL;
+        } else if(!strcmp(argv[i],"--fs-align") && i+1<argc){
+            unsigned long long v = strtoull(argv[++i], NULL, 10);
+            if (v == 0ULL) v = 1ULL;
+            g_file_align_bytes = (uint64_t)v;
         }
     }
 
     if(!plan_path){
         if(rank==0){
-            fprintf(stderr,"Usage: %s --plan payload/plan.csv [--io-api posix|mpiio] [--meta-api posix] [--collective none|independent|collective]\n", argv[0]);
+            fprintf(stderr,"Usage: %s --plan payload/plan.csv [--io-api posix|mpiio] [--meta-api posix] [--collective none|independent|collective] [--fs-align BYTES]\n", argv[0]);
         }
         MPI_Finalize();
         return 1;
