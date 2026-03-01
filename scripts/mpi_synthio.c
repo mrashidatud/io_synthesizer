@@ -445,6 +445,25 @@ static inline off_t force_unaligned_start(off_t s)
     return s;
 }
 
+/* Return how many ops in [start_idx, start_idx+count) fall inside [0, prefix_quota). */
+static inline uint64_t prefix_quota_for_interval(uint64_t prefix_quota,
+                                                 uint64_t start_idx,
+                                                 uint64_t count,
+                                                 uint64_t total_ops)
+{
+    if (count == 0 || prefix_quota == 0 || total_ops == 0) return 0;
+    if (start_idx >= total_ops) return 0;
+
+    uint64_t end_idx = start_idx + count;
+    if (end_idx < start_idx || end_idx > total_ops) end_idx = total_ops;
+
+    uint64_t cutoff = (prefix_quota > total_ops) ? total_ops : prefix_quota;
+    if (start_idx >= cutoff) return 0;
+
+    uint64_t end_cut = (end_idx < cutoff) ? end_idx : cutoff;
+    return (end_cut > start_idx) ? (end_cut - start_idx) : 0;
+}
+
 // === ADD: execute a DATA row for exactly Nops_local ops starting at logical op-index 'start_idx'
 static void exec_phase_data_local(const phase_t* p, int phase_idx,
                                   uint64_t Nops_local, uint64_t start_idx) {
@@ -498,14 +517,25 @@ static void exec_phase_data_local(const phase_t* p, int phase_idx,
     if (p_con > 0.0 && N_con == 0 && N_rnd > 0)     { N_con++; N_rnd--; }
 
     // File-alignment quotas (applied for all xfer sizes).
-    uint64_t N_unaligned_total = (uint64_t)llround(p->p_ua_file * (double)Nops_local);
-    if (N_unaligned_total > Nops_local) N_unaligned_total = Nops_local;
+    // Use GLOBAL row ops, then map quota onto this rank's [start_idx, start_idx+Nops_local)
+    // interval. This avoids per-rank rounding inflation on tiny shared rows.
+    uint64_t Nops_global = p->n_ops ? p->n_ops : Nops_local;
+    if (Nops_global < Nops_local) Nops_global = Nops_local;
+    uint64_t N_unaligned_global = (uint64_t)llround(p->p_ua_file * (double)Nops_global);
+    if (N_unaligned_global > Nops_global) N_unaligned_global = Nops_global;
+    uint64_t N_unaligned_total = prefix_quota_for_interval(
+        N_unaligned_global, start_idx, Nops_local, Nops_global
+    );
     uint64_t N_aligned_total = Nops_local - N_unaligned_total;
     uint64_t unaligned_left = N_unaligned_total;
     uint64_t aligned_left   = N_aligned_total;
 
     // mem misalignment
-    uint64_t N_mem_mis = (uint64_t)llround(p->p_ua_mem * (double)Nops_local);
+    uint64_t N_mem_mis_global = (uint64_t)llround(p->p_ua_mem * (double)Nops_global);
+    if (N_mem_mis_global > Nops_global) N_mem_mis_global = Nops_global;
+    uint64_t N_mem_mis = prefix_quota_for_interval(
+        N_mem_mis_global, start_idx, Nops_local, Nops_global
+    );
     uint64_t mis_left = N_mem_mis;
 
     buf_t b = alloc_buffer((size_t)p->xfer);

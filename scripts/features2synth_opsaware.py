@@ -141,6 +141,56 @@ def read_features(path):
     with open(path,"r") as f:
         return json.load(f)
 
+def _closest_existing_path(path: Path) -> Path:
+    p = path.resolve()
+    while not p.exists() and p.parent != p:
+        p = p.parent
+    return p
+
+def _mount_fstype_for_path(path: Path) -> Optional[str]:
+    """
+    Resolve filesystem type from /proc/mounts by longest mount-point prefix.
+    """
+    target = str(path.resolve())
+    best_len = -1
+    best_fs = None
+    try:
+        with open("/proc/mounts", "r", encoding="utf-8") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) < 3:
+                    continue
+                mnt = parts[1].replace("\\040", " ")
+                fs_type = parts[2].strip().lower()
+                if target == mnt or target.startswith(mnt.rstrip("/") + "/"):
+                    if len(mnt) > best_len:
+                        best_len = len(mnt)
+                        best_fs = fs_type
+    except Exception:
+        return None
+    return best_fs
+
+def infer_fs_file_alignment_bytes(target_path: Path, fallback_align: int) -> int:
+    """
+    Infer file alignment from filesystem characteristics in a Darshan-compatible way:
+      - Lustre => 1 MiB (Darshan POSIX module behavior)
+      - Others => statvfs block size (f_bsize)
+      - Fallback => caller-provided default
+    """
+    p = _closest_existing_path(target_path)
+    fs_type = _mount_fstype_for_path(p)
+    if fs_type == "lustre":
+        return 1 << 20
+    try:
+        st = os.statvfs(str(p))
+        if int(st.f_bsize) > 0:
+            return int(st.f_bsize)
+        if int(st.f_frsize) > 0:
+            return int(st.f_frsize)
+    except Exception:
+        pass
+    return int(fallback_align)
+
 def clamp01(x): return max(0.0, min(1.0, float(x)))
 
 def rational_counts(fracs, max_denom=64, tol=0.05):
@@ -1687,6 +1737,9 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
         min(64, max(min_data_from_roles, min_data_from_shared)),
     )
     target_data_files_initial = int(target_data_files)
+    enable_filecount_alignment_heuristic = bool(
+        feats.get("enable_filecount_alignment_heuristic", False)
+    )
     max_data_files_for_alignment = int(feats.get("max_data_files_for_alignment", 8192))
     if max_data_files_for_alignment < 1:
         max_data_files_for_alignment = 1
@@ -2016,9 +2069,9 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
             if int(sz) % fs_align_bytes != 0
         )
 
-    # One-shot file-count heuristic for offset-driven misalignment:
-    # if intrinsic xfer-floor overshoots target by >0.05, estimate the
-    # number of files needed to "rescue" one intrinsic op per file start.
+    # Optional one-shot file-count heuristic for legacy offset-driven
+    # misalignment handling. Disabled by default because runtime now
+    # enforces p_ua_file directly for all xfer sizes.
     read_bin_specs = (
         (R_S, [read_pick["S"]] if read_pick["S"] is not None else list(S_SUBS)),
         (R_M, [read_pick["M"]] if read_pick["M"] is not None else list(M_SUBS)),
@@ -2043,6 +2096,7 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
         min(int(max_data_files_for_alignment), int(Nio))
     )
     if (
+        enable_filecount_alignment_heuristic and
         filecount_heuristic_gap_est > 0.05 and
         filecount_heuristic_intrinsic_ops_est > 0 and
         fs_align_bytes > 0
@@ -2080,6 +2134,8 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
             filecount_heuristic_note = "gap_detected_no_growth"
     elif filecount_heuristic_gap_est > 0.05:
         filecount_heuristic_note = "gap_detected_not_applicable"
+    elif not enable_filecount_alignment_heuristic:
+        filecount_heuristic_note = "disabled"
     spread_seed_read = 0
     spread_seed_write = 0
 
@@ -2673,8 +2729,11 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
                 n_seq = int(round(ops * max(0.0, ps - pc)))
                 n_rand = max(0, ops - n_con - n_seq)
 
-                # structured coverage: stride by xfer
-                cov_struct += (n_con + n_seq) * xfer
+                # Structured coverage:
+                # - Consecutive grows by xfer per op.
+                # - Seq-only in runtime uses a fixed gap=xfer (stride=2*xfer), so
+                #   each seq op expands file span by ~2*xfer.
+                cov_struct += (n_con * xfer) + (2 * n_seq * xfer)
 
                 # random coverage: 1 op per 128 MiB chunk (RR across chunks)
                 n_rand_total += n_rand
@@ -2698,8 +2757,8 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
                 n_con  = a["con"]
                 n_seq  = a["seq"]
                 n_rand = a["rnd"]
-                # structured coverage
-                cov_struct += (n_con + n_seq) * xfer
+                # Keep tiny-row sizing consistent with runtime seq stride=2*xfer.
+                cov_struct += (n_con * xfer) + (2 * n_seq * xfer)
                 # random coverage is per-file at 1 op per CHUNK_RANDOM
                 n_rand_total += n_rand
             cov_random = n_rand_total * CHUNK_RANDOM
@@ -2757,6 +2816,9 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
     iapi   = str(feats.get('io_api', 'posix'))
     mapi   = str(feats.get('meta_api', 'posix'))
     coll   = str(feats.get('mpi_collective_mode', 'none'))
+    darshan_modmem_mib = int(feats.get("darshan_modmem_mib", 64))
+    if darshan_modmem_mib < 4:
+        darshan_modmem_mib = 4
 
     # For DARSHAN_LOGFILE naming
     cap_total_gib = float(feats.get("cap_total_gib", 1.0))
@@ -2775,9 +2837,18 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
         f.write(
             "mpiexec -n {n} "
             "-genv LD_PRELOAD /mnt/hasanfs/darshan-3.4.7/darshan-runtime/install/lib/libdarshan.so "
+            "-genv DARSHAN_MODMEM {modmem} "
             "-genv DARSHAN_LOGFILE \"$DARSHAN_LOGFILE\" "
             "/mnt/hasanfs/bin/mpi_synthio --plan {plan} --io-api {iapi} --meta-api {mapi} --collective {coll} --fs-align {fs_align}\n"
-            .format(n=nprocs, plan=str(PLAN), iapi=iapi, mapi=mapi, coll=coll, fs_align=fs_align_bytes)
+            .format(
+                n=nprocs,
+                plan=str(PLAN),
+                iapi=iapi,
+                mapi=mapi,
+                coll=coll,
+                fs_align=fs_align_bytes,
+                modmem=darshan_modmem_mib,
+            )
         )
     os.chmod(RUNNER, 0o755)
 
@@ -2906,6 +2977,7 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
         f.write("=== ALIGNMENT TARGETING (FILE vs Darshan File-Alignment) ===\n")
         f.write(f"  Requested pct_file_not_aligned={p_file_ua_req:.2f}\n")
         f.write(f"  fs_align_bytes={fs_align_bytes}  (mem_align_bytes={mem_align_bytes})\n")
+        f.write(f"  darshan_modmem_mib={darshan_modmem_mib}\n")
         f.write(
             f"  Legacy xfer-not-multiple count (diagnostic only): "
             f"{legacy_xfer_not_multiple_ops} of {total_ops}  "
@@ -2995,8 +3067,21 @@ def main():
     if args.meta_scope is not None:
         feats["_meta_scope"] = args.meta_scope
 
-    # Keep align pref
-    fs_align_bytes = int(feats.get("posix_file_alignment_bytes", args.fs_align))
+    # Keep align pref:
+    #  1) JSON explicit field (preferred)
+    #  2) filesystem-derived alignment (Darshan-compatible fallback)
+    #  3) CLI/default --fs-align
+    if ("posix_file_alignment_bytes" in feats) or ("POSIX_FILE_ALIGNMENT" in feats):
+        fs_align_raw = feats.get("posix_file_alignment_bytes", feats.get("POSIX_FILE_ALIGNMENT", args.fs_align))
+        try:
+            fs_align_bytes = int(float(fs_align_raw))
+        except Exception:
+            fs_align_bytes = int(args.fs_align)
+        if fs_align_bytes <= 0:
+            fs_align_bytes = int(args.fs_align)
+    else:
+        fs_align_bytes = infer_fs_file_alignment_bytes(OUTROOT, int(args.fs_align))
+    feats["posix_file_alignment_bytes"] = int(fs_align_bytes)
 
     # Stash json base for runner naming
     feats["_json_base"] = json_base
