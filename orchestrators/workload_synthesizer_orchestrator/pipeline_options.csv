@@ -7,3 +7,12 @@ force_build,1
 delete_darshan,1
 filters,1-25
 meta_scope,data_files
+optimizer,lexicographic
+seq_policy,nonconsec_strict
+alignment_policy,structure_preserving
+phase_cap,50000
+data_random_preseek,0
+darshan_poll_timeout_sec,120
+darshan_poll_initial_sec,0.5
+darshan_poll_max_sec,5.0
+darshan_poll_backoff,1.6

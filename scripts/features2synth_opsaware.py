@@ -1493,40 +1493,127 @@ def rebalancer_autotune_fair(rows, target_total_bytes,
         rr_reduce_to_target(lambda r: r.get("intent") == "read",  desired_read,  eps)
         rr_reduce_to_target(lambda r: r.get("intent") == "write", desired_write, eps)
 
-# ---------------- RW-switch interleaving ----------------
-def interleave_rw_segments(rows, switch_frac=0.0, seg_ops=64):
-    if switch_frac <= 0.0: return rows
-    from collections import defaultdict
-    # Switching is a per-file access pattern; allow pairing across bins/xfer on the same RW path.
-    key = lambda r: r["file"]
-    groups = defaultdict(lambda: {"R": [], "W": []})
+def _split_even(total: int, nprocs: int, rank: int) -> int:
+    base = total // max(1, nprocs)
+    rem = total % max(1, nprocs)
+    return base + (1 if rank < rem else 0)
+
+
+def _fnv1a_64(text: str) -> int:
+    h = 1469598103934665603
+    for b in text.encode("utf-8"):
+        h ^= int(b)
+        h = (h * 1099511628211) & ((1 << 64) - 1)
+    return h
+
+
+def predict_rw_switches_participant_aware(rows, nprocs: int):
+    """
+    Estimate runtime-observed POSIX_RW_SWITCHES from planned row order,
+    accounting for shared/unique/legacy participant sets.
+    """
+    nprocs = max(1, int(nprocs))
+    total_ops = 0
+    switches = 0
+    last_by_rank_path = {}
+
     for r in rows:
-        if r["role"]=="rw":
-            groups[key(r)][ "R" if r["intent"]=="read" else "W" ].append(r)
+        ops = int(r.get("ops", 0))
+        if ops <= 0:
+            continue
+        total_ops += ops
+        intent = "W" if r.get("intent") == "write" else "R"
+        path = str(r.get("file", ""))
+        flags = str(r.get("flags", ""))
 
-    # Calibrate interleaving globally against a switch target normalized by total accesses.
-    total_ops_all = sum(int(r.get("ops", 0)) for r in rows if r.get("intent") in ("read", "write"))
-    target_switches = int(round(clamp01(switch_frac) * total_ops_all))
-    group_mins = {}
-    for k, g in groups.items():
-        r_ops = sum(int(r["ops"]) for r in g["R"])
-        w_ops = sum(int(r["ops"]) for r in g["W"])
-        m = min(r_ops, w_ops)
-        if m > 0:
-            group_mins[k] = m
+        if "|shared|" in flags:
+            participants = [
+                rk for rk in range(nprocs)
+                if _split_even(ops, nprocs, rk) > 0
+            ]
+        elif "|unique|" in flags:
+            owner = int(_fnv1a_64(path) % nprocs)
+            participants = [owner] if ops > 0 else []
+        else:
+            participants = [0] if ops > 0 else []
 
-    M_total = sum(group_mins.values())
-    if target_switches <= 0 or M_total <= 0:
-        return rows
+        for rk in participants:
+            key = (rk, path)
+            prev = last_by_rank_path.get(key)
+            if prev is not None and prev != intent:
+                switches += 1
+            last_by_rank_path[key] = intent
 
-    seg_ops_eff = max(1, int(seg_ops))
+    frac = (float(switches) / float(total_ops)) if total_ops > 0 else 0.0
+    return {
+        "pred_switches": int(switches),
+        "total_ops": int(total_ops),
+        "pred_frac": float(frac),
+    }
 
-    # In an alternating pattern R,W,R,W,... each paired segment contributes about two switches.
-    target_pairs = max(1, int(round(target_switches / 2.0)))
-    # Largest segment size still capable of producing the requested number of pairs.
-    seg_ops_feasible = max(1, int(M_total // max(1, target_pairs)))
-    seg_ops_eff = min(seg_ops_eff, seg_ops_feasible)
-    pair_ops_target = min(M_total, target_pairs * seg_ops_eff)
+
+def _coalesce_rows(rows, *, allow_reorder: bool):
+    if not rows:
+        return []
+    if allow_reorder:
+        agg = {}
+        for r in rows:
+            ops = int(r.get("ops", 0))
+            if ops <= 0:
+                continue
+            key = (
+                r.get("file"),
+                r.get("intent"),
+                int(r.get("xfer", 0)),
+                r.get("phase_kind", ""),
+                r.get("flags", ""),
+                r.get("role", ""),
+                r.get("bin", ""),
+            )
+            if key not in agg:
+                rr = dict(r)
+                rr["ops"] = 0
+                agg[key] = rr
+            agg[key]["ops"] += ops
+        out = list(agg.values())
+        out.sort(key=lambda r: (
+            str(r.get("file", "")),
+            str(r.get("intent", "")),
+            int(r.get("xfer", 0)),
+            str(r.get("phase_kind", "")),
+            str(r.get("flags", "")),
+        ))
+        return out
+
+    out = []
+    prev = None
+    for r in rows:
+        ops = int(r.get("ops", 0))
+        if ops <= 0:
+            continue
+        key = (
+            r.get("file"),
+            r.get("intent"),
+            int(r.get("xfer", 0)),
+            r.get("phase_kind", ""),
+            r.get("flags", ""),
+            r.get("role", ""),
+            r.get("bin", ""),
+        )
+        if prev is not None and prev[0] == key:
+            prev[1]["ops"] += ops
+        else:
+            rr = dict(r)
+            rr["ops"] = ops
+            out.append(rr)
+            prev = (key, rr)
+    return out
+
+
+# ---------------- RW-switch interleaving ----------------
+def interleave_rw_segments(rows, switch_frac=0.0, seg_ops=64, phase_cap=0):
+    rows_in = [dict(r) for r in rows if int(r.get("ops", 0)) > 0]
+    phase_cap = int(phase_cap) if phase_cap is not None else 0
 
     def allocate_pair_ops(min_map, total_need):
         if total_need <= 0 or not min_map:
@@ -1551,58 +1638,168 @@ def interleave_rw_segments(rows, switch_frac=0.0, seg_ops=64):
                     break
         return alloc
 
-    inter_by_group = allocate_pair_ops(group_mins, int(pair_ops_target))
+    def build_rows_for_target(target_switches_eff):
+        from collections import defaultdict
+        rows_local = [dict(r) for r in rows_in]
+        groups = defaultdict(lambda: {"R": [], "W": []})
+        for r in rows_local:
+            if r.get("role") == "rw":
+                groups[r["file"]]["R" if r["intent"] == "read" else "W"].append(r)
 
-    new_rows=[]; drained=set()
-    def next_live(lst, i):
-        while i < len(lst) and int(lst[i].get("ops", 0)) <= 0:
-            i += 1
-        return i
+        group_mins = {}
+        for k, g in groups.items():
+            r_ops = sum(int(rr["ops"]) for rr in g["R"])
+            w_ops = sum(int(rr["ops"]) for rr in g["W"])
+            m = min(r_ops, w_ops)
+            if m > 0:
+                group_mins[k] = m
 
-    for k, g in groups.items():
-        left = int(inter_by_group.get(k, 0))
-        if left <= 0:
-            continue
-        Rs = g["R"]
-        Ws = g["W"]
-        ir = 0
-        iw = 0
-        while left > 0:
-            ir = next_live(Rs, ir)
-            iw = next_live(Ws, iw)
-            if ir >= len(Rs) or iw >= len(Ws):
-                break
-            rrow = Rs[ir]
-            wrow = Ws[iw]
-            take = min(seg_ops_eff, left, int(rrow["ops"]), int(wrow["ops"]))
-            if take <= 0:
-                break
-            rseg = dict(rrow); rseg["ops"] = take
-            wseg = dict(wrow); wseg["ops"] = take
-            new_rows.append(rseg); new_rows.append(wseg)
-            rrow["ops"] -= take
-            wrow["ops"] -= take
-            if rrow["ops"] == 0:
-                drained.add(id(rrow))
-                ir += 1
-            if wrow["ops"] == 0:
-                drained.add(id(wrow))
-                iw += 1
-            left -= take
+        M_total = sum(group_mins.values())
+        if target_switches_eff <= 0 or M_total <= 0:
+            return [dict(r) for r in rows_local], {
+                "target_switches_eff": int(max(0, target_switches_eff)),
+                "seg_ops_eff": int(max(1, seg_ops)),
+                "pair_ops_target": 0,
+                "M_total": int(M_total),
+            }
 
-    for r in rows:
-        if id(r) in drained: continue
-        if r["ops"]>0: new_rows.append(r)
+        seg_ops_eff = max(1, int(seg_ops))
+        target_pairs = max(1, int(round(float(target_switches_eff) / 2.0)))
+        seg_ops_feasible = max(1, int(M_total // max(1, target_pairs)))
+        seg_ops_eff = min(seg_ops_eff, seg_ops_feasible)
+        pair_ops_target = min(M_total, target_pairs * seg_ops_eff)
+        inter_by_group = allocate_pair_ops(group_mins, int(pair_ops_target))
 
-    return new_rows
+        new_rows = []
+        drained = set()
+
+        def next_live(lst, i):
+            while i < len(lst) and int(lst[i].get("ops", 0)) <= 0:
+                i += 1
+            return i
+
+        for k, g in groups.items():
+            left = int(inter_by_group.get(k, 0))
+            if left <= 0:
+                continue
+            Rs = g["R"]
+            Ws = g["W"]
+            ir = 0
+            iw = 0
+            while left > 0:
+                ir = next_live(Rs, ir)
+                iw = next_live(Ws, iw)
+                if ir >= len(Rs) or iw >= len(Ws):
+                    break
+                rrow = Rs[ir]
+                wrow = Ws[iw]
+                take = min(seg_ops_eff, left, int(rrow["ops"]), int(wrow["ops"]))
+                if take <= 0:
+                    break
+                rseg = dict(rrow)
+                wseg = dict(wrow)
+                rseg["ops"] = take
+                wseg["ops"] = take
+                new_rows.append(rseg)
+                new_rows.append(wseg)
+                rrow["ops"] -= take
+                wrow["ops"] -= take
+                if rrow["ops"] == 0:
+                    drained.add(id(rrow))
+                    ir += 1
+                if wrow["ops"] == 0:
+                    drained.add(id(wrow))
+                    iw += 1
+                left -= take
+
+        for r in rows_local:
+            if id(r) in drained:
+                continue
+            if int(r.get("ops", 0)) > 0:
+                new_rows.append(r)
+
+        return new_rows, {
+            "target_switches_eff": int(max(0, target_switches_eff)),
+            "seg_ops_eff": int(seg_ops_eff),
+            "pair_ops_target": int(pair_ops_target),
+            "M_total": int(M_total),
+        }
+
+    total_ops_all = sum(int(r.get("ops", 0)) for r in rows_in)
+    target_switches = int(round(clamp01(switch_frac) * float(total_ops_all)))
+    target_switches = max(0, target_switches)
+
+    if switch_frac <= 0.0:
+        rows0 = _coalesce_rows(rows_in, allow_reorder=True)
+        return rows0, {
+            "switch_requested": int(target_switches),
+            "switch_effective": 0,
+            "phase_cap": int(phase_cap),
+            "phase_cap_applied": False,
+            "seg_ops_hint": int(max(1, int(seg_ops))),
+            "coalesced_rows": len(rows0),
+        }
+
+    cand_rows, build_diag = build_rows_for_target(target_switches)
+    cand_rows = _coalesce_rows(cand_rows, allow_reorder=False)
+    if phase_cap <= 0 or len(cand_rows) <= phase_cap:
+        return cand_rows, {
+            "switch_requested": int(target_switches),
+            "switch_effective": int(build_diag.get("target_switches_eff", target_switches)),
+            "phase_cap": int(phase_cap),
+            "phase_cap_applied": False,
+            "seg_ops_eff": int(build_diag.get("seg_ops_eff", max(1, int(seg_ops)))),
+            "pair_ops_target": int(build_diag.get("pair_ops_target", 0)),
+            "M_total": int(build_diag.get("M_total", 0)),
+            "coalesced_rows": len(cand_rows),
+        }
+
+    lo, hi = 0, target_switches
+    best_rows = _coalesce_rows(build_rows_for_target(0)[0], allow_reorder=False)
+    best_diag = {"target_switches_eff": 0, "seg_ops_eff": int(max(1, int(seg_ops))), "pair_ops_target": 0, "M_total": 0}
+    if len(best_rows) > phase_cap:
+        # If even 0-switch interleave cannot fit, keep a minimal adjacent-coalesced fallback.
+        rows_min = _coalesce_rows(rows_in, allow_reorder=True)
+        return rows_min, {
+            "switch_requested": int(target_switches),
+            "switch_effective": 0,
+            "phase_cap": int(phase_cap),
+            "phase_cap_applied": True,
+            "seg_ops_eff": int(max(1, int(seg_ops))),
+            "pair_ops_target": 0,
+            "M_total": 0,
+            "coalesced_rows": len(rows_min),
+            "phase_cap_unmet": len(rows_min) > phase_cap,
+        }
+
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        rows_mid, diag_mid = build_rows_for_target(mid)
+        rows_mid = _coalesce_rows(rows_mid, allow_reorder=False)
+        if len(rows_mid) <= phase_cap:
+            best_rows = rows_mid
+            best_diag = diag_mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+
+    return best_rows, {
+        "switch_requested": int(target_switches),
+        "switch_effective": int(best_diag.get("target_switches_eff", 0)),
+        "phase_cap": int(phase_cap),
+        "phase_cap_applied": True,
+        "seg_ops_eff": int(best_diag.get("seg_ops_eff", max(1, int(seg_ops)))),
+        "pair_ops_target": int(best_diag.get("pair_ops_target", 0)),
+        "M_total": int(best_diag.get("M_total", 0)),
+        "coalesced_rows": len(best_rows),
+    }
 
 # ---------------- Alignment targeting (file) ----------------
-def compute_rowwise_pua_file(rows, target_frac, fs_align_bytes):
+def compute_rowwise_pua_file(rows, target_frac, fs_align_bytes, alignment_policy="strict_per_op"):
     """
     Global ops-weighted targeting for file-start misalignment.
     Runtime now enforces p_ua_file for all xfer sizes, so there is no xfer-mod floor here.
     """
-    del fs_align_bytes  # kept for interface compatibility
     total_ops = sum(int(r.get("ops", 0)) for r in rows if int(r.get("ops", 0)) > 0)
     if total_ops <= 0:
         return {}
@@ -1616,34 +1813,444 @@ def compute_rowwise_pua_file(rows, target_frac, fs_align_bytes):
     if not active:
         return p_map
 
-    alloc = {}
-    frac_order = []
-    base_sum = 0
-    for idx, r in active:
-        ops = int(r["ops"])
-        raw = tgt * float(ops)
-        base = int(math.floor(raw))
-        if base > ops:
-            base = ops
-        alloc[idx] = base
-        base_sum += base
-        frac_order.append((raw - float(base), idx))
+    if str(alignment_policy).strip().lower() != "structure_preserving":
+        alloc = {}
+        frac_order = []
+        base_sum = 0
+        for idx, r in active:
+            ops = int(r["ops"])
+            raw = tgt * float(ops)
+            base = int(math.floor(raw))
+            if base > ops:
+                base = ops
+            alloc[idx] = base
+            base_sum += base
+            frac_order.append((raw - float(base), idx))
 
-    rem = target_unaligned_ops - base_sum
-    if rem > 0:
-        frac_order.sort(key=lambda t: (t[0], -t[1]), reverse=True)
-        for _, idx in frac_order:
-            if rem <= 0:
+        rem = target_unaligned_ops - base_sum
+        if rem > 0:
+            frac_order.sort(key=lambda t: (t[0], -t[1]), reverse=True)
+            for _, idx in frac_order:
+                if rem <= 0:
+                    break
+                ops = int(rows[idx]["ops"])
+                if alloc[idx] < ops:
+                    alloc[idx] += 1
+                    rem -= 1
+    else:
+        # Lexicographic tie-break helper: preserve ordering structure first.
+        # For consec phases with xfer not divisible by fs_align, forcing
+        # per-op aligned starts can convert consec -> seq in Darshan/runtime.
+        # Keep consec conservative; allow seq rows to absorb alignment demand.
+        align = int(fs_align_bytes) if fs_align_bytes else 1
+        align = max(1, align)
+
+        min_unaligned = {}
+        alloc_aligned = {idx: 0 for idx, _ in active}
+        classes = {
+            "random": [],
+            "other": [],
+            "seq_safe": [],
+            "consec_safe": [],
+        }
+
+        for idx, r in active:
+            ops = int(r.get("ops", 0))
+            if ops <= 0:
+                continue
+            kind = str(r.get("phase_kind", "other")).strip().lower()
+            xfer = int(r.get("xfer", 0))
+            order_sensitive = kind in {"consec"}
+            align_unsafe = (
+                order_sensitive and
+                align > 1 and
+                xfer > 0 and
+                (xfer % align) != 0
+            )
+            floor_unaligned = ops if align_unsafe else 0
+            min_unaligned[idx] = floor_unaligned
+            cap_aligned = max(0, ops - floor_unaligned)
+            if cap_aligned <= 0:
+                continue
+
+            if kind == "random":
+                classes["random"].append((idx, cap_aligned))
+            elif kind == "seq":
+                classes["seq_safe"].append((idx, cap_aligned))
+            elif kind == "consec":
+                classes["consec_safe"].append((idx, cap_aligned))
+            else:
+                classes["other"].append((idx, cap_aligned))
+
+        floor_unaligned_ops = sum(int(v) for v in min_unaligned.values())
+        target_unaligned_ops_eff = max(int(target_unaligned_ops), int(floor_unaligned_ops))
+        target_unaligned_ops_eff = min(int(total_ops), int(target_unaligned_ops_eff))
+        target_aligned_ops = max(0, int(total_ops) - int(target_unaligned_ops_eff))
+
+        def alloc_proportional(bucket, need):
+            if need <= 0 or not bucket:
+                return 0
+            total_cap = sum(int(cap) for _, cap in bucket)
+            if total_cap <= 0:
+                return 0
+            use = min(int(need), int(total_cap))
+            raw = []
+            base = 0
+            out = {}
+            for idx, cap in bucket:
+                frac = (float(cap) / float(total_cap)) if total_cap > 0 else 0.0
+                want = frac * float(use)
+                b = min(int(cap), int(math.floor(want)))
+                out[idx] = b
+                base += b
+                raw.append((want - float(b), idx, int(cap)))
+            rem = int(use - base)
+            if rem > 0:
+                raw.sort(key=lambda t: (t[0], t[2]), reverse=True)
+                for _, idx, cap in raw:
+                    if rem <= 0:
+                        break
+                    if out[idx] < cap:
+                        out[idx] += 1
+                        rem -= 1
+            for idx, val in out.items():
+                alloc_aligned[idx] += int(val)
+            return int(use)
+
+        aligned_left = int(target_aligned_ops)
+        # Priority: random -> other -> seq_safe -> consec_safe
+        for cls in ("random", "other", "seq_safe", "consec_safe"):
+            consumed = alloc_proportional(classes[cls], aligned_left)
+            aligned_left -= consumed
+            if aligned_left <= 0:
                 break
-            ops = int(rows[idx]["ops"])
-            if alloc[idx] < ops:
-                alloc[idx] += 1
-                rem -= 1
+
+        alloc = {}
+        for idx, rr in active:
+            ops = int(rr.get("ops", 0))
+            floor_unaligned = int(min_unaligned.get(idx, 0))
+            aligned_cap = max(0, ops - floor_unaligned)
+            aligned = max(0, min(aligned_cap, int(alloc_aligned.get(idx, 0))))
+            alloc[idx] = max(0, ops - aligned)
 
     for idx, r in active:
         ops = int(r["ops"])
         p_map[id(r)] = float(alloc[idx]) / float(ops) if ops > 0 else 0.0
     return p_map
+
+
+def split_rows_into_phase_kinds(rows, consec_r, seq_r, consec_w, seq_w):
+    """
+    Split each row into consec/seq/random phase rows with exact integer totals per row.
+    """
+    out = []
+    for r in rows:
+        ops = int(r.get("ops", 0))
+        if ops <= 0:
+            continue
+        is_read = (r.get("intent") == "read")
+        pc = (consec_r if is_read else consec_w)
+        ps = (seq_r if is_read else seq_w)
+        pc = min(clamp01(pc), clamp01(ps))
+        n_con = int(round(ops * pc))
+        n_seq = int(round(ops * max(0.0, ps - pc)))
+        if n_con > ops:
+            n_con = ops
+        if n_seq > (ops - n_con):
+            n_seq = ops - n_con
+        n_rnd = max(0, ops - n_con - n_seq)
+
+        if n_con > 0:
+            rr = dict(r)
+            rr["ops"] = n_con
+            rr["phase_kind"] = "consec"
+            out.append(rr)
+        if n_seq > 0:
+            rr = dict(r)
+            rr["ops"] = n_seq
+            rr["phase_kind"] = "seq"
+            out.append(rr)
+        if n_rnd > 0:
+            rr = dict(r)
+            rr["ops"] = n_rnd
+            rr["phase_kind"] = "random"
+            out.append(rr)
+    return out
+
+
+def materialize_tiny_phase_rows(tiny_items, intent, path_flags):
+    """
+    Convert tiny item counts into explicit phase rows for diagnostics/sizing.
+    """
+    out = []
+    for it in tiny_items:
+        path = str(it.get("path", ""))
+        xfer = int(it.get("xfer", 0))
+        if xfer <= 0 or not path:
+            continue
+        flags_extra = path_flags.get(path, "|unique|")
+        role = str(it.get("role", "")).strip().lower()
+        base = {
+            "file": path,
+            "intent": intent,
+            "xfer": xfer,
+            "flags": flags_extra,
+            "role": role,
+            "bin": "",
+        }
+        n_con = int(it.get("con", 0))
+        n_seq = int(it.get("seq", 0))
+        n_rnd = int(it.get("rnd", 0))
+        if n_con > 0:
+            rr = dict(base)
+            rr["phase_kind"] = "consec"
+            rr["ops"] = n_con
+            out.append(rr)
+        if n_seq > 0:
+            rr = dict(base)
+            rr["phase_kind"] = "seq"
+            rr["ops"] = n_seq
+            out.append(rr)
+        if n_rnd > 0:
+            rr = dict(base)
+            rr["phase_kind"] = "random"
+            rr["ops"] = n_rnd
+            out.append(rr)
+    return out
+
+
+def estimate_ordering_metrics(rows, nprocs):
+    """
+    Compute produced ordering metrics from finalized phase rows.
+    """
+    read_ops = 0
+    write_ops = 0
+    read_seq = 0
+    write_seq = 0
+    read_con = 0
+    write_con = 0
+    for r in rows:
+        ops = int(r.get("ops", 0))
+        if ops <= 0:
+            continue
+        intent = str(r.get("intent", ""))
+        phase_kind = str(r.get("phase_kind", ""))
+        if intent == "read":
+            read_ops += ops
+            if phase_kind in {"consec", "seq"}:
+                read_seq += ops
+            if phase_kind == "consec":
+                read_con += ops
+        elif intent == "write":
+            write_ops += ops
+            if phase_kind in {"consec", "seq"}:
+                write_seq += ops
+            if phase_kind == "consec":
+                write_con += ops
+
+    sw = predict_rw_switches_participant_aware(rows, nprocs=max(1, int(nprocs)))
+    return {
+        "pct_seq_reads": (float(read_seq) / float(read_ops)) if read_ops > 0 else 0.0,
+        "pct_seq_writes": (float(write_seq) / float(write_ops)) if write_ops > 0 else 0.0,
+        "pct_consec_reads": (float(read_con) / float(read_ops)) if read_ops > 0 else 0.0,
+        "pct_consec_writes": (float(write_con) / float(write_ops)) if write_ops > 0 else 0.0,
+        "pct_rw_switches": float(sw.get("pred_frac", 0.0)),
+        "read_ops_total": int(read_ops),
+        "write_ops_total": int(write_ops),
+        "pred_switches": int(sw.get("pred_switches", 0)),
+        "pred_switch_ops_total": int(sw.get("total_ops", 0)),
+    }
+
+
+def compute_ordering_error(metrics, targets):
+    keys = (
+        "pct_seq_reads",
+        "pct_seq_writes",
+        "pct_consec_reads",
+        "pct_consec_writes",
+        "pct_rw_switches",
+    )
+    return sum(abs(float(metrics.get(k, 0.0)) - float(targets.get(k, 0.0))) for k in keys)
+
+
+def _simulate_clamp_events_for_file(rows, file_size, fs_align_bytes, pua_map):
+    """
+    Approximate clamp events using the same phase progression semantics as runtime.
+    """
+    if file_size <= 0 or not rows:
+        return 0
+    align = max(1, int(fs_align_bytes) if fs_align_bytes else 1)
+
+    def _clamp(v, lo, hi):
+        if v < lo:
+            return lo
+        if v > hi:
+            return hi
+        return v
+
+    def _force_aligned(v):
+        if align <= 1:
+            return v
+        rem = v % align
+        if rem == 0:
+            return v
+        return v + (align - rem)
+
+    def _force_unaligned(v):
+        if align <= 1:
+            return v
+        if (v % align) == 0:
+            return v + 1
+        return v
+
+    def _align_down(v):
+        if align <= 1:
+            return v
+        return v - (v % align)
+
+    cur_by_intent = {"read": 0, "write": 0}
+    clamps = 0
+
+    for r in rows:
+        ops = int(r.get("ops", 0))
+        if ops <= 0:
+            continue
+        xfer = int(r.get("xfer", 0))
+        if xfer <= 0:
+            continue
+        max_off = max(0, int(file_size) - int(xfer))
+        intent = "write" if str(r.get("intent", "")) == "write" else "read"
+        phase_kind = str(r.get("phase_kind", "random")).strip().lower()
+        pua = clamp01(pua_map.get(id(r), 0.0))
+        n_unaligned = max(0, min(ops, int(round(pua * float(ops)))))
+        n_aligned = ops - n_unaligned
+
+        cur = _clamp(int(cur_by_intent.get(intent, 0)), 0, max_off)
+
+        if phase_kind == "consec":
+            start = cur
+            for mode, cnt in (("U", n_unaligned), ("A", n_aligned)):
+                for _ in range(cnt):
+                    op_start = _force_unaligned(start) if mode == "U" else _force_aligned(start)
+                    if op_start > max_off:
+                        clamps += 1
+                        op_start = max_off
+                    start = op_start + xfer
+            cur = start
+        elif phase_kind == "seq":
+            for mode, cnt in (("U", n_unaligned), ("A", n_aligned)):
+                start = cur + xfer
+                for _ in range(cnt):
+                    op_start = _force_unaligned(start) if mode == "U" else _force_aligned(start)
+                    if op_start > max_off:
+                        clamps += 1
+                        op_start = max_off
+                    start = op_start + (2 * xfer)
+                cur = start - xfer
+        else:
+            nchunks = max(1, (int(file_size) + CHUNK_RANDOM - 1) // CHUNK_RANDOM)
+            cidx = nchunks - 1
+            for i in range(ops):
+                chunk_start = int(cidx * CHUNK_RANDOM)
+                chunk_end = min(int(file_size), int(chunk_start + CHUNK_RANDOM))
+                span = int(chunk_end - chunk_start)
+                if span < xfer:
+                    if cidx > 0:
+                        cidx -= 1
+                        chunk_start = int(cidx * CHUNK_RANDOM)
+                        chunk_end = min(int(file_size), int(chunk_start + CHUNK_RANDOM))
+                        span = int(chunk_end - chunk_start)
+                    else:
+                        chunk_start = 0
+                        chunk_end = int(file_size)
+                        span = int(chunk_end - chunk_start)
+                    if span < xfer:
+                        break
+                if span > xfer:
+                    rnd = ((i + 1) * 1103515245 + (xfer * 12345)) & 0x7FFFFFFF
+                    start = chunk_start + int(rnd % (span - xfer + 1))
+                else:
+                    start = chunk_start
+                if i < n_unaligned:
+                    op_start = _force_unaligned(start)
+                else:
+                    aligned = _align_down(start)
+                    if aligned < chunk_start:
+                        aligned = _force_aligned(chunk_start)
+                    if (aligned + xfer) <= chunk_end:
+                        op_start = aligned
+                    else:
+                        op_start = _force_aligned(start)
+                if op_start > max_off:
+                    clamps += 1
+                    op_start = max_off
+                if cidx > 0:
+                    cidx -= 1
+                else:
+                    cidx = nchunks - 1
+        cur_by_intent[intent] = _clamp(cur, 0, max_off)
+
+    return int(clamps)
+
+
+def apply_adaptive_sparse_span_growth(per_file_span, rows, pua_map, fs_align_bytes, tiny_mode_intents):
+    """
+    Grow sparse file spans for tiny-path modes to reduce EOF clamp artifacts.
+    """
+    diag = {
+        "enabled": bool(tiny_mode_intents),
+        "files_checked": 0,
+        "files_at_risk_before": 0,
+        "clamp_before": 0,
+        "clamp_after": 0,
+        "files_resized": [],
+    }
+    if not tiny_mode_intents:
+        return diag
+
+    rows_by_file = defaultdict(list)
+    for r in rows:
+        ops = int(r.get("ops", 0))
+        if ops <= 0:
+            continue
+        intent = str(r.get("intent", ""))
+        if intent not in tiny_mode_intents:
+            continue
+        rows_by_file[str(r.get("file", ""))].append(r)
+
+    for path, fr in rows_by_file.items():
+        if not path:
+            continue
+        diag["files_checked"] += 1
+        max_xfer = max(int(r.get("xfer", 0)) for r in fr)
+        cur_span = max(int(per_file_span.get(path, 0)), max_xfer)
+        before = _simulate_clamp_events_for_file(fr, cur_span, fs_align_bytes, pua_map)
+        diag["clamp_before"] += int(before)
+        if before <= 0:
+            diag["clamp_after"] += 0
+            continue
+
+        diag["files_at_risk_before"] += 1
+        growth_unit = max(int(fs_align_bytes) if fs_align_bytes else 1, max_xfer * 2, 4096)
+        new_span = int(cur_span)
+        after = int(before)
+        for i in range(10):
+            if after <= 0:
+                break
+            new_span += growth_unit * (2 ** i)
+            after = _simulate_clamp_events_for_file(fr, new_span, fs_align_bytes, pua_map)
+        diag["clamp_after"] += int(after)
+
+        if new_span > cur_span:
+            per_file_span[path] = int(new_span)
+            diag["files_resized"].append({
+                "path": path,
+                "old_span": int(cur_span),
+                "new_span": int(new_span),
+                "clamp_before": int(before),
+                "clamp_after": int(after),
+            })
+    return diag
 
 # ---------------- Planner core ----------------
 def plan_from_features(feats, nranks:int, fs_align_bytes:int):
@@ -1663,6 +2270,34 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
     # OPS split (STRICT)
     p_reads_ops  = clamp01(feats.get("pct_reads", 0))
     p_writes_ops = clamp01(feats.get("pct_writes", 0))
+
+    # Planner controls
+    optimizer = str(feats.get("optimizer", "lexicographic")).strip().lower()
+    if optimizer != "lexicographic":
+        optimizer = "lexicographic"
+
+    seq_policy = str(feats.get("seq_policy", "nonconsec_strict")).strip().lower()
+    if seq_policy != "nonconsec_strict":
+        raise ValueError(f"Unsupported seq_policy='{seq_policy}'. Use 'nonconsec_strict'.")
+
+    alignment_policy = str(feats.get("alignment_policy", "structure_preserving")).strip().lower()
+    if alignment_policy not in {"structure_preserving", "strict_per_op"}:
+        raise ValueError(
+            f"Unsupported alignment_policy='{alignment_policy}'. "
+            "Use 'structure_preserving' or 'strict_per_op'."
+        )
+
+    try:
+        phase_cap = int(feats.get("phase_cap", 50000))
+    except Exception:
+        phase_cap = 50000
+    if phase_cap < 0:
+        phase_cap = 0
+
+    try:
+        data_random_preseek = bool(int(float(feats.get("data_random_preseek", 0))))
+    except Exception:
+        data_random_preseek = False
 
     # Sequence model (consec ⊂ seq)
     consec_r = clamp01(feats.get("pct_consec_reads", 0))
@@ -2376,7 +3011,7 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
         target_by_flag=res_flag
     )
 
-    # RW switches
+    # RW switches + phase-cap (phase-cap-only hard control; switch is only a target signal)
     switch_frac = clamp01(feats.get("pct_rw_switches", 0.0))
     if switch_frac > 0.0:
         # Smaller segments are required for high switch fractions.
@@ -2384,44 +3019,140 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
     else:
         seg_hint = 64
 
-    def _phase_split_rows_for_switch(rows):
-        """
-        Freeze consec/seq/random counts *before* interleaving to avoid
-        per-fragment rounding drift when switching is enabled.
-        """
-        out = []
-        for r in rows:
-            ops = int(r.get("ops", 0))
-            if ops <= 0:
-                continue
-            is_read = (r.get("intent") == "read")
-            pc = (consec_r if is_read else consec_w)
-            ps = (seq_r    if is_read else seq_w)
-            pc = min(clamp01(pc), clamp01(ps))
-            n_con = int(round(ops * pc))
-            n_seq = int(round(ops * max(0.0, ps - pc)))
-            if n_con > ops:
-                n_con = ops
-            if n_seq > (ops - n_con):
-                n_seq = ops - n_con
-            n_rnd = max(0, ops - n_con - n_seq)
+    emit_rows_pre = split_rows_into_phase_kinds(layout_rows, consec_r, seq_r, consec_w, seq_w)
+    phase_cap_input = int(phase_cap)
+    phase_cap_effective = int(phase_cap_input)
+    phase_cap_adapted = False
 
-            if n_con > 0:
-                rr = dict(r); rr["ops"] = n_con; rr["phase_kind"] = "consec"; out.append(rr)
-            if n_seq > 0:
-                rr = dict(r); rr["ops"] = n_seq; rr["phase_kind"] = "seq"; out.append(rr)
-            if n_rnd > 0:
-                rr = dict(r); rr["ops"] = n_rnd; rr["phase_kind"] = "random"; out.append(rr)
-        return out
+    def _build_emit_rows_for_cap(phase_cap_use: int):
+        switch_control_frac_used_local = float(switch_frac)
+        switch_calibration_iters_local = 0
+        switch_pred_frac_stage1_local = 0.0
 
-    if switch_frac > 0.0:
-        emit_rows = _phase_split_rows_for_switch(layout_rows)
-        emit_rows = interleave_rw_segments(emit_rows, switch_frac=switch_frac, seg_ops=seg_hint)
-    else:
-        emit_rows = layout_rows
+        if switch_frac > 0.0:
+            lo = 0.0
+            hi = 1.0
+            best = None
+            probes = [switch_frac, 0.0, 1.0]
+            max_iters = 12
 
-    # ---------- Alignment targeting (FILE) ----------
-    pua_file_map = compute_rowwise_pua_file(emit_rows, p_file_ua_req, fs_align_bytes)
+            for i in range(max_iters):
+                if i < len(probes):
+                    ctrl = float(probes[i])
+                else:
+                    ctrl = float(0.5 * (lo + hi))
+                ctrl = max(0.0, min(1.0, ctrl))
+
+                rows_try, diag_try = interleave_rw_segments(
+                    emit_rows_pre,
+                    switch_frac=ctrl,
+                    seg_ops=seg_hint,
+                    phase_cap=phase_cap_use,
+                )
+                if phase_cap_use > 0 and len(rows_try) > phase_cap_use:
+                    rows_try = _coalesce_rows(rows_try, allow_reorder=True)
+                    diag_try["phase_cap_applied"] = True
+                    diag_try["phase_cap_post_coalesce"] = len(rows_try)
+                    diag_try["phase_cap_unmet"] = len(rows_try) > phase_cap_use
+
+                pred_try = float(
+                    estimate_ordering_metrics(rows_try, nprocs=max(1, nprocs)).get("pct_rw_switches", 0.0)
+                )
+                diff_try = abs(pred_try - float(switch_frac))
+                score_try = (diff_try, len(rows_try))
+
+                if best is None or score_try < best["score"]:
+                    best = {
+                        "rows": rows_try,
+                        "diag": dict(diag_try),
+                        "control": float(ctrl),
+                        "pred": float(pred_try),
+                        "score": score_try,
+                    }
+
+                if pred_try < float(switch_frac):
+                    lo = max(lo, ctrl)
+                else:
+                    hi = min(hi, ctrl)
+                switch_calibration_iters_local = i + 1
+
+            emit_rows_local = list(best["rows"]) if best is not None else list(emit_rows_pre)
+            interleave_diag_local = dict(best["diag"]) if best is not None else {}
+            switch_control_frac_used_local = float(best["control"]) if best is not None else float(switch_frac)
+            switch_pred_frac_stage1_local = float(best["pred"]) if best is not None else 0.0
+        else:
+            emit_rows_local, interleave_diag_local = interleave_rw_segments(
+                emit_rows_pre,
+                switch_frac=0.0,
+                seg_ops=seg_hint,
+                phase_cap=phase_cap_use,
+            )
+            if phase_cap_use > 0 and len(emit_rows_local) > phase_cap_use:
+                emit_rows_local = _coalesce_rows(emit_rows_local, allow_reorder=True)
+                interleave_diag_local["phase_cap_applied"] = True
+                interleave_diag_local["phase_cap_post_coalesce"] = len(emit_rows_local)
+                interleave_diag_local["phase_cap_unmet"] = len(emit_rows_local) > phase_cap_use
+
+        interleave_diag_local["switch_control_frac"] = float(switch_control_frac_used_local)
+        interleave_diag_local["switch_calibration_iters"] = int(switch_calibration_iters_local)
+        interleave_diag_local["switch_pred_frac_stage1"] = float(switch_pred_frac_stage1_local)
+        return emit_rows_local, interleave_diag_local
+
+    emit_rows, interleave_diag = _build_emit_rows_for_cap(phase_cap_effective)
+
+    # Adaptive phase-cap growth (nprocs fixed): if switch target is infeasible under the
+    # requested cap, increase only the phase cap estimate required to reach the target.
+    if switch_frac > 0.0 and phase_cap_input > 0:
+        ordering_metrics_cap = estimate_ordering_metrics(emit_rows, nprocs=max(1, nprocs))
+        pred_frac_cap = float(ordering_metrics_cap.get("pct_rw_switches", 0.0))
+        pred_switches_cap = int(ordering_metrics_cap.get("pred_switches", 0))
+        total_ops_cap = int(ordering_metrics_cap.get("pred_switch_ops_total", 0))
+        target_switches_cap = int(round(float(switch_frac) * float(total_ops_cap)))
+        if pred_frac_cap + 1e-12 < float(switch_frac) and pred_switches_cap > 0 and total_ops_cap > 0:
+            switches_per_row = float(pred_switches_cap) / float(max(1, len(emit_rows)))
+            if switches_per_row > 0.0:
+                req_rows = int(math.ceil(float(target_switches_cap) / switches_per_row))
+                if req_rows > phase_cap_input:
+                    phase_cap_effective = int(req_rows)
+                    phase_cap_adapted = True
+                    emit_rows, interleave_diag = _build_emit_rows_for_cap(phase_cap_effective)
+
+    interleave_diag["phase_cap_input"] = int(phase_cap_input)
+    interleave_diag["phase_cap_effective"] = int(phase_cap_effective)
+    interleave_diag["phase_cap_adapted"] = bool(phase_cap_adapted)
+    interleave_diag["phase_cap_input_hit"] = bool(
+        phase_cap_input > 0 and len(emit_rows) > phase_cap_input
+    )
+
+    ordering_targets = {
+        "pct_seq_reads": float(seq_r),
+        "pct_seq_writes": float(seq_w),
+        "pct_consec_reads": float(consec_r),
+        "pct_consec_writes": float(consec_w),
+        "pct_rw_switches": float(switch_frac),
+    }
+
+    # Lexicographic Stage 1: ordering objective
+    ordering_metrics_stage1 = estimate_ordering_metrics(emit_rows, nprocs=max(1, nprocs))
+    ordering_error_stage1 = compute_ordering_error(ordering_metrics_stage1, ordering_targets)
+
+    # Lexicographic Stage 2: alignment objective within Stage 1 result
+    pua_file_map = compute_rowwise_pua_file(
+        emit_rows,
+        p_file_ua_req,
+        fs_align_bytes,
+        alignment_policy=alignment_policy,
+    )
+    predicted_unaligned_ops_stage2 = sum(
+        float(pua_file_map.get(id(r), 0.0)) * float(int(r.get("ops", 0)))
+        for r in emit_rows
+        if int(r.get("ops", 0)) > 0
+    )
+    total_ops_stage2 = sum(int(r.get("ops", 0)) for r in emit_rows if int(r.get("ops", 0)) > 0)
+    predicted_unaligned_frac_stage2 = (
+        predicted_unaligned_ops_stage2 / float(total_ops_stage2)
+    ) if total_ops_stage2 > 0 else 0.0
+    alignment_error_stage2 = abs(float(predicted_unaligned_frac_stage2) - float(p_file_ua_req))
 
     # ---------- Emit CSV ----------
     header=("type,path,total_bytes,xfer,p_write,p_rand,p_seq_r,p_consec_r,p_seq_w,p_consec_w,"
@@ -2487,30 +3218,6 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
         ]
         lines.append(",".join(row))
 
-    def emit_intent_rows(rows, is_read):
-        order_bin = {"L":0,"M":1,"S":2}
-        rows_sorted = sorted(rows, key=lambda r: (order_bin[r["bin"]], r["file"], r["xfer"]))
-        from collections import defaultdict
-        grp = defaultdict(list)
-        for r in rows_sorted:
-            grp[(r["file"], r["bin"], r["xfer"], r.get("flags",""))].append(r)
-        for (path, bin_name, xfer, flags_extra), parts in grp.items():
-            ops = sum(p["ops"] for p in parts)
-            if ops<=0: continue
-            pc = (consec_r if is_read else consec_w)
-            ps = (seq_r    if is_read else seq_w)
-            pc = min(clamp01(pc), clamp01(ps))
-            n_con = int(round(ops * pc))
-            n_seq = int(round(ops * max(0.0, ps - pc)))
-            n_rnd = max(0, ops - n_con - n_seq)
-
-            sample = parts[0]
-            p_ua_file_eff = pua_file_map.get(id(sample), 0.0)
-
-            emit_data_phase(path, "read" if is_read else "write", xfer, n_con, "consec", p_ua_file_eff, p_mem_ua, False, flags_extra)
-            emit_data_phase(path, "read" if is_read else "write", xfer, n_seq, "seq",    p_ua_file_eff, p_mem_ua, False, flags_extra)
-            emit_data_phase(path, "read" if is_read else "write", xfer, n_rnd, "random", p_ua_file_eff, p_mem_ua, True,  flags_extra)
-
     def emit_rows_in_layout_order(rows):
         """
         Emit rows in their current order.
@@ -2543,20 +3250,25 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
             if phase_kind in ("consec", "seq", "random"):
                 emit_data_phase(
                     path, intent, xfer, ops, phase_kind, p_ua_file_eff, p_mem_ua,
-                    (phase_kind == "random"), flags_extra
+                    (data_random_preseek if phase_kind == "random" else False), flags_extra
                 )
             else:
                 emit_data_phase(path, intent, xfer, n_con, "consec", p_ua_file_eff, p_mem_ua, False, flags_extra)
                 emit_data_phase(path, intent, xfer, n_seq, "seq",    p_ua_file_eff, p_mem_ua, False, flags_extra)
-                emit_data_phase(path, intent, xfer, n_rnd, "random", p_ua_file_eff, p_mem_ua, True,  flags_extra)
+                emit_data_phase(
+                    path,
+                    intent,
+                    xfer,
+                    n_rnd,
+                    "random",
+                    p_ua_file_eff,
+                    p_mem_ua,
+                    data_random_preseek,
+                    flags_extra,
+                )
 
-    # Important: once interleaving is requested, emit in current layout order.
-    # Splitting by intent and regrouping would erase planned R/W alternations.
-    if switch_frac > 0.0:
-        emit_rows_in_layout_order(emit_rows)
-    else:
-        emit_intent_rows([r for r in emit_rows if r["intent"]=="read"],  is_read=True)
-        emit_intent_rows([r for r in emit_rows if r["intent"]=="write"], is_read=False)
+    # Always emit in finalized row order to preserve interleave and phase-cap output.
+    emit_rows_in_layout_order(emit_rows)
 
     def emit_tiny_items(tiny_items, intent, path_flags, p_ua_file_default, p_mem_ua):
         """
@@ -2580,7 +3292,6 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
             a["rnd"] += int(it.get("rnd", 0))
 
         # Emit three phases per (path,xfer,flags): consec, seq, random
-        # Use pre_seek_eof=True for the random leg to match your convention
         n_emitted_ops = 0
         for (path, xfer, flags_extra), a in agg.items():
             if a["con"] > 0:
@@ -2593,7 +3304,7 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
                 n_emitted_ops += a["seq"]
             if a["rnd"] > 0:
                 emit_data_phase(path, intent, xfer, a["rnd"], "random",
-                                p_ua_file_default, p_mem_ua, True, flags_extra)
+                                p_ua_file_default, p_mem_ua, data_random_preseek, flags_extra)
                 n_emitted_ops += a["rnd"]
         return n_emitted_ops
 
@@ -2603,6 +3314,10 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
     extra_tiny_rows_write = locals().get("extra_tiny_rows_write", [])
     extra_tiny_rows_read, extra_tiny_rows_write = ensure_rw_presence_tiny_mirror(
         extra_tiny_rows_read, extra_tiny_rows_write
+    )
+    tiny_phase_rows = (
+        materialize_tiny_phase_rows(extra_tiny_rows_read, "read", path_flags)
+        + materialize_tiny_phase_rows(extra_tiny_rows_write, "write", path_flags)
     )
 
     # Emit tiny read/write items with exact consec/seq/rand ratios
@@ -2623,9 +3338,31 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
             p_mem_ua=p_mem_ua
         )
 
+    final_data_phase_rows = list(emit_rows) + list(tiny_phase_rows)
+    pua_file_map_all = dict(pua_file_map)
+    for rr in tiny_phase_rows:
+        pua_file_map_all[id(rr)] = clamp01(p_file_ua_req)
+
+    ordering_metrics_final = estimate_ordering_metrics(final_data_phase_rows, nprocs=max(1, nprocs))
+    ordering_error_final = compute_ordering_error(ordering_metrics_final, ordering_targets)
+    predicted_unaligned_ops_final = sum(
+        float(pua_file_map_all.get(id(r), 0.0)) * float(int(r.get("ops", 0)))
+        for r in final_data_phase_rows
+        if int(r.get("ops", 0)) > 0
+    )
+    total_ops_final = sum(
+        int(r.get("ops", 0))
+        for r in final_data_phase_rows
+        if int(r.get("ops", 0)) > 0
+    )
+    predicted_unaligned_frac_final = (
+        predicted_unaligned_ops_final / float(total_ops_final)
+    ) if total_ops_final > 0 else 0.0
+    alignment_error_final = abs(float(predicted_unaligned_frac_final) - float(p_file_ua_req))
+
     # after the layout_rows (data rows) are finalized
-    Nr = sum(r["ops"] for r in layout_rows if r["intent"]=="read")
-    Nw = sum(r["ops"] for r in layout_rows if r["intent"]=="write")
+    Nr = sum(int(r.get("ops", 0)) for r in emit_rows if r.get("intent") == "read")
+    Nw = sum(int(r.get("ops", 0)) for r in emit_rows if r.get("intent") == "write")
     Nio_realized = Nr + Nw + tiny_ops_total
 
     # desired meta totals (counts), using *features* fractions and the user’s requested io/meta split
@@ -2707,70 +3444,49 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
     # ---------- File sizing (truncate) ----------
     from collections import defaultdict
     per_file_span = defaultdict(int)
-    def add_span(rows, pc, ps):
-        """
-        rows: iterable of {"file","xfer","ops"}
-        pc, ps: consec & seq fractions for this intent (already clamped [0,1])
-        Random fraction is inferred as pr = 1 - min(1, ps) with consec ⊂ seq.
-        """
-        by_fx = defaultdict(lambda: defaultdict(int))  # file -> xfer -> ops
+
+    def add_span_from_phase_rows(rows):
+        by_file_xfer_kind = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
         for r in rows:
-            by_fx[r["file"]][r["xfer"]] += int(r["ops"])
+            ops = int(r.get("ops", 0))
+            if ops <= 0:
+                continue
+            f = str(r.get("file", ""))
+            x = int(r.get("xfer", 0))
+            k = str(r.get("phase_kind", "random")).strip().lower()
+            if not f or x <= 0:
+                continue
+            by_file_xfer_kind[f][x][k] += ops
 
-        for f, sizes in by_fx.items():
+        for f, sizes in by_file_xfer_kind.items():
             cov_struct = 0
             n_rand_total = 0
-
-            for xfer, ops in sizes.items():
-                if ops <= 0:
-                    continue
-
-                n_con = int(round(ops * pc))
-                n_seq = int(round(ops * max(0.0, ps - pc)))
-                n_rand = max(0, ops - n_con - n_seq)
-
-                # Structured coverage:
-                # - Consecutive grows by xfer per op.
-                # - Seq-only in runtime uses a fixed gap=xfer (stride=2*xfer), so
-                #   each seq op expands file span by ~2*xfer.
+            max_xfer = 0
+            for xfer, by_kind in sizes.items():
+                max_xfer = max(max_xfer, int(xfer))
+                n_con = int(by_kind.get("consec", 0))
+                n_seq = int(by_kind.get("seq", 0))
+                n_rand = int(by_kind.get("random", 0))
                 cov_struct += (n_con * xfer) + (2 * n_seq * xfer)
-
-                # random coverage: 1 op per 128 MiB chunk (RR across chunks)
-                n_rand_total += n_rand
-
-            cov_random = n_rand_total * CHUNK_RANDOM
-            per_file_span[f] += max(cov_struct, cov_random)
-    def add_span_from_tiny(tiny_items, p_con, p_seq):
-        # Aggregate tiny ops per (file,xfer)
-        from collections import defaultdict
-        agg = defaultdict(lambda: defaultdict(lambda: {"con":0, "seq":0, "rnd":0}))
-        for it in tiny_items:
-            f = it["path"]; x = int(it["xfer"])
-            agg[f][x]["con"] += int(it.get("con", 0))
-            agg[f][x]["seq"] += int(it.get("seq", 0))
-            agg[f][x]["rnd"] += int(it.get("rnd", 0))
-
-        for f, sizes in agg.items():
-            cov_struct = 0
-            n_rand_total = 0
-            for xfer, a in sizes.items():
-                n_con  = a["con"]
-                n_seq  = a["seq"]
-                n_rand = a["rnd"]
-                # Keep tiny-row sizing consistent with runtime seq stride=2*xfer.
-                cov_struct += (n_con * xfer) + (2 * n_seq * xfer)
-                # random coverage is per-file at 1 op per CHUNK_RANDOM
                 n_rand_total += n_rand
             cov_random = n_rand_total * CHUNK_RANDOM
-            per_file_span[f] += max(cov_struct, cov_random)
+            per_file_span[f] += max(cov_struct, cov_random, max_xfer)
 
-    # Reads and writes (random fraction implied by consec ⊂ seq model)
-    add_span([r for r in layout_rows if r["intent"] == "read"],  consec_r, seq_r)
-    add_span([r for r in layout_rows if r["intent"] == "write"], consec_w, seq_w)
+    add_span_from_phase_rows(final_data_phase_rows)
 
-    # Fold tiny rows (if any)
-    add_span_from_tiny(extra_tiny_rows_read,  consec_r, seq_r)
-    add_span_from_tiny(extra_tiny_rows_write, consec_w, seq_w)
+    tiny_mode_intents = set()
+    if (p_bytes_r <= 1e-6) and (p_reads_ops > 0.0):
+        tiny_mode_intents.add("read")
+    if (p_bytes_w <= 1e-6) and (p_writes_ops > 0.0):
+        tiny_mode_intents.add("write")
+
+    clamp_diag = apply_adaptive_sparse_span_growth(
+        per_file_span,
+        final_data_phase_rows,
+        pua_file_map_all,
+        fs_align_bytes,
+        tiny_mode_intents=tiny_mode_intents,
+    )
 
     # ---------- Write plan.csv ----------
     os.makedirs(PAYLOAD, exist_ok=True)
@@ -2853,22 +3569,17 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
     os.chmod(RUNNER, 0o755)
 
     # ---------- Comprehensive Notes ----------
-    total_bytes, by_role, by_intent, by_file, by_flag = summarize(layout_rows)
+    total_bytes, by_role, by_intent, by_file, by_flag = summarize(final_data_phase_rows)
 
     # Alignment accounting (for Notes)
-    total_ops = sum(int(r.get("ops", 0)) for r in layout_rows)
+    total_ops = sum(int(r.get("ops", 0)) for r in final_data_phase_rows)
     legacy_xfer_not_multiple_ops = sum(
         int(r.get("ops", 0))
-        for r in layout_rows
+        for r in final_data_phase_rows
         if fs_align_bytes > 0 and (int(r.get("xfer", 0)) % fs_align_bytes) != 0
     )
-    pua_layout_map = compute_rowwise_pua_file(layout_rows, p_file_ua_req, fs_align_bytes)
-    predicted_unaligned_ops = sum(
-        float(pua_layout_map.get(id(r), 0.0)) * float(int(r.get("ops", 0)))
-        for r in layout_rows
-        if int(r.get("ops", 0)) > 0
-    )
-    predicted_unaligned_frac = (predicted_unaligned_ops / float(total_ops)) if total_ops > 0 else 0.0
+    predicted_unaligned_ops = float(predicted_unaligned_ops_final)
+    predicted_unaligned_frac = float(predicted_unaligned_frac_final)
 
     with open(NOTES,"w") as f:
         # Inputs (verbatim)
@@ -2884,11 +3595,48 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
         f.write("  Bins:\n")
         f.write(f"    S_SUBS={S_SUBS}  M_SUBS={M_SUBS}  L_CHOICES={L_SIZE_CHOICES}\n")
         f.write("  Phase split inside each (file,bin,sub-size,intent): Consec ⊂ Seq; remainder Random\n")
-        f.write("  Random placement: descending 128 MiB chunk RR; pre_seek_eof=1 for random phases\n")
+        f.write(
+            "  Random placement: descending 128 MiB chunk RR; "
+            f"pre_seek_eof={'1' if data_random_preseek else '0'} for random data phases\n"
+        )
         f.write("  Rebalancer: in-bin only for S/M; preserves op counts; L moves within the 11–64 MiB ladder per intent; presence floors.\n")
         f.write("  RW-switches: planner interleaves segments on eligible RW paths when pct_rw_switches>0\n")
         f.write(f"  META scope: {meta_scope}\n")
         f.write("  Shared vs Unique: file counts from pct_shared_files/pct_unique_files; byte targets from pct_bytes_* (enforced via flags)\n\n")
+        f.write("=== OPTIMIZER & CAP DIAGNOSTICS ===\n")
+        f.write(
+            f"  optimizer={optimizer}  seq_policy={seq_policy}  alignment_policy={alignment_policy}\n"
+        )
+        f.write(
+            f"  phase_cap={interleave_diag.get('phase_cap_effective', phase_cap)}  "
+            f"(input={interleave_diag.get('phase_cap_input', phase_cap)} "
+            f"adapted={bool(interleave_diag.get('phase_cap_adapted', False))})  "
+            f"emitted_rows={len(emit_rows)}  "
+            f"phase_cap_applied={bool(interleave_diag.get('phase_cap_applied', False))}\n"
+        )
+        f.write(
+            f"  interleave_diag: requested_switches={interleave_diag.get('switch_requested', 0)} "
+            f"effective_switches={interleave_diag.get('switch_effective', 0)} "
+            f"control_frac={interleave_diag.get('switch_control_frac', switch_frac):.6f} "
+            f"pred_stage1={interleave_diag.get('switch_pred_frac_stage1', 0.0):.6f} "
+            f"calib_iters={interleave_diag.get('switch_calibration_iters', 0)} "
+            f"seg_ops_eff={interleave_diag.get('seg_ops_eff', interleave_diag.get('seg_ops_hint', seg_hint))} "
+            f"coalesced_rows={interleave_diag.get('coalesced_rows', len(emit_rows))} "
+            f"phase_cap_unmet={bool(interleave_diag.get('phase_cap_unmet', False))} "
+            f"phase_cap_input_hit={bool(interleave_diag.get('phase_cap_input_hit', False))}\n"
+        )
+        f.write(
+            f"  Stage1 ordering error={ordering_error_stage1:.6f} "
+            f"(final with tiny={ordering_error_final:.6f})\n"
+        )
+        f.write(
+            f"  Stage2 alignment error={alignment_error_stage2:.6f} "
+            f"(final with tiny={alignment_error_final:.6f})\n"
+        )
+        f.write(
+            f"  tiny_modes={sorted(tiny_mode_intents) if tiny_mode_intents else []} "
+            f"tiny_phase_rows={len(tiny_phase_rows)}\n\n"
+        )
 
         # Capacity to bytes & intent bytes target
         f.write("=== CAPACITY → BYTES & INTENT TARGETS ===\n")
@@ -2976,14 +3724,20 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
         # Alignment section
         f.write("=== ALIGNMENT TARGETING (FILE vs Darshan File-Alignment) ===\n")
         f.write(f"  Requested pct_file_not_aligned={p_file_ua_req:.2f}\n")
-        f.write(f"  fs_align_bytes={fs_align_bytes}  (mem_align_bytes={mem_align_bytes})\n")
+        f.write(
+            f"  fs_align_bytes={fs_align_bytes}  (mem_align_bytes={mem_align_bytes})  "
+            f"policy={alignment_policy}\n"
+        )
         f.write(f"  darshan_modmem_mib={darshan_modmem_mib}\n")
         f.write(
             f"  Legacy xfer-not-multiple count (diagnostic only): "
             f"{legacy_xfer_not_multiple_ops} of {total_ops}  "
             f"(~{legacy_xfer_not_multiple_ops/total_ops if total_ops>0 else 0.0:.4f})\n"
         )
-        f.write(f"  Predicted overall file-unaligned fraction: ~{predicted_unaligned_frac:.4f}\n")
+        f.write(
+            f"  Predicted overall file-unaligned fraction: ~{predicted_unaligned_frac:.4f} "
+            f"(error={alignment_error_final:.6f})\n"
+        )
         f.write("  Distribution of unaligned ops: largest-remainder allocation across data rows by ops.\n\n")
         f.write("  File-count heuristic (single-shot, only if intrinsic gap > 0.05):\n")
         f.write(f"    initial_data_files={target_data_files_initial} final_data_files={target_data_files}\n")
@@ -2997,7 +3751,43 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
 
         # RW-switches details
         f.write("=== RW SWITCHES ===\n")
-        f.write(f"  pct_rw_switches={switch_frac:.2f} → planner interleaves ≤64-op segments on same RW paths; harness simply executes rows.\n\n")
+        f.write(
+            f"  target_pct_rw_switches={switch_frac:.4f} "
+            f"pred_pct_rw_switches(participant-aware)={ordering_metrics_final.get('pct_rw_switches', 0.0):.4f}\n"
+        )
+        f.write(
+            f"  predicted_switches={ordering_metrics_final.get('pred_switches', 0)} "
+            f"over_ops={ordering_metrics_final.get('pred_switch_ops_total', 0)}\n"
+        )
+        f.write(
+            f"  phase_cap={interleave_diag.get('phase_cap_effective', phase_cap)} "
+            f"(input={interleave_diag.get('phase_cap_input', phase_cap)} "
+            f"adapted={bool(interleave_diag.get('phase_cap_adapted', False))}) "
+            f"phase_cap_applied={bool(interleave_diag.get('phase_cap_applied', False))} "
+            f"phase_cap_unmet={bool(interleave_diag.get('phase_cap_unmet', False))} "
+            f"phase_cap_input_hit={bool(interleave_diag.get('phase_cap_input_hit', False))}\n\n"
+        )
+
+        # Clamp-risk diagnostics
+        f.write("=== CLAMP RISK (TINY BYTES≈0 PATHS) ===\n")
+        f.write(
+            f"  enabled={bool(clamp_diag.get('enabled', False))} "
+            f"files_checked={clamp_diag.get('files_checked', 0)} "
+            f"files_at_risk_before={clamp_diag.get('files_at_risk_before', 0)}\n"
+        )
+        f.write(
+            f"  predicted_clamp_before={clamp_diag.get('clamp_before', 0)} "
+            f"predicted_clamp_after={clamp_diag.get('clamp_after', 0)}\n"
+        )
+        resized = clamp_diag.get("files_resized", []) or []
+        f.write(f"  files_resized={len(resized)}\n")
+        for it in resized:
+            f.write(
+                "    "
+                f"{it.get('path')} old={it.get('old_span')} new={it.get('new_span')} "
+                f"clamp_before={it.get('clamp_before')} clamp_after={it.get('clamp_after')}\n"
+            )
+        f.write("\n")
 
         # META mapping
         f.write("=== META OPS MAPPING ===\n")
@@ -3015,6 +3805,10 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
 
         # Assumptions & invariants
         f.write("=== ASSUMPTIONS & INVARIANTS ===\n")
+        f.write("  • Optimization is lexicographic: ordering metrics first, alignment second; meta metrics are excluded from objective search.\n")
+        f.write("  • Seq policy is strict non-consecutive (runtime stride=2*xfer for seq).\n")
+        f.write("  • Only phase_cap is a hard anti-explosion control; no switch-cap is used.\n")
+        f.write(f"  • data_random_preseek default is {1 if data_random_preseek else 0} for data random phases.\n")
         f.write("  • Rebalancer: in-bin only, op-preserving, presence floors. L bin uses a bounded ladder 11-64 MiB with 1 MiB increment to auto up/down-tune per intent (read/write) before the fair in-bin nudger; S/M adjust only within their fixed ladders. Keeps 10M+ constraints intact.\n")
         f.write("  • Presence floors: any (file,bin,sub-size) that existed pre-rebalance keeps ≥1 op.\n")
         f.write("  • Prep truncate safeguard: if a requested sparse size exceeds filesystem limits, prep falls back to smaller tiers (16/8/4/2/1 TiB, then 512 GiB) to avoid aborting the run.\n")
@@ -3034,6 +3828,37 @@ def main():
     ap.add_argument("--io-api", choices=["posix","mpiio"], default=None, help="Override io_api")
     ap.add_argument("--meta-api", choices=["posix"], default=None, help="Override meta_api")
     ap.add_argument("--mpi-collective-mode", choices=["none","independent","collective"], default=None, help="Override mpi_collective_mode")
+    ap.add_argument(
+        "--optimizer",
+        choices=["lexicographic"],
+        default="lexicographic",
+        help="Planner optimizer mode (lexicographic only)",
+    )
+    ap.add_argument(
+        "--seq-policy",
+        choices=["nonconsec_strict"],
+        default="nonconsec_strict",
+        help="Sequential semantics policy",
+    )
+    ap.add_argument(
+        "--alignment-policy",
+        choices=["structure_preserving", "strict_per_op"],
+        default="structure_preserving",
+        help="How alignment targeting is applied across phases",
+    )
+    ap.add_argument(
+        "--phase-cap",
+        type=int,
+        default=50000,
+        help="Hard cap on emitted data phase rows (0 disables)",
+    )
+    ap.add_argument(
+        "--data-random-preseek",
+        type=int,
+        choices=[0, 1],
+        default=0,
+        help="Set pre_seek_eof for random data phases",
+    )
     ap.add_argument(
         "--meta-scope",
         choices=["separate", "data_files"],
@@ -3066,6 +3891,11 @@ def main():
         feats["mpi_collective_mode"] = args.mpi_collective_mode
     if args.meta_scope is not None:
         feats["_meta_scope"] = args.meta_scope
+    feats["optimizer"] = args.optimizer
+    feats["seq_policy"] = args.seq_policy
+    feats["alignment_policy"] = args.alignment_policy
+    feats["phase_cap"] = int(args.phase_cap)
+    feats["data_random_preseek"] = int(args.data_random_preseek)
 
     # Keep align pref:
     #  1) JSON explicit field (preferred)

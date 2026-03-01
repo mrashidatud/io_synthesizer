@@ -152,6 +152,80 @@ def extract_darshan_logfile(run_sh: Path) -> tuple[Path | None, str | None]:
     return None, None
 
 
+def count_data_rows(plan_csv: Path) -> int:
+    if not plan_csv.is_file():
+        return 0
+    rows = 0
+    with plan_csv.open("r", encoding="utf-8") as f:
+        for line in f:
+            if line.startswith("data,"):
+                rows += 1
+    return rows
+
+
+def parse_phase_cap_diagnostics(notes_path: Path) -> dict[str, str]:
+    out: dict[str, str] = {}
+    if not notes_path.is_file():
+        return out
+    line_re = re.compile(
+        r"phase_cap=(\d+)"
+        r"(?:\s+\(input=(\d+)\s+adapted=(True|False)\))?"
+        r"\s+emitted_rows=(\d+)\s+phase_cap_applied=(True|False)",
+        re.IGNORECASE,
+    )
+    unmet_re = re.compile(r"phase_cap_unmet=(True|False)", re.IGNORECASE)
+    try:
+        for line in notes_path.read_text(encoding="utf-8").splitlines():
+            m = line_re.search(line)
+            if m:
+                out["phase_cap"] = m.group(1)
+                if m.group(2) is not None:
+                    out["phase_cap_input"] = m.group(2)
+                if m.group(3) is not None:
+                    out["phase_cap_adapted"] = m.group(3)
+                out["emitted_rows"] = m.group(4)
+                out["phase_cap_applied"] = m.group(5)
+            u = unmet_re.search(line)
+            if u:
+                out["phase_cap_unmet"] = u.group(1)
+    except Exception:
+        return out
+    return out
+
+
+def poll_for_darshan(
+    run_root: Path,
+    expected: Path | None,
+    *,
+    timeout_sec: float,
+    initial_interval_sec: float,
+    max_interval_sec: float,
+    backoff: float,
+) -> tuple[Path | None, str]:
+    deadline = time.time() + max(0.0, timeout_sec)
+    interval = max(0.1, initial_interval_sec)
+    backoff = max(1.0, backoff)
+    max_interval = max(interval, max_interval_sec)
+
+    while True:
+        if expected and expected.is_file():
+            return expected, "expected_path"
+
+        found = sorted(run_root.glob("*.darshan"))
+        if expected is None:
+            if len(found) == 1:
+                return found[0], "single_discovered"
+        else:
+            if len(found) == 1:
+                return found[0], "expected_missing_single_discovered"
+
+        if time.time() >= deadline:
+            return None, "timeout"
+
+        time.sleep(interval)
+        interval = min(max_interval, interval * backoff)
+
+
 def cleanup_payload_subdirs(run_root: Path) -> None:
     payload_dir = run_root / "payload"
     if not payload_dir.is_dir():
@@ -266,13 +340,43 @@ def main() -> None:
     force_build = parse_bool(opts.get("force_build"), default=False)
     delete_darshan = parse_bool(opts.get("delete_darshan"), default=False)
     filters_raw = (opts.get("filters", "") or "").strip()
-    flush_wait_sec = float(opts.get("flush_wait_sec", "10") or "10")
     meta_scope = parse_meta_scope(opts.get("meta_scope", "separate"))
+    optimizer = (opts.get("optimizer", "lexicographic") or "lexicographic").strip()
+    seq_policy = (opts.get("seq_policy", "nonconsec_strict") or "nonconsec_strict").strip()
+    alignment_policy = (opts.get("alignment_policy", "structure_preserving") or "structure_preserving").strip()
+    phase_cap = int(opts.get("phase_cap", "50000") or "50000")
+    data_random_preseek = int(opts.get("data_random_preseek", "0") or "0")
+    darshan_poll_timeout_sec = float(
+        opts.get("darshan_poll_timeout_sec", opts.get("flush_wait_sec", "120")) or "120"
+    )
+    darshan_poll_initial_sec = float(opts.get("darshan_poll_initial_sec", "0.5") or "0.5")
+    darshan_poll_max_sec = float(opts.get("darshan_poll_max_sec", "5.0") or "5.0")
+    darshan_poll_backoff = float(opts.get("darshan_poll_backoff", "1.6") or "1.6")
 
     if nprocs_override and not nprocs_override.isdigit():
         raise ValueError(f"Invalid nprocs '{nprocs_override}': expected integer")
     if nprocs_cap <= 0:
         raise ValueError("nprocs_cap must be > 0")
+    if optimizer != "lexicographic":
+        raise ValueError(f"Invalid optimizer '{optimizer}': expected 'lexicographic'")
+    if seq_policy != "nonconsec_strict":
+        raise ValueError(f"Invalid seq_policy '{seq_policy}': expected 'nonconsec_strict'")
+    if alignment_policy not in {"structure_preserving", "strict_per_op"}:
+        raise ValueError(
+            f"Invalid alignment_policy '{alignment_policy}': expected structure_preserving or strict_per_op"
+        )
+    if phase_cap < 0:
+        raise ValueError("phase_cap must be >= 0")
+    if data_random_preseek not in {0, 1}:
+        raise ValueError("data_random_preseek must be 0 or 1")
+    if darshan_poll_timeout_sec < 0:
+        raise ValueError("darshan_poll_timeout_sec must be >= 0")
+    if darshan_poll_initial_sec <= 0:
+        raise ValueError("darshan_poll_initial_sec must be > 0")
+    if darshan_poll_max_sec <= 0:
+        raise ValueError("darshan_poll_max_sec must be > 0")
+    if darshan_poll_backoff < 1.0:
+        raise ValueError("darshan_poll_backoff must be >= 1.0")
 
     out_root.mkdir(parents=True, exist_ok=True)
     stamp = timestamp()
@@ -287,6 +391,10 @@ def main() -> None:
     print(f"{ts()}  Input dir: {input_dir}")
     print(f"{ts()}  Output root: {out_root}")
     print(f"{ts()}  Meta scope: {meta_scope}")
+    print(
+        f"{ts()}  Planner controls: optimizer={optimizer} seq_policy={seq_policy} "
+        f"alignment_policy={alignment_policy} phase_cap={phase_cap} data_random_preseek={data_random_preseek}"
+    )
 
     ensure_mpi_binary(root, bin_dir, force_build)
 
@@ -327,6 +435,16 @@ def main() -> None:
             "none",
             "--meta-scope",
             meta_scope,
+            "--optimizer",
+            optimizer,
+            "--seq-policy",
+            seq_policy,
+            "--alignment-policy",
+            alignment_policy,
+            "--phase-cap",
+            str(phase_cap),
+            "--data-random-preseek",
+            str(data_random_preseek),
         ]
         if desired_nprocs is not None:
             cmd.extend(["--nprocs", str(desired_nprocs)])
@@ -347,6 +465,22 @@ def main() -> None:
             print(f"{ts()}  ERROR: Could not find run_from_features.sh in {cand1} or {cand2}")
             continue
 
+        plan_csv = run_root / "payload" / "plan.csv"
+        notes_path = run_root / "run_from_features.sh.notes.txt"
+        data_rows = count_data_rows(plan_csv)
+        phase_diag = parse_phase_cap_diagnostics(notes_path)
+        if phase_diag:
+            print(
+                f"{ts()}  [PlanDiag] data_rows={data_rows} "
+                f"phase_cap={phase_diag.get('phase_cap', 'NA')} "
+                f"phase_cap_input={phase_diag.get('phase_cap_input', 'NA')} "
+                f"phase_cap_adapted={phase_diag.get('phase_cap_adapted', 'NA')} "
+                f"phase_cap_applied={phase_diag.get('phase_cap_applied', 'NA')} "
+                f"phase_cap_unmet={phase_diag.get('phase_cap_unmet', 'NA')}"
+            )
+        else:
+            print(f"{ts()}  [PlanDiag] data_rows={data_rows} phase_cap_diagnostics=unavailable")
+
         if delete_darshan:
             print(f"{ts()}  [Pre-run] --delete-darshan enabled -> removing existing Darshan files in {run_root}")
             for p in run_root.glob("*.darshan"):
@@ -362,33 +496,29 @@ def main() -> None:
         else:
             print(f"{ts()}  [Run] {run_sh}")
             run_cmd(["bash", str(run_sh)])
-
-            print(f"{ts()}  [Validate] Sleep {flush_wait_sec}s to allow Darshan to flush")
-            time.sleep(flush_wait_sec)
-
-            if expected and expected.is_file():
-                print(f"{ts()}  OK: Found Darshan: {expected}")
-            elif expected and not expected.is_file():
-                print(f"{ts()}  WARN: Expected Darshan not found: {expected}")
+            print(
+                f"{ts()}  [Validate] Polling for Darshan logfile "
+                f"(timeout={darshan_poll_timeout_sec:.1f}s initial={darshan_poll_initial_sec:.2f}s "
+                f"max={darshan_poll_max_sec:.2f}s backoff={darshan_poll_backoff:.2f})"
+            )
+            resolved, poll_status = poll_for_darshan(
+                run_root,
+                expected,
+                timeout_sec=darshan_poll_timeout_sec,
+                initial_interval_sec=darshan_poll_initial_sec,
+                max_interval_sec=darshan_poll_max_sec,
+                backoff=darshan_poll_backoff,
+            )
+            if resolved is None:
                 present = sorted(run_root.glob("*.darshan"))
-                if len(present) == 1:
-                    expected = present[0]
-                    print(f"{ts()}  INFO: Using discovered Darshan file: {expected}")
-                else:
-                    if present:
-                        for p in present:
-                            print(f"{ts()}    Present: {p}")
-                    cleanup_payload_subdirs(run_root)
-                    continue
-            else:
-                found = sorted(run_root.glob("*.darshan"))
-                if len(found) == 1:
-                    expected = found[0]
-                    print(f"{ts()}  INFO: Using discovered Darshan file: {expected}")
-                else:
-                    print(f"{ts()}  ERROR: Could not determine Darshan artifact to analyze")
-                    cleanup_payload_subdirs(run_root)
-                    continue
+                print(f"{ts()}  ERROR: Darshan poll timed out ({poll_status})")
+                if present:
+                    for p in present:
+                        print(f"{ts()}    Present: {p}")
+                cleanup_payload_subdirs(run_root)
+                continue
+            expected = resolved
+            print(f"{ts()}  OK: Found Darshan: {expected} ({poll_status})")
 
         print(f"{ts()}  [Analyze] merged analysis for {json_name}")
         if not analyze_script.is_file():
