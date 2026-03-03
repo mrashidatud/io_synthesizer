@@ -26,7 +26,16 @@ from io_recommender.deploy import DeploymentRecommender, materialize_recommendat
 from io_recommender.model import ConfigEncoder, EnsembleConfig, EnsembleModel, WorkloadEncoder
 from io_recommender.pipeline import baseline_from_specs, parse_specs
 from io_recommender.types import Observation, ParameterSpec, WorkloadPattern, config_id_from_params
-from warm_start_pipeline import append_csv, apply_lustre_knobs, ensure_mpi_binary, run_cmd, ts, workload_key
+from warm_start_pipeline import (
+    append_csv,
+    apply_lustre_knobs,
+    ensure_mpi_binary,
+    parse_collective_mode,
+    parse_io_api,
+    run_cmd,
+    ts,
+    workload_key,
+)
 
 
 @dataclass
@@ -257,7 +266,7 @@ def main() -> None:
     ap.add_argument("--nprocs", type=int, default=1)
     ap.add_argument("--io-api", default="posix")
     ap.add_argument("--meta-api", default="posix")
-    ap.add_argument("--coll", default="none")
+    ap.add_argument("--coll", choices=["yes", "no"], default="no")
     ap.add_argument("--meta-scope", default="separate")
 
     ap.add_argument("--metric-key", default="agg_perf_by_slowest")
@@ -276,6 +285,9 @@ def main() -> None:
     ap.add_argument("--force-build", action="store_true", default=False)
 
     args = ap.parse_args()
+    io_api = parse_io_api(args.io_api, default="posix")
+    meta_api = "posix"
+    coll = parse_collective_mode(args.coll, io_api=io_api, default="no")
 
     closest_json = Path(args.closest_json)
     inputs_dir = Path(args.inputs_dir)
@@ -353,7 +365,7 @@ def main() -> None:
         if len(recs) < 3:
             raise RuntimeError(f"Expected 3 recommendations for {cand}, got {len(recs)}")
 
-        wkey = workload_key(cand, args.cap, args.nprocs, args.io_api, args.meta_api, args.coll)
+        wkey = workload_key(cand, args.cap, args.nprocs, io_api, meta_api, coll)
         workload_dir = output_root / wkey
         workload_dir.mkdir(parents=True, exist_ok=True)
 
@@ -368,11 +380,11 @@ def main() -> None:
                 "--cap-total-gib",
                 str(args.cap),
                 "--io-api",
-                args.io_api,
+                io_api,
                 "--meta-api",
-                args.meta_api,
+                meta_api,
                 "--mpi-collective-mode",
-                args.coll,
+                coll,
                 "--meta-scope",
                 args.meta_scope,
                 "--nprocs",
@@ -391,9 +403,9 @@ def main() -> None:
             "candidate_rank": int(sel["candidate_rank"]),
             "nprocs": args.nprocs,
             "cap_total_gib": args.cap,
-            "io_api": args.io_api,
-            "meta_api": args.meta_api,
-            "collective": args.coll,
+            "io_api": io_api,
+            "meta_api": meta_api,
+            "collective": coll,
             "meta_scope": args.meta_scope,
             "recommendations": recs,
             "baseline_config_id": baseline_id,

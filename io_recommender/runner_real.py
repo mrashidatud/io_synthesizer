@@ -50,7 +50,7 @@ class RealSynthRunner:
     cap_total_gib: float = 512.0
     io_api: str = "posix"
     meta_api: str = "posix"
-    mpi_collective_mode: str = "none"
+    mpi_collective_mode: str = "no"
     meta_scope: str = "separate"
     nprocs_cap: int = 64
     metric_key: str = "POSIX_agg_perf_by_slowest"
@@ -68,6 +68,23 @@ class RealSynthRunner:
         self.io_synth_root = Path(self.io_synth_root)
         self.input_dir = Path(self.input_dir)
         self.out_root = Path(self.out_root)
+        self.io_api = str(self.io_api).strip().lower() or "posix"
+        if self.io_api not in {"posix", "mpiio"}:
+            self.io_api = "posix"
+        self.meta_api = "posix"
+        if isinstance(self.mpi_collective_mode, bool):
+            coll = "yes" if self.mpi_collective_mode else "no"
+        else:
+            s = str(self.mpi_collective_mode).strip().lower()
+            if s in {"yes", "y", "1", "true", "on", "collective"}:
+                coll = "yes"
+            elif s in {"no", "n", "0", "false", "off", "none", "independent", ""}:
+                coll = "no"
+            else:
+                coll = "no"
+        if self.io_api != "mpiio":
+            coll = "no"
+        self.mpi_collective_mode = coll
         self.meta_scope = str(self.meta_scope).strip().lower() or "separate"
         if self.meta_scope not in {"separate", "data_files"}:
             raise ValueError(f"Unsupported runner meta_scope='{self.meta_scope}'")

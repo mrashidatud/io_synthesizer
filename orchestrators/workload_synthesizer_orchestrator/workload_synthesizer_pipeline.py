@@ -45,6 +45,28 @@ def parse_meta_scope(v: object, default: str = "separate") -> str:
         raise ValueError(f"Invalid meta_scope '{v}'. Expected one of: separate, data_files")
     return scope
 
+def parse_io_api(v: object, default: str = "posix") -> str:
+    io_api = str(v).strip().lower() if v is not None else default
+    io_api = io_api or default
+    if io_api not in {"posix", "mpiio"}:
+        io_api = default
+    return io_api
+
+def parse_collective_mode(v: object, *, io_api: str, default: str = "no") -> str:
+    if isinstance(v, bool):
+        coll = "yes" if v else "no"
+    else:
+        s = str(v).strip().lower() if v is not None else ""
+        if s in {"yes", "y", "1", "true", "on", "collective"}:
+            coll = "yes"
+        elif s in {"no", "n", "0", "false", "off", "none", "independent", ""}:
+            coll = "no"
+        else:
+            coll = default
+    if io_api != "mpiio":
+        return "no"
+    return coll
+
 
 def parse_options_csv(path: Path) -> Dict[str, str]:
     out: Dict[str, str] = {}
@@ -346,6 +368,15 @@ def main() -> None:
     alignment_policy = (opts.get("alignment_policy", "structure_preserving") or "structure_preserving").strip()
     phase_cap = int(opts.get("phase_cap", "50000") or "50000")
     data_random_preseek = int(opts.get("data_random_preseek", "0") or "0")
+    io_api = parse_io_api(opts.get("io_api", "posix"), default="posix")
+    meta_api = (opts.get("meta_api", "posix") or "posix").strip().lower()
+    if meta_api != "posix":
+        meta_api = "posix"
+    coll = parse_collective_mode(
+        opts.get("mpi_collective_mode", "no"),
+        io_api=io_api,
+        default="no",
+    )
     darshan_poll_timeout_sec = float(
         opts.get("darshan_poll_timeout_sec", opts.get("flush_wait_sec", "120")) or "120"
     )
@@ -395,6 +426,7 @@ def main() -> None:
         f"{ts()}  Planner controls: optimizer={optimizer} seq_policy={seq_policy} "
         f"alignment_policy={alignment_policy} phase_cap={phase_cap} data_random_preseek={data_random_preseek}"
     )
+    print(f"{ts()}  I/O API controls: io_api={io_api} meta_api={meta_api} mpi_collective_mode={coll}")
 
     ensure_mpi_binary(root, bin_dir, force_build)
 
@@ -428,11 +460,11 @@ def main() -> None:
             "--cap-total-gib",
             str(cap_total_gib),
             "--io-api",
-            "posix",
+            io_api,
             "--meta-api",
-            "posix",
+            meta_api,
             "--mpi-collective-mode",
-            "none",
+            coll,
             "--meta-scope",
             meta_scope,
             "--optimizer",

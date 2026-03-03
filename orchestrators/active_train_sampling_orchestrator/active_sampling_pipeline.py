@@ -38,6 +38,8 @@ from warm_start_pipeline import (
     load_manifest_meta_scope,
     load_nprocs_from_json,
     parse_bool,
+    parse_collective_mode,
+    parse_io_api,
     parse_meta_scope,
     parse_options_csv,
     read_iteration_observation_index,
@@ -268,9 +270,16 @@ def main() -> None:
     cap_total_gib = float(opts.get("cap", str(runner_cfg.get("cap_total_gib", 512.0))) or str(runner_cfg.get("cap_total_gib", 512.0)))
     nprocs_override = opts.get("nprocs", "").strip()
     nprocs_cap = int(opts.get("nprocs_cap", str(runner_cfg.get("nprocs_cap", 64))) or str(runner_cfg.get("nprocs_cap", 64)))
-    io_api = opts.get("io_api", str(runner_cfg.get("io_api", "posix"))) or "posix"
+    io_api = parse_io_api(
+        opts.get("io_api", str(runner_cfg.get("io_api", "posix"))),
+        default="posix",
+    )
     meta_api = opts.get("meta_api", str(runner_cfg.get("meta_api", "posix"))) or "posix"
-    coll = opts.get("mpi_collective_mode", str(runner_cfg.get("mpi_collective_mode", "none"))) or "none"
+    coll = parse_collective_mode(
+        opts.get("mpi_collective_mode", str(runner_cfg.get("mpi_collective_mode", "no"))),
+        io_api=io_api,
+        default="no",
+    )
     meta_scope = parse_meta_scope(opts.get("meta_scope", runner_cfg.get("meta_scope", "separate")))
     flush_wait_sec = float(opts.get("flush_wait_sec", str(runner_cfg.get("flush_wait_sec", 10.0))) or str(runner_cfg.get("flush_wait_sec", 10.0)))
     use_sudo_lustre = parse_bool(opts.get("use_sudo_lustre"), default=bool(runner_cfg.get("use_sudo_for_lustre", False)))

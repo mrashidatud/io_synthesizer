@@ -6,6 +6,9 @@ inputs,/mnt/hasanfs/io_synthesizer/inputs/exemplar_jsons
 force_build,1
 delete_darshan,1
 filters,1-25
+io_api,posix
+meta_api,posix
+mpi_collective_mode,no
 meta_scope,data_files
 optimizer,lexicographic
 seq_policy,nonconsec_strict

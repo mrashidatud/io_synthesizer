@@ -46,6 +46,32 @@ def parse_meta_scope(v: object, default: str = "separate") -> str:
         raise ValueError(f"Invalid meta_scope '{v}'. Expected one of: separate, data_files")
     return scope
 
+def parse_io_api(v: object, default: str = "posix") -> str:
+    io_api = str(v).strip().lower() if v is not None else default
+    io_api = io_api or default
+    if io_api not in {"posix", "mpiio"}:
+        io_api = default
+    return io_api
+
+def parse_collective_mode(v: object, *, io_api: str, default: str = "no") -> str:
+    """
+    Normalize collective mode to yes|no.
+    Collective only materializes for mpiio; posix always forces no.
+    """
+    if isinstance(v, bool):
+        coll = "yes" if v else "no"
+    else:
+        s = str(v).strip().lower() if v is not None else ""
+        if s in {"yes", "y", "1", "true", "on", "collective"}:
+            coll = "yes"
+        elif s in {"no", "n", "0", "false", "off", "none", "independent", ""}:
+            coll = "no"
+        else:
+            coll = default
+    if io_api != "mpiio":
+        return "no"
+    return coll
+
 
 def parse_options_csv(path: Path) -> Dict[str, str]:
     out: Dict[str, str] = {}
@@ -275,9 +301,13 @@ def main() -> None:
     delete_darshan = parse_bool(opts.get("delete_darshan"), default=True)
     filters_raw = opts.get("filters", "").strip()
     iterations = int(opts.get("iterations", "3") or "3")
-    io_api = opts.get("io_api", "posix") or "posix"
+    io_api = parse_io_api(opts.get("io_api", "posix"), default="posix")
     meta_api = opts.get("meta_api", "posix") or "posix"
-    coll = opts.get("mpi_collective_mode", "none") or "none"
+    coll = parse_collective_mode(
+        opts.get("mpi_collective_mode", "no"),
+        io_api=io_api,
+        default="no",
+    )
     meta_scope = parse_meta_scope(opts.get("meta_scope", "separate"))
     flush_wait_sec = float(opts.get("flush_wait_sec", "10") or "10")
     use_sudo_lustre = parse_bool(opts.get("use_sudo_lustre"), default=False)

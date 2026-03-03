@@ -1,7 +1,7 @@
 ,top1_101,top2_20,top3_18,top4_192,top5_74,top6_331,top7_28,top8_48,top9_47,top10_252,top11_249,top12_236,top13_237,top14_344,top15_50,top16_225,top17_41,top18_7,top19_83,top20_322,top21_258,top22_207,top23_193,top24_138,top25_64
 io_api,posix,posix,posix,mpiio,posix,posix,posix,mpiio,posix,posix,mpiio,posix,posix,posix,mpiio,posix,mpiio,posix,posix,posix,posix,posix,mpiio,posix,posix
 meta_api,posix,posix,posix,posix,posix,posix,posix,posix,posix,posix,posix,posix,posix,posix,posix,posix,posix,posix,posix,posix,posix,posix,posix,posix,posix
-mpi_collective_mode,none,none,none,True,none,none,none,False,none,none,False,none,none,none,False,none,True,none,none,none,none,none,True,none,none
+mpi_collective_mode,no,no,no,yes,no,no,no,no,no,no,no,no,no,no,no,no,yes,no,no,no,no,no,yes,no,no
 nprocs,1,1,1,1,1,4,1,16,40,1,512,1,32,64,4,8,160,4,4,8,1,64,512,1,16
 cluster,101,20,18,192,74,331,28,48,47,252,249,236,237,344,50,225,41,7,83,322,258,207,193,138,64
 pct_file_not_aligned,0.6,0.33,0.33,0.0,0.44,1.0,0.06,0.92,0.98,0.33,1.0,0.46,0.43,0.71,0.71,0.88,0.03,1.0,1.0,0.98,0.67,0.2,0.01,0.95,0.98

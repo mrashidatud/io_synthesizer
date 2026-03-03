@@ -3,7 +3,7 @@
   "jobid": 3060703,
   "io_api": "posix",
   "meta_api": "posix",
-  "mpi_collective_mode": "none",
+  "mpi_collective_mode": "no",
   "nprocs": 8,
   "cluster": 322,
   "pct_file_not_aligned": 0.98,

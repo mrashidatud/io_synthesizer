@@ -17,7 +17,7 @@ def _base_features():
         "nprocs": 2,
         "io_api": "posix",
         "meta_api": "posix",
-        "mpi_collective_mode": "none",
+        "mpi_collective_mode": "no",
         "meta_scope": "data_files",
         "pct_reads": 0.5,
         "pct_writes": 0.5,
@@ -62,7 +62,8 @@ def _run_plan(tmp_path, overrides=None):
     out = MOD.plan_from_features(feats, nranks=2, fs_align_bytes=4096)
     plan_csv = Path(out["plan_csv"])
     notes = Path(out["notes"])
-    return plan_csv, notes
+    run_sh = Path(out["run_sh"])
+    return plan_csv, notes, run_sh
 
 
 def test_lexicographic_alignment_does_not_change_ordering_error():
@@ -87,7 +88,7 @@ def test_lexicographic_alignment_does_not_change_ordering_error():
 
 
 def test_seq_rows_stay_nonconsecutive_in_generated_plan(tmp_path):
-    plan_csv, _ = _run_plan(
+    plan_csv, _, _ = _run_plan(
         tmp_path,
         {
             "pct_seq_reads": 0.8,
@@ -153,7 +154,7 @@ def test_clamp_risk_mitigation_reduces_predicted_clamps():
 
 
 def test_data_random_preseek_zero_avoids_meta_seek_inflation_path(tmp_path):
-    plan_csv, _ = _run_plan(
+    plan_csv, _, _ = _run_plan(
         tmp_path,
         {
             "data_random_preseek": 0,
@@ -176,3 +177,41 @@ def test_data_random_preseek_zero_avoids_meta_seek_inflation_path(tmp_path):
     meta_rows = [r for r in rows if r["type"] == "meta"]
     assert meta_rows
     assert all(int(r["meta_seek"]) == 0 for r in meta_rows)
+
+
+def test_collective_yes_applies_for_mpiio_runner(tmp_path):
+    _, _, run_sh = _run_plan(
+        tmp_path,
+        {
+            "io_api": "mpiio",
+            "mpi_collective_mode": "yes",
+        },
+    )
+    text = run_sh.read_text(encoding="utf-8")
+    assert "--io-api mpiio" in text
+    assert "--collective yes" in text
+
+
+def test_collective_forced_no_for_posix_runner(tmp_path):
+    _, _, run_sh = _run_plan(
+        tmp_path,
+        {
+            "io_api": "posix",
+            "mpi_collective_mode": "yes",
+        },
+    )
+    text = run_sh.read_text(encoding="utf-8")
+    assert "--io-api posix" in text
+    assert "--collective no" in text
+
+
+def test_collective_boolean_feature_normalized(tmp_path):
+    _, _, run_sh = _run_plan(
+        tmp_path,
+        {
+            "io_api": "mpiio",
+            "mpi_collective_mode": True,
+        },
+    )
+    text = run_sh.read_text(encoding="utf-8")
+    assert "--collective yes" in text

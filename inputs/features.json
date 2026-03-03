@@ -4,7 +4,7 @@
   "io_api": "posix",
   "meta_api": "posix",
   "use_mdtest": false,
-  "mpi_collective_mode": "none",
+  "mpi_collective_mode": "no",
   "nprocs": 1,
   "cap_total_gib": 512,
 

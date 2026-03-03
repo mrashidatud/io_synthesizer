@@ -90,7 +90,7 @@ runner:
   cap_total_gib: 512
   io_api: posix
   meta_api: posix
-  mpi_collective_mode: none
+  mpi_collective_mode: no
   meta_scope: separate   # separate | data_files
   nprocs_cap: 64
   metric_key: POSIX_agg_perf_by_slowest

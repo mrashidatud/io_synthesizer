@@ -9,7 +9,7 @@ filters,1
 iterations,3
 io_api,posix
 meta_api,posix
-mpi_collective_mode,none
+mpi_collective_mode,no
 meta_scope,separate
 flush_wait_sec,10
 use_sudo_lustre,0

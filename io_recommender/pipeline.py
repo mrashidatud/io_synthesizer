@@ -218,7 +218,7 @@ def run_pipeline(cfg: Mapping, output_dir: Path) -> PipelineArtifacts:
             cap_total_gib=float(runner_cfg.get("cap_total_gib", 512.0)),
             io_api=str(runner_cfg.get("io_api", "posix")),
             meta_api=str(runner_cfg.get("meta_api", "posix")),
-            mpi_collective_mode=str(runner_cfg.get("mpi_collective_mode", "none")),
+            mpi_collective_mode=str(runner_cfg.get("mpi_collective_mode", "no")),
             meta_scope=str(runner_cfg.get("meta_scope", "separate")),
             nprocs_cap=int(runner_cfg.get("nprocs_cap", 64)),
             metric_key=str(runner_cfg.get("metric_key", "POSIX_agg_perf_by_slowest")),

@@ -193,6 +193,35 @@ def infer_fs_file_alignment_bytes(target_path: Path, fallback_align: int) -> int
 
 def clamp01(x): return max(0.0, min(1.0, float(x)))
 
+def normalize_io_collective(io_api_raw, collective_raw):
+    """
+    Normalize io_api + collective mode to the supported interface:
+      - io_api: posix|mpiio
+      - collective: yes|no
+
+    Policy:
+      - legacy collective spellings are accepted as input for compatibility.
+      - collective only materializes for mpiio; posix always forces collective=no.
+    """
+    io_api = str(io_api_raw).strip().lower() if io_api_raw is not None else "posix"
+    if io_api not in {"posix", "mpiio"}:
+        io_api = "posix"
+
+    if isinstance(collective_raw, bool):
+        collective = "yes" if collective_raw else "no"
+    else:
+        s = str(collective_raw).strip().lower() if collective_raw is not None else ""
+        if s in {"yes", "y", "1", "true", "on", "collective"}:
+            collective = "yes"
+        elif s in {"no", "n", "0", "false", "off", "none", "independent", ""}:
+            collective = "no"
+        else:
+            collective = "no"
+
+    if io_api != "mpiio":
+        collective = "no"
+    return io_api, collective
+
 def rational_counts(fracs, max_denom=64, tol=0.05):
     """
     Map fractional shares to small integer counts with a tolerance-first policy.
@@ -3529,9 +3558,16 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
 
     # ---------- Runner (EXACT paths; run prep first) ----------
     nprocs = int(feats.get('nprocs', max(1, nranks)))
-    iapi   = str(feats.get('io_api', 'posix'))
-    mapi   = str(feats.get('meta_api', 'posix'))
-    coll   = str(feats.get('mpi_collective_mode', 'none'))
+    iapi, coll = normalize_io_collective(
+        feats.get("io_api", "posix"),
+        feats.get("mpi_collective_mode", "no"),
+    )
+    mapi = str(feats.get("meta_api", "posix")).strip().lower() or "posix"
+    if mapi != "posix":
+        mapi = "posix"
+    feats["io_api"] = iapi
+    feats["meta_api"] = mapi
+    feats["mpi_collective_mode"] = coll
     darshan_modmem_mib = int(feats.get("darshan_modmem_mib", 64))
     if darshan_modmem_mib < 4:
         darshan_modmem_mib = 4
@@ -3827,7 +3863,7 @@ def main():
     ap.add_argument("--nprocs", type=int, default=None, help="Override number of ranks (takes precedence over --nranks)")
     ap.add_argument("--io-api", choices=["posix","mpiio"], default=None, help="Override io_api")
     ap.add_argument("--meta-api", choices=["posix"], default=None, help="Override meta_api")
-    ap.add_argument("--mpi-collective-mode", choices=["none","independent","collective"], default=None, help="Override mpi_collective_mode")
+    ap.add_argument("--mpi-collective-mode", choices=["yes","no"], default=None, help="Override mpi_collective_mode")
     ap.add_argument(
         "--optimizer",
         choices=["lexicographic"],
@@ -3912,6 +3948,15 @@ def main():
     else:
         fs_align_bytes = infer_fs_file_alignment_bytes(OUTROOT, int(args.fs_align))
     feats["posix_file_alignment_bytes"] = int(fs_align_bytes)
+
+    # Normalize execution mode controls once for all downstream consumers.
+    iapi, coll = normalize_io_collective(
+        feats.get("io_api", "posix"),
+        feats.get("mpi_collective_mode", "no"),
+    )
+    feats["io_api"] = iapi
+    feats["mpi_collective_mode"] = coll
+    feats["meta_api"] = "posix"
 
     # Stash json base for runner naming
     feats["_json_base"] = json_base

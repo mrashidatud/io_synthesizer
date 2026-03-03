@@ -27,7 +27,7 @@
  *
  * Run:
  *   mpiexec -n <N> ./mpi_synthio --plan payload/plan.csv \
- *           --io-api posix --meta-api posix --collective none
+ *           --io-api posix --meta-api posix --collective no
  */
 
 #define _GNU_SOURCE
@@ -997,7 +997,7 @@ int main(int argc, char** argv)
     const char* plan_path=NULL;
     io_api_t ioapi=API_POSIX;
     meta_api_t metapi=META_POSIX;
-    col_mode_t cm=COL_NONE;
+    col_mode_t cm=COL_INDEP; /* default mpiio behavior for --collective=no */
 
     for(int i=1;i<argc;i++){
         if(!strcmp(argv[i],"--plan") && i+1<argc) {
@@ -1012,9 +1012,13 @@ int main(int argc, char** argv)
             metapi=META_POSIX;
         } else if(!strcmp(argv[i],"--collective") && i+1<argc){
             const char* v=argv[++i];
-            if(!strcmp(v,"none")) cm=COL_NONE;
-            else if(!strcmp(v,"independent")) cm=COL_INDEP;
-            else if(!strcmp(v,"collective")) cm=COL_COLL;
+            if(!strcmp(v,"no")) cm=COL_INDEP;
+            else if(!strcmp(v,"yes")) cm=COL_COLL;
+            else if(rank==0){
+                fprintf(stderr,
+                    "WARN: invalid --collective '%s' (expected yes|no). Using 'no'.\n",
+                    v);
+            }
         } else if(!strcmp(argv[i],"--fs-align") && i+1<argc){
             unsigned long long v = strtoull(argv[++i], NULL, 10);
             if (v == 0ULL) v = 1ULL;
@@ -1024,10 +1028,18 @@ int main(int argc, char** argv)
 
     if(!plan_path){
         if(rank==0){
-            fprintf(stderr,"Usage: %s --plan payload/plan.csv [--io-api posix|mpiio] [--meta-api posix] [--collective none|independent|collective] [--fs-align BYTES]\n", argv[0]);
+            fprintf(stderr,"Usage: %s --plan payload/plan.csv [--io-api posix|mpiio] [--meta-api posix] [--collective no|yes] [--fs-align BYTES]\n", argv[0]);
         }
         MPI_Finalize();
         return 1;
+    }
+
+    if (ioapi != API_MPIIO) {
+        if (cm == COL_COLL && rank == 0) {
+            fprintf(stderr,
+                "INFO: --collective=yes ignored because --io-api=posix. Using POSIX path.\n");
+        }
+        cm = COL_NONE;
     }
 
     /* All ranks read/iterate plan to stay in step (but only participants open/IO) */
