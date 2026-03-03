@@ -1,11 +1,19 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Dict, Iterable, List, Mapping, Sequence
 
 import numpy as np
 
 from io_recommender.sampling.pairwise import enumerate_all_configs, total_space_size
 from io_recommender.types import Config, Observation, ParameterSpec
+
+
+@dataclass(frozen=True)
+class CandidatePoolResult:
+    configs: List[Config]
+    mode: str
+    total_space: int
 
 
 def _config_key(config: Mapping[str, object], specs: Sequence[ParameterSpec]) -> tuple:
@@ -30,24 +38,26 @@ def _mutate_two(config: Config, specs: Sequence[ParameterSpec], rng: np.random.G
     return c
 
 
-def generate_candidate_pool(
+def generate_candidate_pool_details(
     specs: Sequence[ParameterSpec],
     observations: Iterable[Observation],
     pattern_id: str,
     top_configs: List[Config],
     seed: int,
-    enum_threshold: int = 50_000,
+    enum_threshold_hard: int = 52_920,
     max_pool: int = 12_000,
-) -> List[Config]:
+) -> CandidatePoolResult:
     rng = np.random.default_rng(seed)
     tested = {
         _config_key(obs.config_params, specs)
         for obs in observations
         if obs.pattern_id == pattern_id
     }
+    total = total_space_size(specs)
 
-    if total_space_size(specs) <= enum_threshold:
-        return [c for c in enumerate_all_configs(specs) if _config_key(c, specs) not in tested]
+    if total <= enum_threshold_hard:
+        configs = [c for c in enumerate_all_configs(specs) if _config_key(c, specs) not in tested]
+        return CandidatePoolResult(configs=configs, mode="enumerated", total_space=total)
 
     pool: Dict[tuple, Config] = {}
     for cfg in top_configs:
@@ -72,4 +82,24 @@ def generate_candidate_pool(
         if k in tested:
             continue
         pool[k] = c
-    return list(pool.values())
+    return CandidatePoolResult(configs=list(pool.values()), mode="sampled", total_space=total)
+
+
+def generate_candidate_pool(
+    specs: Sequence[ParameterSpec],
+    observations: Iterable[Observation],
+    pattern_id: str,
+    top_configs: List[Config],
+    seed: int,
+    enum_threshold_hard: int = 52_920,
+    max_pool: int = 12_000,
+) -> List[Config]:
+    return generate_candidate_pool_details(
+        specs=specs,
+        observations=observations,
+        pattern_id=pattern_id,
+        top_configs=top_configs,
+        seed=seed,
+        enum_threshold_hard=enum_threshold_hard,
+        max_pool=max_pool,
+    ).configs

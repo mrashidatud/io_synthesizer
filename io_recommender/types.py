@@ -33,6 +33,9 @@ class Observation:
     perf: float
     baseline_perf: float
     gain: float
+    source: str = "active"
+    iteration: int = 0
+    replicate_index: int = 0
 
 
 def config_id_from_params(config: Mapping[str, Any]) -> str:

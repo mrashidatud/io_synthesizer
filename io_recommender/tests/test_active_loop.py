@@ -51,6 +51,9 @@ def test_active_loop_batching_and_no_duplicates() -> None:
     assert len(history) == 3
     expected_new = len(patterns) * cfg.batch_per_iter * cfg.iterations
     assert len(final_obs) == len(warm_obs) + expected_new
+    assert all("candidate_mode_counts" in h for h in history)
+    assert all("uncertainty_top" in h for h in history)
+    assert all(h["candidate_mode_counts"].get("enumerated", 0) == len(patterns) for h in history)
 
     for p in patterns:
         seen = set()
