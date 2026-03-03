@@ -10,8 +10,13 @@ import yaml
 
 from io_recommender.active import ActiveLoopConfig, run_active_loop
 from io_recommender.deploy import DeploymentRecommender, materialize_recommendation_matrix
-from io_recommender.eval import plot_learning_curves
-from io_recommender.model import ConfigEncoder, WorkloadEncoder
+from io_recommender.eval import (
+    build_contribution_report,
+    evaluate_on_heldout,
+    plot_learning_curves,
+    write_markdown_summary,
+)
+from io_recommender.model import ConfigEncoder, EnsembleConfig, WorkloadEncoder
 from io_recommender.runner import StubTestbedRunner
 from io_recommender.runner_real import RealSynthRunner
 from io_recommender.sampling import build_warm_start_set, enumerate_all_configs, total_space_size
@@ -117,6 +122,9 @@ def collect_observations(
                     perf=perf,
                     baseline_perf=base_perf,
                     gain=perf - base_perf,
+                    source="warm",
+                    iteration=0,
+                    replicate_index=0,
                 )
             )
     return out, baseline_perf_by_pattern
@@ -153,6 +161,13 @@ def compute_oracle_best_gain(
             perf = runner.run_testbed(p.pattern_id, c, wvec)
             best = max(best, perf - baseline_perf_by_pattern[p.pattern_id])
         out[p.pattern_id] = best
+    return out
+
+
+def _best_gain_by_pattern(observations: Sequence[Observation]) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    for o in observations:
+        out[o.pattern_id] = max(out.get(o.pattern_id, float("-inf")), o.gain)
     return out
 
 
@@ -225,20 +240,34 @@ def run_pipeline(cfg: Mapping, output_dir: Path) -> PipelineArtifacts:
         baseline_cfg,
     )
 
-    if runner_mode == "real":
-        oracle_best = None
-    else:
-        oracle_best = compute_oracle_best_gain(
-            patterns,
-            specs,
-            baseline_perf,
-            workload_encoder,
-            runner,
-            seed=seed,
-        )
-
     active_cfg_raw = cfg.get("active", {})
     model_cfg = cfg.get("model", {})
+    oracle_mode_requested = str(active_cfg_raw.get("oracle_mode", "warm_only")).lower()
+    oracle_mode_effective = oracle_mode_requested
+    oracle_data_source = "warm_observations"
+    oracle_best = _best_gain_by_pattern(warm_obs)
+
+    if oracle_mode_requested == "heldout":
+        if runner_mode == "stub":
+            oracle_best = compute_oracle_best_gain(
+                patterns,
+                specs,
+                baseline_perf,
+                workload_encoder,
+                runner,
+                enum_threshold=int(active_cfg_raw.get("oracle_enum_threshold", 52_920)),
+                sampled=int(active_cfg_raw.get("oracle_sampled", 25_000)),
+                seed=seed,
+            )
+            oracle_data_source = "stub_enumerated_or_sampled"
+        else:
+            oracle_mode_effective = "warm_only"
+            oracle_data_source = "warm_observations_fallback_real_runner"
+    elif oracle_mode_requested == "warm_only":
+        oracle_data_source = "warm_observations"
+    else:
+        raise ValueError(f"Unsupported active.oracle_mode={oracle_mode_requested}")
+
     active_cfg = ActiveLoopConfig(
         iterations=int(active_cfg_raw.get("iterations", 8)),
         batch_per_iter=int(active_cfg_raw.get("batch_per_iter", 3)),
@@ -251,6 +280,12 @@ def run_pipeline(cfg: Mapping, output_dir: Path) -> PipelineArtifacts:
         use_lightgbm=bool(model_cfg.get("use_lightgbm", True)),
         early_stop_rounds=int(active_cfg_raw.get("early_stop_rounds", 0)),
         low_sigma_threshold=float(active_cfg_raw.get("low_sigma_threshold", 0.0)),
+        oracle_mode=oracle_mode_effective,
+        enum_threshold_hard=int(active_cfg_raw.get("enum_threshold_hard", 52_920)),
+        candidate_max_pool=int(active_cfg_raw.get("candidate_max_pool", 12_000)),
+        replicate_top_n=int(active_cfg_raw.get("replicate_top_n", 0)),
+        replicate_repeats=int(active_cfg_raw.get("replicate_repeats", 1)),
+        robust_score_z=float(active_cfg_raw.get("robust_score_z", 1.0)),
         seed=seed,
     )
 
@@ -281,15 +316,57 @@ def run_pipeline(cfg: Mapping, output_dir: Path) -> PipelineArtifacts:
 
     plot_learning_curves(history, output_dir / "plots")
 
+    eval_cfg = cfg.get("evaluation", {})
+    eval_enabled = bool(eval_cfg.get("enabled", True))
+    evaluation_report: dict = {"enabled": False}
+    if eval_enabled:
+        evaluation_report = evaluate_on_heldout(
+            observations=observations,
+            patterns=patterns,
+            workload_encoder=workload_encoder,
+            config_encoder=config_encoder,
+            ensemble_cfg=EnsembleConfig(
+                mode=str(model_cfg.get("mode", "ranking")),
+                ensemble_size=int(active_cfg_raw.get("ensemble_size", 6)),
+                seed=seed,
+                use_lightgbm=bool(model_cfg.get("use_lightgbm", True)),
+            ),
+            split_mode=str(eval_cfg.get("split_mode", "heldout_configs_per_pattern")),
+            holdout_fraction_configs=float(eval_cfg.get("holdout_fraction_configs", 0.2)),
+            holdout_fraction_patterns=float(eval_cfg.get("holdout_fraction_patterns", 0.2)),
+            temporal_split=bool(eval_cfg.get("temporal_split", False)),
+            temporal_holdout_fraction=float(eval_cfg.get("temporal_holdout_fraction", 0.2)),
+            top_k=int(eval_cfg.get("top_k", 3)),
+            hit_tolerance=float(eval_cfg.get("hit_tolerance", 0.05)),
+            bootstrap_iters=int(eval_cfg.get("bootstrap_iters", 200)),
+            ci_level=float(eval_cfg.get("ci_level", 0.95)),
+            seed=seed,
+        )
+    with open(output_dir / "evaluation_report.json", "w", encoding="utf-8") as f:
+        json.dump(evaluation_report, f, indent=2)
+
+    contribution_cfg = cfg.get("contribution", {})
+    contribution_report = build_contribution_report(
+        observations=observations,
+        top_k=int(contribution_cfg.get("top_k", 3)),
+    )
+    with open(output_dir / "contribution_report.json", "w", encoding="utf-8") as f:
+        json.dump(contribution_report, f, indent=2)
+
     summary = {
         "seed": seed,
         "runner_mode": runner_mode,
+        "oracle_mode": oracle_mode_effective,
+        "oracle_data_source": oracle_data_source,
         "n_patterns": len(patterns),
         "feature_names": feature_names,
         "warm_size": len(warm.configs),
         "pairwise_coverage_percent": warm.pairwise_coverage_percent,
         "total_observations": len(observations),
+        "replicate_observations": len([o for o in observations if o.source == "replicate"]),
         "history": history,
+        "evaluation_report_file": "evaluation_report.json",
+        "contribution_report_file": "contribution_report.json",
         "deployment_demo": demo,
     }
     with open(output_dir / "summary.json", "w", encoding="utf-8") as f:
@@ -297,6 +374,15 @@ def run_pipeline(cfg: Mapping, output_dir: Path) -> PipelineArtifacts:
 
     with open(output_dir / "recommendation_matrix.json", "w", encoding="utf-8") as f:
         json.dump(rec_matrix.topk_by_pattern, f, indent=2)
+
+    reporting_cfg = cfg.get("reporting", {})
+    if bool(reporting_cfg.get("write_markdown_summary", True)):
+        write_markdown_summary(
+            out_path=output_dir / "summary.md",
+            summary=summary,
+            evaluation_report=evaluation_report,
+            contribution_report=contribution_report,
+        )
 
     return PipelineArtifacts(
         specs=specs,
