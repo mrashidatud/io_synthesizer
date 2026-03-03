@@ -1,151 +1,181 @@
-# Improvement Plan: Warm-Start + Active-Sampling Recommender
+# Improvement Plan (Remaining Work) - Pipeline Style
 
 Date: 2026-03-02  
-Goal: Convert current high in-sample quality into reliable, measurable, and operationally robust recommendation quality.
+Scope: only pending work, written in the same flow as the recommender pipeline.
 
-## Plan Overview
+## What Is Already Done
+- Leakage fix in active history metrics (`oracle_mode`, `oracle_data_source`).
+- Held-out validation framework (`evaluation_report.json`).
+- Adaptive candidate mode (`enumerated` vs `sampled`) with logging.
+- Replicate support + uncertainty stats + robust ranking fields.
+- Contribution reporting (`contribution_report.json`) + markdown summary.
 
-This plan addresses 5 identified shortcomings:
-1. Evaluation leakage in active history metrics
-2. Missing held-out validation protocol
-3. Candidate search strategy near full-space boundary
-4. Single-shot active measurements (noise sensitivity)
-5. Missing active-vs-warm contribution reporting
+## End-to-End Flow (Remaining)
 
-## Phase 1: Fix Evaluation Metrics (Leakage Removal)
+`Objective -> Prior Build -> Warm-Start Bootstrap -> Active Sampling -> Stop Policy -> Validation/Report`
 
-### Objective
-Make `regret_at_3`, `hit_at_3`, and `ndcg_at_3` meaningful and non-trivial.
+---
 
-### Tasks
-- Change oracle construction in active pipeline to use a fixed reference set (not current observed best).
-- Support two oracle modes:
-  - `oracle_mode=heldout` (preferred)
-  - `oracle_mode=warm_only` (fallback)
-- Add explicit metadata in `summary.json`:
-  - `oracle_mode`
-  - `oracle_data_source`
+## Step 1: Set the Right Objective (TODO)
 
-### Deliverables
-- Code updates in active pipeline.
-- Backward-compatible output schema update.
+### Goal
+Switch optimization target from throughput-only to end-to-end behavior (I/O + metadata time).
 
-### Acceptance Criteria
-- History metrics are no longer constant/perfect by construction.
-- A/B rerun shows non-trivial metric curves over iterations.
+### Why
+Throughput can look good while metadata cost is high. We want the objective to match user-facing runtime.
 
-## Phase 2: Add True Validation Protocol
+### Plan
+- Add objective config:
+  - `objective.metric: throughput | e2e_time | speedup`
+  - `objective.direction: maximize | minimize`
+- Compute `e2e_time` from Darshan summary:
+  - `POSIX_F_READ_TIME + POSIX_F_WRITE_TIME + POSIX_F_META_TIME`
+- Convert to model-friendly gain:
+  - time-minimization form: `gain = baseline_e2e - current_e2e`
+  - optional relative form: `(baseline_e2e / current_e2e) - 1`
+- Record objective metadata in summary/evaluation/contribution artifacts.
 
-### Objective
-Measure generalization quality instead of in-sample ranking only.
+### Note on your intuition
+Your intuition is correct: for ranking configs **within the same workload**, scale differences across workloads are less problematic. Still, for regression mode we should prefer normalized targets.
 
-### Tasks
-- Add evaluation split options:
-  - `split_mode=heldout_configs_per_pattern`
-  - `split_mode=heldout_patterns`
-  - optional `temporal_split` for resumed runs
-- Generate `evaluation_report.json` with:
-  - top-1/top-3 regret vs held-out oracle
-  - hit@k and NDCG@k on held-out set
-  - confidence intervals (bootstrap)
+### Done when
+- Pipeline runs with `objective.metric=e2e_time`.
+- Held-out report can compare throughput objective vs e2e objective.
 
-### Deliverables
-- Evaluation module and CLI flags.
-- Saved validation report artifact.
+---
 
-### Acceptance Criteria
-- Reproducible held-out results from fixed seed.
-- Report includes per-workload and aggregate metrics.
+## Step 2: Build Prior From Observations (TODO)
 
-## Phase 3: Candidate Search Strategy Upgrade
+### Goal
+Use prior observations to guide search, instead of hand-written empirical rules.
 
-### Objective
-Reduce miss-risk from sampled candidate pools when full enumeration is feasible.
+### Why
+This gives sample efficiency without brittle manual heuristics.
 
-### Tasks
-- Add adaptive candidate mode:
-  - if total space <= `enum_threshold_hard`, use full enumeration.
-- Set `enum_threshold_hard` >= 52,920 for this environment (or auto by memory/time guard).
-- Log candidate mode per iteration/pattern (`enumerated` vs `sampled`).
+### Plan
+Build two priors:
+- **Global prior**: learned from all sampled workloads.
+- **Local prior**: learned from top-K similar workloads to current workload.
 
-### Deliverables
-- Candidate pool selector update.
-- Runtime diagnostics in logs.
+Combine them:
+- `prior_score = alpha * global_prior + (1 - alpha) * local_prior`
+- make `alpha` adaptive:
+  - early (low local evidence): higher global weight
+  - later (more local evidence): higher local weight
 
-### Acceptance Criteria
-- For current 52,920-space config, mode resolves to enumerated without failure.
-- Runtime overhead remains within agreed budget.
+Use prior in two modes:
+- soft bias (default): re-rank/down-weight low-prior candidates
+- hard prune (optional): filter candidates below `P(gain>0)` threshold
 
-## Phase 4: Add Replicate Policy for Active Top Candidates
+### Done when
+- Candidate count drops with prior enabled.
+- Held-out quality does not regress beyond tolerance.
+- Logs show global/local contribution and before/after candidate counts.
 
-### Objective
-Improve ranking reliability under run-to-run variability.
+---
 
-### Tasks
-- Add replicate policy after each active iteration:
-  - re-run top-1 and top-2 candidates for each pattern (configurable).
-- Store replicate index and aggregate stats per config:
-  - mean, std, CV, 95% CI
-- Rank by robust score (e.g., lower confidence bound or mean-penalized-std).
+## Step 3: Prior-Guided Warm-Start Workload Ordering (TODO)
 
-### Deliverables
-- Replicate execution path.
-- Aggregated scoring logic.
+### Goal
+Choose which workloads to sample first so early observations are maximally reusable.
 
-### Acceptance Criteria
-- Active top-K becomes stable across reruns.
-- Ranking report includes uncertainty columns.
+### Why
+If we explore "influential" workloads first, later workloads get stronger local prior sooner.
 
-## Phase 5: Active Contribution and Operational Reporting
+### Plan
+- Build workload similarity graph from workload features.
+- Compute centrality over **yet-unexplored** workloads.
+- Use adaptive ordering (recomputed as exploration proceeds), not one-time static ordering.
+- Prioritize workloads with highest coverage influence.
 
-### Objective
-Make improvement attribution explicit and decision-ready.
+Config examples:
+- `workload_ordering: static | centrality_first | adaptive_centrality`
+- `transfer.k_neighbors`, `transfer.weight`
 
-### Tasks
-- Add `contribution_report.json` with:
-  - `% top-K from active`
-  - `best_active_vs_best_warm` delta per pattern
-  - `new_best_found_iter`
-  - cumulative improvement trajectory
-- Add markdown summary generation from artifacts.
+### Done when
+- Ordering artifact is generated (auditable per round).
+- Adaptive ordering reaches same/better quality with fewer runs than static ordering.
 
-### Deliverables
-- Contribution report artifact.
-- Auto-generated concise markdown summary for experiment runs.
+---
 
-### Acceptance Criteria
-- One command produces summary showing active value-add clearly.
-- Decision-makers can tell whether active sampling paid off per workload.
+## Step 4: Active Sampling Loop (TODO Refinement)
 
-## Suggested Execution Order
+### Goal
+Keep existing explore/exploit/diverse selection, but make it prior-guided and transfer-aware.
 
-1. Phase 1 (metric correctness)  
-2. Phase 2 (validation framework)  
-3. Phase 3 (candidate strategy)  
-4. Phase 4 (replicates + robust ranking)  
-5. Phase 5 (reporting and attribution)
+### Clear flow per active iteration
+1. Choose next workload(s) using adaptive centrality/priority.  
+2. Build candidate pool.  
+3. Apply prior bias (global + local).  
+4. Run explore/exploit/diversity selection on biased pool.  
+5. Execute selected configs.  
+6. Optional replicates for top candidates.  
+7. Update posterior/model and priors.
 
-## Estimated Effort (Engineering)
+### Why this is not duplicate work
+- Prior-guided constraints (Step 2) act at **config candidate** level.
+- Adaptive centrality ordering (Step 3) acts at **workload scheduling** level.
+- Both are needed, but they should be presented as one coherent pipeline.
 
-- Phase 1: 0.5-1 day
-- Phase 2: 1-2 days
-- Phase 3: 0.5-1 day
-- Phase 4: 1-2 days
-- Phase 5: 0.5-1 day
+### Done when
+- Active loop logs include workload priority, prior usage, candidate filtering stats, and replicate stats.
 
-Total: **3.5 to 7 days** depending on test/runtime cycles.
+---
 
-## Risks and Mitigations
+## Step 5: Better Stop Policy (TODO)
 
-- Risk: Increased runtime from enumeration/replicates  
-  Mitigation: make both configurable and budget-guarded.
+### Goal
+Stop based on evidence, not only fixed iteration count.
 
-- Risk: Held-out oracle quality depends on split design  
-  Mitigation: support multiple split modes and report both.
+### Plan
+Add composite stopping:
+- `min_iters` guard,
+- robust gain plateau patience,
+- uncertainty collapse threshold,
+- optional budget cap (`max_runs`/wall-clock).
 
-- Risk: Schema changes break downstream tooling  
-  Mitigation: keep backward-compatible fields and version artifacts.
+Stop reason must be logged explicitly.
 
-## Immediate Next Step
+### Done when
+- Runs end with deterministic reason codes.
+- Lower average run count at comparable held-out quality.
 
-Implement Phase 1 first, then rerun one short active experiment (e.g., 4 iterations) to verify metrics are no longer degenerate before moving to broader changes.
+---
+
+## Step 6: Validate and Decide (TODO)
+
+### Goal
+Prove that changes improve generalization and operational value.
+
+### Plan
+For each milestone run:
+- held-out validation (`evaluation_report.json`): top1/topk regret, hit@k, ndcg@k, CI
+- contribution report (`contribution_report.json`): active value-add trajectory
+- markdown summary for decision-making
+
+### Done when
+- One run folder clearly answers:
+  - Did quality improve?
+  - Did sample cost drop?
+  - Did active/prior guidance actually add value?
+
+---
+
+## Suggested Implementation Order
+1. Step 1 (objective = e2e)
+2. Step 2 (observation-based priors)
+3. Step 3 (adaptive workload ordering)
+4. Step 4 (wire into active loop)
+5. Step 5 (stop policy)
+6. Step 6 (validation + decision checks)
+
+This order keeps the objective correct first, then improves search efficiency, then controls runtime budget.
+
+---
+
+## Quick Validation Protocol (No Full Execution)
+For each step, run only short stub/small pilot checks:
+- schema checks: `summary.json`, `evaluation_report.json`, `contribution_report.json`
+- deterministic seed check
+- expected new fields/logs present
+- no full-scale workload execution
