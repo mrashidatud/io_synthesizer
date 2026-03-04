@@ -31,8 +31,10 @@ from io_recommender.model import ConfigEncoder, EnsembleConfig, EnsembleModel, W
 from io_recommender.pipeline import baseline_from_specs, parse_specs
 from io_recommender.types import Observation, ParameterSpec, WorkloadPattern, config_id_from_params
 from warm_start_pipeline import (
+    MPI_SYNTH_ENV_KEYS,
     append_csv,
     apply_lustre_knobs,
+    build_mpi_tuning_env,
     collect_workload_jsons,
     ensure_mpi_binary,
     load_manifest_meta_scope,
@@ -545,7 +547,15 @@ def main() -> None:
                         darshan_path.unlink(missing_ok=True)
 
                     applied = apply_lustre_knobs(ctx.workload_dir, conf, use_sudo_lustre)
+                    mpi_env, applied_mpi = build_mpi_tuning_env(
+                        conf,
+                        io_api=io_api,
+                        collective=coll,
+                    )
                     env = os.environ.copy()
+                    for k in MPI_SYNTH_ENV_KEYS:
+                        env.pop(k, None)
+                    env.update(mpi_env)
                     env["DARSHAN_LOGFILE"] = str(darshan_path)
                     run_cmd(["bash", str(ctx.run_sh)], cwd=root, env=env)
 
@@ -560,6 +570,8 @@ def main() -> None:
                             str(darshan_path),
                             "--outdir",
                             str(cfg_dir),
+                            "--io-api",
+                            io_api,
                             "--metric-key",
                             metric_key,
                         ],
@@ -598,6 +610,7 @@ def main() -> None:
                     for k, v in conf.items():
                         row[k] = v
                     row.update(applied)
+                    row.update(applied_mpi)
                     fieldnames = list(row.keys())
                     append_csv(iter_csv, row, fieldnames)
                     append_csv(workload_csv, row, fieldnames)

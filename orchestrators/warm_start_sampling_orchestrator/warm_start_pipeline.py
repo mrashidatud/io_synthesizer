@@ -23,6 +23,12 @@ from io_recommender.pipeline import baseline_from_specs, parse_specs
 from io_recommender.sampling import build_warm_start_set
 from io_recommender.types import config_id_from_params
 
+MPI_SYNTH_ENV_KEYS = (
+    "SYNTH_MPI_NUM_AGGREGATORS",
+    "SYNTH_MPI_COLLECTIVE_BUFFER_SIZE",
+    "SYNTH_MPI_AGGREGATORS_PER_CLIENT",
+)
+
 
 def ts() -> str:
     return datetime.now().strftime("%F %T")
@@ -71,6 +77,53 @@ def parse_collective_mode(v: object, *, io_api: str, default: str = "no") -> str
     if io_api != "mpiio":
         return "no"
     return coll
+
+def parse_positive_int(v: object) -> int | None:
+    if v is None:
+        return None
+    s = str(v).strip()
+    if not s:
+        return None
+    try:
+        val = int(float(s))
+    except Exception:
+        return None
+    return val if val > 0 else None
+
+def build_mpi_tuning_env(
+    cfg: Dict[str, object],
+    *,
+    io_api: str,
+    collective: str,
+) -> tuple[Dict[str, str], Dict[str, object]]:
+    env: Dict[str, str] = {}
+    applied: Dict[str, object] = {
+        "mpi_tuning_active": 0,
+        "applied_mpi_num_aggregators": "",
+        "applied_mpi_collective_buffer_size": "",
+        "applied_mpi_aggregators_per_client": "",
+    }
+    if parse_io_api(io_api, default="posix") != "mpiio":
+        return env, applied
+    if parse_collective_mode(collective, io_api="mpiio", default="no") != "yes":
+        return env, applied
+
+    num_aggs = parse_positive_int(cfg.get("num_aggregators", cfg.get("mpi_num_aggregators")))
+    cb_bytes = parse_positive_int(cfg.get("collective_buffer_size", cfg.get("mpi_collective_buffer_size")))
+    aggs_per_client = parse_positive_int(cfg.get("aggregators_per_client", cfg.get("mpi_aggregators_per_client")))
+
+    if num_aggs is not None:
+        env["SYNTH_MPI_NUM_AGGREGATORS"] = str(num_aggs)
+        applied["applied_mpi_num_aggregators"] = num_aggs
+    if cb_bytes is not None:
+        env["SYNTH_MPI_COLLECTIVE_BUFFER_SIZE"] = str(cb_bytes)
+        applied["applied_mpi_collective_buffer_size"] = cb_bytes
+    if aggs_per_client is not None:
+        env["SYNTH_MPI_AGGREGATORS_PER_CLIENT"] = str(aggs_per_client)
+        applied["applied_mpi_aggregators_per_client"] = aggs_per_client
+    if env:
+        applied["mpi_tuning_active"] = 1
+    return env, applied
 
 
 def parse_options_csv(path: Path) -> Dict[str, str]:
@@ -438,8 +491,16 @@ def main() -> None:
                     darshan_path.unlink(missing_ok=True)
 
                 applied = apply_lustre_knobs(workload_dir, cfg, use_sudo_lustre)
+                mpi_env, applied_mpi = build_mpi_tuning_env(
+                    cfg,
+                    io_api=io_api,
+                    collective=coll,
+                )
 
                 env = os.environ.copy()
+                for k in MPI_SYNTH_ENV_KEYS:
+                    env.pop(k, None)
+                env.update(mpi_env)
                 env["DARSHAN_LOGFILE"] = str(darshan_path)
                 run_cmd(["bash", str(run_sh)], cwd=root, env=env)
 
@@ -454,6 +515,8 @@ def main() -> None:
                         str(darshan_path),
                         "--outdir",
                         str(cfg_dir),
+                        "--io-api",
+                        io_api,
                         "--metric-key",
                         metric_key,
                     ],
@@ -478,6 +541,7 @@ def main() -> None:
                 for k, v in cfg.items():
                     row[k] = v
                 row.update(applied)
+                row.update(applied_mpi)
 
                 fieldnames = list(row.keys())
                 append_csv(iter_csv, row, fieldnames)

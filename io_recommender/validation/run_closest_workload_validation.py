@@ -27,8 +27,10 @@ from io_recommender.model import ConfigEncoder, EnsembleConfig, EnsembleModel, W
 from io_recommender.pipeline import baseline_from_specs, parse_specs
 from io_recommender.types import Observation, ParameterSpec, WorkloadPattern, config_id_from_params
 from warm_start_pipeline import (
+    MPI_SYNTH_ENV_KEYS,
     append_csv,
     apply_lustre_knobs,
+    build_mpi_tuning_env,
     ensure_mpi_binary,
     parse_collective_mode,
     parse_io_api,
@@ -434,8 +436,16 @@ def main() -> None:
 
             print(f"{ts()}  [{idx+1}/{len(selected)}] {cand} ({ref}) -> running {label} ({cfg_id})")
             applied = apply_lustre_knobs(workload_dir, cfg, args.use_sudo_lustre)
+            mpi_env, applied_mpi = build_mpi_tuning_env(
+                cfg,
+                io_api=io_api,
+                collective=coll,
+            )
 
             env = os.environ.copy()
+            for k in MPI_SYNTH_ENV_KEYS:
+                env.pop(k, None)
+            env.update(mpi_env)
             env["DARSHAN_LOGFILE"] = str(darshan_path)
             run_cmd(["bash", str(run_sh)], cwd=REPO_ROOT, env=env)
 
@@ -450,6 +460,8 @@ def main() -> None:
                     str(darshan_path),
                     "--outdir",
                     str(run_dir),
+                    "--io-api",
+                    io_api,
                     "--metric-key",
                     args.metric_key,
                 ],
@@ -480,6 +492,7 @@ def main() -> None:
             for k, v in cfg.items():
                 row[k] = v
             row.update(applied)
+            row.update(applied_mpi)
 
             fieldnames = list(row.keys())
             append_csv(workload_dir / "observations.csv", row, fieldnames)

@@ -38,6 +38,12 @@ def main():
     ap.add_argument("--darshan", required=True, help="Path to the .darshan file to analyze")
     ap.add_argument("--input-json", required=True, help="Path to the original input features JSON")
     ap.add_argument("--outdir", required=True, help="Run folder: /mnt/hasanfs/out_synth/<json_base>/")
+    ap.add_argument(
+        "--module-basis",
+        choices=["auto", "posix", "mpiio"],
+        default="auto",
+        help="Counter basis for feature derivation when generating darshan_features_updated.json",
+    )
     args = ap.parse_args()
 
     outdir = Path(args.outdir).resolve()
@@ -76,7 +82,17 @@ def main():
         sys.exit(1)
 
     print(f"[features] running generate_features.py in {outdir}")
-    run(["python3", str(gen), "--root", str(outdir)], cwd=str(outdir))
+    run(
+        [
+            "python3",
+            str(gen),
+            "--root",
+            str(outdir),
+            "--module-basis",
+            args.module_basis,
+        ],
+        cwd=str(outdir),
+    )
 
     if not feats_json_path.exists():
         print("⚠️  Features JSON not found after generation.", file=sys.stderr)
@@ -116,6 +132,7 @@ def main():
     else:
         print("⚠️  Produced features JSON has unexpected structure.", file=sys.stderr)
         sys.exit(1)
+    module_basis_used = str(prod_obj.get("feature_module_basis", "unknown"))
 
     keys = sorted([k for k in input_obj.keys() if k.startswith("pct_") and k in prod_obj])
 
@@ -157,6 +174,8 @@ def main():
         r.write(f"Time: {datetime.now().isoformat()}\n")
         r.write(f"Input JSON: {input_json}\n")
         r.write(f"Produced JSON: {feats_json_path}\n")
+        r.write(f"Module basis requested: {args.module_basis}\n")
+        r.write(f"Module basis used: {module_basis_used}\n")
         r.write(f"Total pct_* compared: {len(keys)}\n")
         r.write(f"Exact matches: {len(exact)}\n")
         r.write(f"Within ±{TOL}: {len(within)}\n")

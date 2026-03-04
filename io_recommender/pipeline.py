@@ -221,7 +221,7 @@ def run_pipeline(cfg: Mapping, output_dir: Path) -> PipelineArtifacts:
             mpi_collective_mode=str(runner_cfg.get("mpi_collective_mode", "no")),
             meta_scope=str(runner_cfg.get("meta_scope", "separate")),
             nprocs_cap=int(runner_cfg.get("nprocs_cap", 64)),
-            metric_key=str(runner_cfg.get("metric_key", "POSIX_agg_perf_by_slowest")),
+            metric_key=str(runner_cfg.get("metric_key", "agg_perf_by_slowest")),
             metric_fallback=str(runner_cfg.get("metric_fallback", "bytes_over_f_time")),
             delete_existing_darshan=bool(runner_cfg.get("delete_existing_darshan", True)),
             flush_wait_sec=float(runner_cfg.get("flush_wait_sec", 10.0)),

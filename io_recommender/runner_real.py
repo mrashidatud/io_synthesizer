@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -10,9 +11,15 @@ from typing import Dict, Sequence
 
 from io_recommender.types import Config, ParameterSpec
 
+MPI_SYNTH_ENV_KEYS = (
+    "SYNTH_MPI_NUM_AGGREGATORS",
+    "SYNTH_MPI_COLLECTIVE_BUFFER_SIZE",
+    "SYNTH_MPI_AGGREGATORS_PER_CLIENT",
+)
 
-def _run(cmd: list[str], cwd: Path | None = None) -> None:
-    subprocess.run(cmd, cwd=str(cwd) if cwd else None, check=True)
+
+def _run(cmd: list[str], cwd: Path | None = None, env: dict[str, str] | None = None) -> None:
+    subprocess.run(cmd, cwd=str(cwd) if cwd else None, env=env, check=True)
 
 
 def _parse_darshan_from_run_script(run_sh: Path) -> Path | None:
@@ -41,6 +48,19 @@ def _kib_or_size_to_lfs(value: object) -> str:
     return f"{v}K"
 
 
+def _parse_positive_int(v: object) -> int | None:
+    if v is None:
+        return None
+    s = str(v).strip()
+    if not s:
+        return None
+    try:
+        val = int(float(s))
+    except Exception:
+        return None
+    return val if val > 0 else None
+
+
 @dataclass
 class RealSynthRunner:
     specs: Sequence[ParameterSpec]
@@ -53,7 +73,7 @@ class RealSynthRunner:
     mpi_collective_mode: str = "no"
     meta_scope: str = "separate"
     nprocs_cap: int = 64
-    metric_key: str = "POSIX_agg_perf_by_slowest"
+    metric_key: str = "agg_perf_by_slowest"
     metric_fallback: str = "bytes_over_f_time"
     delete_existing_darshan: bool = True
     flush_wait_sec: float = 10.0
@@ -197,20 +217,52 @@ class RealSynthRunner:
         _run(self._cmd_lctl_set_param("mdc", "max_pages_per_rpc", mdc_pages))
         _run(self._cmd_lctl_set_param("mdc", "max_rpcs_in_flight", mdc_rpcs))
 
-    @staticmethod
-    def _metric_from_csv(csv_path: Path, metric_key: str, metric_fallback: str) -> float:
+    def _build_mpi_tuning_env(self, config: Config) -> dict[str, str]:
+        env: dict[str, str] = {}
+        if self.io_api != "mpiio":
+            return env
+        if self.mpi_collective_mode != "yes":
+            return env
+        num_aggs = _parse_positive_int(config.get("num_aggregators", config.get("mpi_num_aggregators")))
+        cb_bytes = _parse_positive_int(config.get("collective_buffer_size", config.get("mpi_collective_buffer_size")))
+        aggs_per_client = _parse_positive_int(config.get("aggregators_per_client", config.get("mpi_aggregators_per_client")))
+        if num_aggs is not None:
+            env["SYNTH_MPI_NUM_AGGREGATORS"] = str(num_aggs)
+        if cb_bytes is not None:
+            env["SYNTH_MPI_COLLECTIVE_BUFFER_SIZE"] = str(cb_bytes)
+        if aggs_per_client is not None:
+            env["SYNTH_MPI_AGGREGATORS_PER_CLIENT"] = str(aggs_per_client)
+        return env
+
+    def _metric_from_csv(self, csv_path: Path, metric_key: str, metric_fallback: str) -> float:
         with csv_path.open("r", encoding="utf-8") as f:
             row = next(csv.DictReader(f))
         if metric_key in row and row[metric_key] not in ("", None):
             return float(row[metric_key])
+        if f"MPIIO_{metric_key}" in row and row[f"MPIIO_{metric_key}"] not in ("", None):
+            return float(row[f"MPIIO_{metric_key}"])
+        if f"POSIX_{metric_key}" in row and row[f"POSIX_{metric_key}"] not in ("", None):
+            return float(row[f"POSIX_{metric_key}"])
 
         if metric_fallback == "bytes_over_f_time":
-            bytes_rw = float(row.get("POSIX_BYTES_READ", 0.0)) + float(row.get("POSIX_BYTES_WRITTEN", 0.0))
-            total_f_time = (
-                float(row.get("POSIX_F_READ_TIME", 0.0))
-                + float(row.get("POSIX_F_WRITE_TIME", 0.0))
-                + float(row.get("POSIX_F_META_TIME", 0.0))
+            module_prefix = "MPIIO" if self.io_api == "mpiio" else "POSIX"
+            bytes_rw = float(row.get(f"{module_prefix}_BYTES_READ", 0.0) or 0.0) + float(
+                row.get(f"{module_prefix}_BYTES_WRITTEN", 0.0) or 0.0
             )
+            total_f_time = (
+                float(row.get(f"{module_prefix}_F_READ_TIME", 0.0) or 0.0)
+                + float(row.get(f"{module_prefix}_F_WRITE_TIME", 0.0) or 0.0)
+                + float(row.get(f"{module_prefix}_F_META_TIME", 0.0) or 0.0)
+            )
+            if total_f_time <= 1e-12 or bytes_rw <= 0.0:
+                bytes_rw = float(row.get("POSIX_BYTES_READ", 0.0) or 0.0) + float(
+                    row.get("POSIX_BYTES_WRITTEN", 0.0) or 0.0
+                )
+                total_f_time = (
+                    float(row.get("POSIX_F_READ_TIME", 0.0) or 0.0)
+                    + float(row.get("POSIX_F_WRITE_TIME", 0.0) or 0.0)
+                    + float(row.get("POSIX_F_META_TIME", 0.0) or 0.0)
+                )
             if total_f_time <= 1e-12:
                 return 0.0
             return bytes_rw / total_f_time / (1024.0 * 1024.0)
@@ -230,7 +282,11 @@ class RealSynthRunner:
 
         self._apply_knobs_before_run(run_root, config)
 
-        _run(["bash", str(run_sh)], cwd=self.io_synth_root)
+        env = os.environ.copy()
+        for k in MPI_SYNTH_ENV_KEYS:
+            env.pop(k, None)
+        env.update(self._build_mpi_tuning_env(config))
+        _run(["bash", str(run_sh)], cwd=self.io_synth_root, env=env)
         if self.flush_wait_sec > 0:
             time.sleep(self.flush_wait_sec)
 
@@ -253,6 +309,8 @@ class RealSynthRunner:
                 str(pattern_json),
                 "--outdir",
                 str(run_root),
+                "--module-basis",
+                "mpiio" if self.io_api == "mpiio" else "posix",
             ],
             cwd=self.io_synth_root,
         )

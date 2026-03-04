@@ -567,6 +567,8 @@ def main() -> None:
                     str(workload_json),
                     "--outdir",
                     str(run_root),
+                    "--module-basis",
+                    "mpiio" if io_api == "mpiio" else "posix",
                 ],
                 check=False,
             )

@@ -17,13 +17,25 @@ def run(cmd: list[str]) -> None:
     subprocess.run(cmd, check=True)
 
 
-def fallback_perf_mib_per_s(row: dict[str, str]) -> float:
-    bytes_total = float(row.get("POSIX_BYTES_READ", 0.0) or 0.0) + float(row.get("POSIX_BYTES_WRITTEN", 0.0) or 0.0)
+def _row_float(row: dict[str, str], key: str) -> float:
+    return float(row.get(key, 0.0) or 0.0)
+
+
+def fallback_perf_mib_per_s(row: dict[str, str], module_pref: str = "posix") -> float:
+    prefix = "MPIIO" if str(module_pref).strip().lower() == "mpiio" else "POSIX"
+    bytes_total = _row_float(row, f"{prefix}_BYTES_READ") + _row_float(row, f"{prefix}_BYTES_WRITTEN")
     total_f_time = (
-        float(row.get("POSIX_F_READ_TIME", 0.0) or 0.0)
-        + float(row.get("POSIX_F_WRITE_TIME", 0.0) or 0.0)
-        + float(row.get("POSIX_F_META_TIME", 0.0) or 0.0)
+        _row_float(row, f"{prefix}_F_READ_TIME")
+        + _row_float(row, f"{prefix}_F_WRITE_TIME")
+        + _row_float(row, f"{prefix}_F_META_TIME")
     )
+    if (bytes_total <= 0.0 or total_f_time <= 1e-12) and prefix != "POSIX":
+        bytes_total = _row_float(row, "POSIX_BYTES_READ") + _row_float(row, "POSIX_BYTES_WRITTEN")
+        total_f_time = (
+            _row_float(row, "POSIX_F_READ_TIME")
+            + _row_float(row, "POSIX_F_WRITE_TIME")
+            + _row_float(row, "POSIX_F_META_TIME")
+        )
     if total_f_time <= 1e-12:
         return 0.0
     return bytes_total / total_f_time / (1024.0 * 1024.0)
@@ -49,10 +61,48 @@ def parse_perf_metrics_from_darshan(darshan_path: Path) -> dict[str, float]:
     return metrics
 
 
+def select_metric(
+    row: dict[str, str],
+    perf_metrics: dict[str, float],
+    metric_key: str,
+    io_api: str,
+) -> tuple[float, str]:
+    # Caller preference first.
+    if metric_key in perf_metrics:
+        return float(perf_metrics[metric_key]), f"darshan_perf:{metric_key}"
+    if metric_key in row and row[metric_key] not in ("", None):
+        return float(row[metric_key]), f"summary:{metric_key}"
+    if f"MPIIO_{metric_key}" in row and row[f"MPIIO_{metric_key}"] not in ("", None):
+        return float(row[f"MPIIO_{metric_key}"]), f"summary:MPIIO_{metric_key}"
+    if f"POSIX_{metric_key}" in row and row[f"POSIX_{metric_key}"] not in ("", None):
+        return float(row[f"POSIX_{metric_key}"]), f"summary:POSIX_{metric_key}"
+
+    io_api_n = str(io_api).strip().lower()
+    if io_api_n == "mpiio":
+        if row.get("MPIIO_agg_perf_by_slowest", "") not in ("", None):
+            return float(row["MPIIO_agg_perf_by_slowest"]), "summary:MPIIO_agg_perf_by_slowest"
+        if "agg_perf_by_slowest" in perf_metrics:
+            return float(perf_metrics["agg_perf_by_slowest"]), "darshan_perf:agg_perf_by_slowest"
+        if row.get("agg_perf_by_slowest", "") not in ("", None):
+            return float(row["agg_perf_by_slowest"]), "summary:agg_perf_by_slowest"
+        if row.get("POSIX_agg_perf_by_slowest", "") not in ("", None):
+            return float(row["POSIX_agg_perf_by_slowest"]), "summary:POSIX_agg_perf_by_slowest"
+        return float(fallback_perf_mib_per_s(row, module_pref="mpiio")), "fallback:bytes_over_f_time:MPIIO"
+
+    if row.get("POSIX_agg_perf_by_slowest", "") not in ("", None):
+        return float(row["POSIX_agg_perf_by_slowest"]), "summary:POSIX_agg_perf_by_slowest"
+    if "agg_perf_by_slowest" in perf_metrics:
+        return float(perf_metrics["agg_perf_by_slowest"]), "darshan_perf:agg_perf_by_slowest"
+    if row.get("agg_perf_by_slowest", "") not in ("", None):
+        return float(row["agg_perf_by_slowest"]), "summary:agg_perf_by_slowest"
+    return float(fallback_perf_mib_per_s(row, module_pref="posix")), "fallback:bytes_over_f_time:POSIX"
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Darshan analysis for warm-start recommender samples")
     ap.add_argument("--darshan", required=True, help="Path to .darshan file")
     ap.add_argument("--outdir", required=True, help="Output directory for parsed artifacts")
+    ap.add_argument("--io-api", choices=["auto", "posix", "mpiio"], default="auto", help="I/O API used for module-aware metric fallback")
     ap.add_argument("--metric-key", default="agg_perf_by_slowest", help="Preferred metric key (Darshan --perf key or darshan_summary.csv column)")
     ap.add_argument("--txt-name", default=None, help="Optional txt output name")
     args = ap.parse_args()
@@ -82,28 +132,43 @@ def main() -> None:
     with csv_path.open("r", encoding="utf-8") as f:
         row = next(csv.DictReader(f))
 
-    if args.metric_key in perf_metrics:
-        selected_metric = float(perf_metrics[args.metric_key])
-    elif args.metric_key in row and row[args.metric_key] not in ("", None):
-        selected_metric = float(row[args.metric_key])
-    elif f"POSIX_{args.metric_key}" in row and row[f"POSIX_{args.metric_key}"] not in ("", None):
-        selected_metric = float(row[f"POSIX_{args.metric_key}"])
-    else:
-        selected_metric = fallback_perf_mib_per_s(row)
+    io_api = args.io_api
+    if io_api == "auto":
+        has_mpiio = (_row_float(row, "MPIIO_BYTES_READ") + _row_float(row, "MPIIO_BYTES_WRITTEN")) > 0.0
+        io_api = "mpiio" if has_mpiio else "posix"
+
+    selected_metric, metric_source = select_metric(
+        row=row,
+        perf_metrics=perf_metrics,
+        metric_key=args.metric_key,
+        io_api=io_api,
+    )
 
     metrics = {
         "darshan_file": str(darshan_path),
+        "io_api": io_api,
         "metric_key": args.metric_key,
+        "metric_source": metric_source,
         "selected_metric": float(selected_metric),
-        "fallback_mib_per_s": float(fallback_perf_mib_per_s(row)),
+        "fallback_mib_per_s": float(fallback_perf_mib_per_s(row, module_pref=io_api)),
         "darshan_perf_metrics": perf_metrics,
         "agg_perf_by_slowest": float(perf_metrics.get("agg_perf_by_slowest", 0.0)),
-        "POSIX_agg_perf_by_slowest": float(row.get("POSIX_agg_perf_by_slowest", 0.0) or 0.0),
-        "POSIX_BYTES_READ": float(row.get("POSIX_BYTES_READ", 0.0) or 0.0),
-        "POSIX_BYTES_WRITTEN": float(row.get("POSIX_BYTES_WRITTEN", 0.0) or 0.0),
-        "POSIX_F_READ_TIME": float(row.get("POSIX_F_READ_TIME", 0.0) or 0.0),
-        "POSIX_F_WRITE_TIME": float(row.get("POSIX_F_WRITE_TIME", 0.0) or 0.0),
-        "POSIX_F_META_TIME": float(row.get("POSIX_F_META_TIME", 0.0) or 0.0),
+        "POSIX_agg_perf_by_slowest": _row_float(row, "POSIX_agg_perf_by_slowest"),
+        "MPIIO_agg_perf_by_slowest": _row_float(row, "MPIIO_agg_perf_by_slowest"),
+        "POSIX_BYTES_READ": _row_float(row, "POSIX_BYTES_READ"),
+        "POSIX_BYTES_WRITTEN": _row_float(row, "POSIX_BYTES_WRITTEN"),
+        "POSIX_F_READ_TIME": _row_float(row, "POSIX_F_READ_TIME"),
+        "POSIX_F_WRITE_TIME": _row_float(row, "POSIX_F_WRITE_TIME"),
+        "POSIX_F_META_TIME": _row_float(row, "POSIX_F_META_TIME"),
+        "MPIIO_BYTES_READ": _row_float(row, "MPIIO_BYTES_READ"),
+        "MPIIO_BYTES_WRITTEN": _row_float(row, "MPIIO_BYTES_WRITTEN"),
+        "MPIIO_F_READ_TIME": _row_float(row, "MPIIO_F_READ_TIME"),
+        "MPIIO_F_WRITE_TIME": _row_float(row, "MPIIO_F_WRITE_TIME"),
+        "MPIIO_F_META_TIME": _row_float(row, "MPIIO_F_META_TIME"),
+        "MPIIO_INDEP_READS": _row_float(row, "MPIIO_INDEP_READS"),
+        "MPIIO_INDEP_WRITES": _row_float(row, "MPIIO_INDEP_WRITES"),
+        "MPIIO_COLL_READS": _row_float(row, "MPIIO_COLL_READS"),
+        "MPIIO_COLL_WRITES": _row_float(row, "MPIIO_COLL_WRITES"),
     }
 
     with metrics_path.open("w", encoding="utf-8") as f:
