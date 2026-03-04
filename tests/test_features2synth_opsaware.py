@@ -215,3 +215,20 @@ def test_collective_boolean_feature_normalized(tmp_path):
     )
     text = run_sh.read_text(encoding="utf-8")
     assert "--collective yes" in text
+
+
+def test_runner_contains_mpi_env_passthrough_args(tmp_path):
+    _, _, run_sh = _run_plan(
+        tmp_path,
+        {
+            "io_api": "mpiio",
+            "mpi_collective_mode": "yes",
+        },
+    )
+    text = run_sh.read_text(encoding="utf-8")
+    assert "SYNTH_MPI_NUM_AGGREGATORS" in text
+    assert "SYNTH_MPI_COLLECTIVE_BUFFER_SIZE" in text
+    assert "SYNTH_MPI_AGGREGATORS_PER_CLIENT" in text
+    assert "--mpi-num-aggregators" in text
+    assert "--mpi-collective-buffer-size" in text
+    assert "--mpi-aggregators-per-client" in text

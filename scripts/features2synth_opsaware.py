@@ -3585,13 +3585,29 @@ def plan_from_features(feats, nranks:int, fs_align_bytes:int):
         f.write(f"bash {PREP}\n")
         # Allow external override for repeated iterations/config trials.
         f.write(f"export DARSHAN_LOGFILE=\"${{DARSHAN_LOGFILE:-{darshan_path}}}\"\n")
+        f.write("MPI_SYNTH_ARGS=()\n")
+        f.write(
+            "if [[ -n \"${SYNTH_MPI_NUM_AGGREGATORS:-}\" ]]; then "
+            "MPI_SYNTH_ARGS+=(--mpi-num-aggregators \"${SYNTH_MPI_NUM_AGGREGATORS}\"); "
+            "fi\n"
+        )
+        f.write(
+            "if [[ -n \"${SYNTH_MPI_COLLECTIVE_BUFFER_SIZE:-}\" ]]; then "
+            "MPI_SYNTH_ARGS+=(--mpi-collective-buffer-size \"${SYNTH_MPI_COLLECTIVE_BUFFER_SIZE}\"); "
+            "fi\n"
+        )
+        f.write(
+            "if [[ -n \"${SYNTH_MPI_AGGREGATORS_PER_CLIENT:-}\" ]]; then "
+            "MPI_SYNTH_ARGS+=(--mpi-aggregators-per-client \"${SYNTH_MPI_AGGREGATORS_PER_CLIENT}\"); "
+            "fi\n"
+        )
         # mpiexec: LD_PRELOAD + DARSHAN_LOGFILE for all ranks
         f.write(
             "mpiexec -n {n} "
             "-genv LD_PRELOAD /mnt/hasanfs/darshan-3.4.7/darshan-runtime/install/lib/libdarshan.so "
             "-genv DARSHAN_MODMEM {modmem} "
             "-genv DARSHAN_LOGFILE \"$DARSHAN_LOGFILE\" "
-            "/mnt/hasanfs/bin/mpi_synthio --plan {plan} --io-api {iapi} --meta-api {mapi} --collective {coll} --fs-align {fs_align}\n"
+            "/mnt/hasanfs/bin/mpi_synthio --plan {plan} --io-api {iapi} --meta-api {mapi} --collective {coll} --fs-align {fs_align} \"${{MPI_SYNTH_ARGS[@]}}\"\n"
             .format(
                 n=nprocs,
                 plan=str(PLAN),

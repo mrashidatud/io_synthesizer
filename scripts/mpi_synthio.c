@@ -351,6 +351,227 @@ static void cursor_cache_close_all(void)
     g_cursor_cache_cap = 0;
 }
 
+typedef struct {
+    int set_num_aggs;
+    int num_aggs;
+    int set_cb_buf;
+    long long cb_buf_bytes;
+    int set_aggs_per_client;
+    int aggs_per_client;
+} mpi_hint_cfg_t;
+
+typedef struct {
+    char path[1024];
+    MPI_File fh;
+    MPI_Offset fsz;
+    int mode_write;
+    int comm_kind; /* 0=world, 1=self */
+    int valid;
+} mpi_fh_cache_entry_t;
+
+static mpi_fh_cache_entry_t* g_mpi_fh_cache = NULL;
+static size_t g_mpi_fh_cache_n = 0;
+static size_t g_mpi_fh_cache_cap = 0;
+static unsigned long long g_mpi_fh_cache_hits = 0ULL;
+static unsigned long long g_mpi_fh_cache_misses = 0ULL;
+static unsigned long long g_mpi_fh_cache_opens = 0ULL;
+
+static inline MPI_Comm mpi_comm_from_kind(int comm_kind)
+{
+    return (comm_kind == 1) ? MPI_COMM_SELF : MPI_COMM_WORLD;
+}
+
+static int mpi_info_set_kv(MPI_Info info, const char* key, const char* val)
+{
+    int rc = MPI_Info_set(info, (char*)key, (char*)val);
+    return (rc == MPI_SUCCESS) ? 0 : -1;
+}
+
+static void mpi_log_effective_hints(MPI_File fh, int world_rank, const char* path, int comm_kind)
+{
+    MPI_Info info_used = MPI_INFO_NULL;
+    if (MPI_File_get_info(fh, &info_used) != MPI_SUCCESS || info_used == MPI_INFO_NULL) {
+        return;
+    }
+    int flag = 0;
+    char val[MPI_MAX_INFO_VAL + 1];
+    val[0] = '\0';
+    if (world_rank == 0) {
+        if (MPI_Info_get(info_used, "cb_nodes", MPI_MAX_INFO_VAL, val, &flag) == MPI_SUCCESS && flag) {
+            fprintf(stderr, "INFO: MPIIO effective hint path=%s comm=%s cb_nodes=%s\n",
+                    path, (comm_kind == 1 ? "self" : "world"), val);
+        }
+        if (MPI_Info_get(info_used, "cb_buffer_size", MPI_MAX_INFO_VAL, val, &flag) == MPI_SUCCESS && flag) {
+            fprintf(stderr, "INFO: MPIIO effective hint path=%s comm=%s cb_buffer_size=%s\n",
+                    path, (comm_kind == 1 ? "self" : "world"), val);
+        }
+        if (MPI_Info_get(info_used, "cb_config_list", MPI_MAX_INFO_VAL, val, &flag) == MPI_SUCCESS && flag) {
+            fprintf(stderr, "INFO: MPIIO effective hint path=%s comm=%s cb_config_list=%s\n",
+                    path, (comm_kind == 1 ? "self" : "world"), val);
+        }
+        fflush(stderr);
+    }
+    MPI_Info_free(&info_used);
+}
+
+static int mpi_build_open_info(MPI_Info* out,
+                               const mpi_hint_cfg_t* hint_cfg,
+                               int hints_active,
+                               int world_rank,
+                               const char* path,
+                               int comm_kind)
+{
+    *out = MPI_INFO_NULL;
+    if (MPI_Info_create(out) != MPI_SUCCESS) return -1;
+
+    if (!hints_active || !hint_cfg) return 0;
+
+    if (hint_cfg->set_num_aggs) {
+        char buf[64];
+        (void)snprintf(buf, sizeof(buf), "%d", hint_cfg->num_aggs);
+        if (mpi_info_set_kv(*out, "cb_nodes", buf) == 0 && world_rank == 0) {
+            fprintf(stderr, "INFO: MPIIO requested hint path=%s comm=%s cb_nodes=%s\n",
+                    path, (comm_kind == 1 ? "self" : "world"), buf);
+        }
+    }
+    if (hint_cfg->set_cb_buf) {
+        char buf[64];
+        (void)snprintf(buf, sizeof(buf), "%lld", hint_cfg->cb_buf_bytes);
+        if (mpi_info_set_kv(*out, "cb_buffer_size", buf) == 0 && world_rank == 0) {
+            fprintf(stderr, "INFO: MPIIO requested hint path=%s comm=%s cb_buffer_size=%s\n",
+                    path, (comm_kind == 1 ? "self" : "world"), buf);
+        }
+    }
+    if (hint_cfg->set_aggs_per_client) {
+        char buf[64];
+        (void)snprintf(buf, sizeof(buf), "*:%d", hint_cfg->aggs_per_client);
+        if (mpi_info_set_kv(*out, "cb_config_list", buf) == 0 && world_rank == 0) {
+            fprintf(stderr, "INFO: MPIIO requested hint path=%s comm=%s cb_config_list=%s\n",
+                    path, (comm_kind == 1 ? "self" : "world"), buf);
+        }
+    }
+    return 0;
+}
+
+static int mpi_fh_cache_get(const char* path,
+                            int need_write,
+                            int comm_kind,
+                            const mpi_hint_cfg_t* hint_cfg,
+                            int hints_active,
+                            MPI_File* fh_out,
+                            MPI_Offset* fsz_out)
+{
+    int world_rank = 0;
+    MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
+    for (size_t i = 0; i < g_mpi_fh_cache_n; i++) {
+        mpi_fh_cache_entry_t* e = &g_mpi_fh_cache[i];
+        if (!e->valid) continue;
+        if (e->mode_write != (need_write ? 1 : 0)) continue;
+        if (e->comm_kind != comm_kind) continue;
+        if (strcmp(e->path, path) != 0) continue;
+        g_mpi_fh_cache_hits++;
+        *fh_out = e->fh;
+        *fsz_out = e->fsz;
+        return 0;
+    }
+
+    if (g_mpi_fh_cache_n == g_mpi_fh_cache_cap) {
+        size_t new_cap = g_mpi_fh_cache_cap ? (g_mpi_fh_cache_cap * 2) : 32;
+        mpi_fh_cache_entry_t* tmp =
+            (mpi_fh_cache_entry_t*)realloc(g_mpi_fh_cache, new_cap * sizeof(mpi_fh_cache_entry_t));
+        if (!tmp) return -1;
+        g_mpi_fh_cache = tmp;
+        g_mpi_fh_cache_cap = new_cap;
+    }
+
+    mpi_fh_cache_entry_t* e = &g_mpi_fh_cache[g_mpi_fh_cache_n++];
+    memset(e, 0, sizeof(*e));
+    (void)snprintf(e->path, sizeof(e->path), "%s", path);
+    e->mode_write = need_write ? 1 : 0;
+    e->comm_kind = comm_kind;
+
+    MPI_Info info = MPI_INFO_NULL;
+    if (mpi_build_open_info(&info, hint_cfg, hints_active, world_rank, path, comm_kind) != 0) {
+        e->valid = 0;
+        return -1;
+    }
+    int amode = need_write ? (MPI_MODE_RDWR | MPI_MODE_CREATE) : MPI_MODE_RDONLY;
+    MPI_Comm comm = mpi_comm_from_kind(comm_kind);
+    int rc = MPI_File_open(comm, (char*)path, amode, info, &e->fh);
+    if (info != MPI_INFO_NULL) MPI_Info_free(&info);
+    if (rc != MPI_SUCCESS) {
+        if (world_rank == 0) {
+            char err[MPI_MAX_ERROR_STRING];
+            int n = 0;
+            MPI_Error_string(rc, err, &n);
+            fprintf(stderr, "ERROR: MPI_File_open failed path=%s comm=%s err=%.*s\n",
+                    path, (comm_kind == 1 ? "self" : "world"), n, err);
+        }
+        e->valid = 0;
+        return -1;
+    }
+    if (MPI_File_get_size(e->fh, &e->fsz) != MPI_SUCCESS) {
+        MPI_File_close(&e->fh);
+        e->valid = 0;
+        return -1;
+    }
+    e->valid = 1;
+    g_mpi_fh_cache_misses++;
+    g_mpi_fh_cache_opens++;
+    mpi_log_effective_hints(e->fh, world_rank, path, comm_kind);
+
+    *fh_out = e->fh;
+    *fsz_out = e->fsz;
+    return 0;
+}
+
+static void mpi_fh_cache_close_all(void)
+{
+    for (size_t i = 0; i < g_mpi_fh_cache_n; i++) {
+        if (!g_mpi_fh_cache[i].valid) continue;
+        MPI_File_close(&g_mpi_fh_cache[i].fh);
+        g_mpi_fh_cache[i].valid = 0;
+    }
+    free(g_mpi_fh_cache);
+    g_mpi_fh_cache = NULL;
+    g_mpi_fh_cache_n = 0;
+    g_mpi_fh_cache_cap = 0;
+}
+
+static int mpi_file_rw_at(MPI_File fh, void* buf, size_t len, MPI_Offset off, int wr, int collective)
+{
+    size_t done = 0;
+    char* p = (char*)buf;
+    MPI_Offset cur = off;
+    while (done < len) {
+        size_t left = len - done;
+        int chunk = (left > (size_t)INT_MAX) ? INT_MAX : (int)left;
+        int rc;
+        if (collective) {
+            rc = wr ? MPI_File_write_at_all(fh, cur, p + done, chunk, MPI_BYTE, MPI_STATUS_IGNORE)
+                    : MPI_File_read_at_all(fh, cur, p + done, chunk, MPI_BYTE, MPI_STATUS_IGNORE);
+        } else {
+            rc = wr ? MPI_File_write_at(fh, cur, p + done, chunk, MPI_BYTE, MPI_STATUS_IGNORE)
+                    : MPI_File_read_at(fh, cur, p + done, chunk, MPI_BYTE, MPI_STATUS_IGNORE);
+        }
+        if (rc != MPI_SUCCESS) return -1;
+        done += (size_t)chunk;
+        cur += (MPI_Offset)chunk;
+    }
+    if (len == 0) {
+        int rc;
+        if (collective) {
+            rc = wr ? MPI_File_write_at_all(fh, off, buf, 0, MPI_BYTE, MPI_STATUS_IGNORE)
+                    : MPI_File_read_at_all(fh, off, buf, 0, MPI_BYTE, MPI_STATUS_IGNORE);
+        } else {
+            rc = wr ? MPI_File_write_at(fh, off, buf, 0, MPI_BYTE, MPI_STATUS_IGNORE)
+                    : MPI_File_read_at(fh, off, buf, 0, MPI_BYTE, MPI_STATUS_IGNORE);
+        }
+        if (rc != MPI_SUCCESS) return -1;
+    }
+    return 0;
+}
+
 static int fd_cache_open_entry(fd_cache_entry_t* e, const char* path, int need_write)
 {
     int fd = open(path, need_write ? (O_RDWR | O_CREAT) : O_RDONLY, 0644);
@@ -462,6 +683,356 @@ static inline uint64_t prefix_quota_for_interval(uint64_t prefix_quota,
 
     uint64_t end_cut = (end_idx < cutoff) ? end_idx : cutoff;
     return (end_cut > start_idx) ? (end_cut - start_idx) : 0;
+}
+
+typedef struct {
+    off_t off;
+    unsigned char mis;
+} local_op_t;
+
+static int build_local_ops_plan(const phase_t* p,
+                                uint64_t Nops_local,
+                                uint64_t start_idx,
+                                off_t fsz,
+                                off_t* cur_io,
+                                int world_rank,
+                                local_op_t** ops_out,
+                                uint64_t* n_ops_out)
+{
+    *ops_out = NULL;
+    *n_ops_out = 0;
+    if (p->xfer == 0 || Nops_local == 0) return 0;
+    local_op_t* ops = (local_op_t*)calloc((size_t)Nops_local, sizeof(local_op_t));
+    if (!ops) return -1;
+    uint64_t op_idx = 0;
+
+    off_t cur = *cur_io;
+    cur = clamp_range(cur, fsz, p->xfer);
+
+    int is_write = (p->p_write > 0.5);
+
+    double p_con, p_seq;
+    if (is_write) { p_con = p->p_consec_w; p_seq = p->p_seq_w; }
+    else          { p_con = p->p_consec_r; p_seq = p->p_seq_r; }
+    if (p_con < 0.0) { p_con = 0.0; }
+    if (p_con > 1.0) { p_con = 1.0; }
+    if (p_seq < 0.0) { p_seq = 0.0; }
+    if (p_seq > 1.0) { p_seq = 1.0; }
+    if (p_seq < p_con) { p_seq = p_con; }
+
+    uint64_t N_con = (uint64_t) llround((double)Nops_local * p_con);
+    uint64_t N_seq = (uint64_t) llround((double)Nops_local * (p_seq - p_con));
+    if (N_con > Nops_local) N_con = Nops_local;
+    if (N_seq > Nops_local - N_con) N_seq = Nops_local - N_con;
+    uint64_t N_rnd = Nops_local - N_con - N_seq;
+    if ((p_seq > p_con) && N_seq == 0 && N_rnd > 0) { N_seq++; N_rnd--; }
+    if (p_con > 0.0 && N_con == 0 && N_rnd > 0)     { N_con++; N_rnd--; }
+
+    uint64_t Nops_global = p->n_ops ? p->n_ops : Nops_local;
+    if (Nops_global < Nops_local) Nops_global = Nops_local;
+    uint64_t N_unaligned_global = (uint64_t)llround(p->p_ua_file * (double)Nops_global);
+    if (N_unaligned_global > Nops_global) N_unaligned_global = Nops_global;
+    uint64_t N_unaligned_total = prefix_quota_for_interval(
+        N_unaligned_global, start_idx, Nops_local, Nops_global
+    );
+    uint64_t N_aligned_total = Nops_local - N_unaligned_total;
+    uint64_t unaligned_left = N_unaligned_total;
+    uint64_t aligned_left   = N_aligned_total;
+
+    uint64_t N_mem_mis_global = (uint64_t)llround(p->p_ua_mem * (double)Nops_global);
+    if (N_mem_mis_global > Nops_global) N_mem_mis_global = Nops_global;
+    uint64_t N_mem_mis = prefix_quota_for_interval(
+        N_mem_mis_global, start_idx, Nops_local, Nops_global
+    );
+    uint64_t mis_left = N_mem_mis;
+
+    srand(p->seed + (unsigned int)world_rank * 1337u + (unsigned int)(start_idx % 7919u));
+
+    if (N_con > 0) {
+        uint64_t U = (unaligned_left > N_con) ? N_con : unaligned_left;
+        uint64_t A = N_con - U;
+        if (U > 0) {
+            off_t start = clamp_range(cur, fsz, p->xfer);
+            uint64_t done = 0;
+            for (uint64_t i = 0; i < U && op_idx < Nops_local; i++) {
+                off_t op_start = force_unaligned_start(start);
+                op_start = clamp_range(op_start, fsz, p->xfer);
+                ops[op_idx].off = op_start;
+                ops[op_idx].mis = (mis_left > 0) ? 1 : 0;
+                if (mis_left > 0) mis_left--;
+                op_idx++;
+                start = op_start + (off_t)p->xfer;
+                done++;
+            }
+            cur = start;
+            if (unaligned_left >= done) unaligned_left -= done; else unaligned_left = 0;
+        }
+        if (A > 0) {
+            off_t start = clamp_range(cur, fsz, p->xfer);
+            uint64_t done = 0;
+            for (uint64_t i = 0; i < A && op_idx < Nops_local; i++) {
+                off_t op_start = force_aligned_start(start);
+                op_start = clamp_range(op_start, fsz, p->xfer);
+                ops[op_idx].off = op_start;
+                ops[op_idx].mis = (mis_left > 0) ? 1 : 0;
+                if (mis_left > 0) mis_left--;
+                op_idx++;
+                start = op_start + (off_t)p->xfer;
+                done++;
+            }
+            cur = start;
+            if (aligned_left >= done) aligned_left -= done; else aligned_left = 0;
+        }
+    }
+
+    if (N_seq > 0) {
+        uint64_t U = (unaligned_left > N_seq) ? N_seq : unaligned_left;
+        uint64_t A = N_seq - U;
+        if (U > 0) {
+            off_t start = clamp_range(cur + (off_t)p->xfer, fsz, p->xfer);
+            uint64_t done = 0;
+            for (uint64_t i = 0; i < U && op_idx < Nops_local; i++) {
+                off_t op_start = force_unaligned_start(start);
+                op_start = clamp_range(op_start, fsz, p->xfer);
+                ops[op_idx].off = op_start;
+                ops[op_idx].mis = (mis_left > 0) ? 1 : 0;
+                if (mis_left > 0) mis_left--;
+                op_idx++;
+                start = op_start + (off_t)(p->xfer * 2);
+                done++;
+            }
+            cur = start - (off_t)p->xfer;
+            if (unaligned_left >= done) unaligned_left -= done; else unaligned_left = 0;
+        }
+        if (A > 0) {
+            off_t start = clamp_range(cur + (off_t)p->xfer, fsz, p->xfer);
+            uint64_t done = 0;
+            for (uint64_t i = 0; i < A && op_idx < Nops_local; i++) {
+                off_t op_start = force_aligned_start(start);
+                op_start = clamp_range(op_start, fsz, p->xfer);
+                ops[op_idx].off = op_start;
+                ops[op_idx].mis = (mis_left > 0) ? 1 : 0;
+                if (mis_left > 0) mis_left--;
+                op_idx++;
+                start = op_start + (off_t)(p->xfer * 2);
+                done++;
+            }
+            cur = start - (off_t)p->xfer;
+            if (aligned_left >= done) aligned_left -= done; else aligned_left = 0;
+        }
+    }
+
+    if (N_rnd > 0 && p->pre_seek_eof) {
+        cur = fsz;
+    }
+    uint64_t nchunks = (fsz>0) ? ((fsz + CHUNK_RANDOM - 1) / CHUNK_RANDOM) : 1;
+    uint64_t cidx = (nchunks>0 ? nchunks-1 : 0);
+
+    for (uint64_t i=0; i<N_rnd && op_idx < Nops_local; i++) {
+        off_t chunk_start = (off_t)cidx * (off_t)CHUNK_RANDOM;
+        off_t chunk_end   = chunk_start + (off_t)CHUNK_RANDOM;
+        if (chunk_end > fsz) chunk_end = fsz;
+        off_t span = chunk_end - chunk_start;
+        if (span < (off_t)p->xfer) {
+            if (cidx>0) { cidx--; i--; continue; }
+            chunk_start = 0; chunk_end = fsz; span = chunk_end - chunk_start;
+            if (span < (off_t)p->xfer) break;
+        }
+        off_t start = chunk_start;
+        if (span > (off_t)p->xfer) {
+            uint64_t r = (uint64_t)rand();
+            off_t delta = (off_t)(r % (uint64_t)(span - (off_t)p->xfer + 1));
+            start = chunk_start + delta;
+        }
+        if (unaligned_left > 0) {
+            start = force_unaligned_start(start);
+            unaligned_left--;
+        } else if (aligned_left > 0) {
+            off_t aligned = align_down_off(start);
+            if (aligned < chunk_start) aligned = force_aligned_start(chunk_start);
+            if (aligned + (off_t)p->xfer <= chunk_end) start = aligned;
+            else start = force_aligned_start(start);
+            aligned_left--;
+        }
+        start = clamp_range(start, fsz, p->xfer);
+        ops[op_idx].off = start;
+        ops[op_idx].mis = (mis_left > 0) ? 1 : 0;
+        if (mis_left > 0) mis_left--;
+        op_idx++;
+        if (cidx>0) cidx--; else cidx = nchunks-1;
+    }
+
+    *cur_io = cur;
+    *ops_out = ops;
+    *n_ops_out = op_idx;
+    return 0;
+}
+
+static void exec_phase_data_local_mpi_indep(const phase_t* p,
+                                            int phase_idx,
+                                            uint64_t Nops_local,
+                                            uint64_t start_idx,
+                                            int comm_kind,
+                                            const char* backend_label,
+                                            const mpi_hint_cfg_t* hint_cfg,
+                                            int hints_active)
+{
+    if (p->xfer == 0 || Nops_local == 0) return;
+    int world_rank = 0;
+    MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
+
+    int is_write = (p->p_write > 0.5);
+    MPI_File fh = MPI_FILE_NULL;
+    MPI_Offset fsz = 0;
+    if (mpi_fh_cache_get(p->path, is_write, comm_kind, hint_cfg, hints_active, &fh, &fsz) != 0) {
+        if (world_rank == 0) fprintf(stderr, "ERROR: mpi_fh_cache_get failed for %s\n", p->path);
+        return;
+    }
+
+    int cur_found = 0;
+    off_t cur = cursor_cache_get(p->path, is_write, &cur_found);
+    if (!cur_found) {
+        if (p->xfer > 0 && start_idx > 0) {
+            __uint128_t prod = ((__uint128_t)start_idx) * ((__uint128_t)p->xfer);
+            cur = (prod > (__uint128_t)LLONG_MAX) ? (off_t)LLONG_MAX : (off_t)prod;
+        } else {
+            cur = 0;
+        }
+    }
+
+    local_op_t* ops = NULL;
+    uint64_t n_ops = 0;
+    if (build_local_ops_plan(p, Nops_local, start_idx, (off_t)fsz, &cur, world_rank, &ops, &n_ops) != 0) {
+        if (world_rank == 0) fprintf(stderr, "ERROR: build_local_ops_plan failed for %s\n", p->path);
+        return;
+    }
+
+    buf_t b = alloc_buffer((size_t)p->xfer);
+    if (!b.base) {
+        free(ops);
+        perror("alloc_buffer");
+        return;
+    }
+    void* aligned_ptr = b.base;
+    void* mis_ptr = (void*)((uintptr_t)b.base + 1);
+
+    struct timespec ts_start, ts_end;
+    wallclock_now(&ts_start);
+    for (uint64_t i = 0; i < n_ops; i++) {
+        void* ptr = ops[i].mis ? mis_ptr : aligned_ptr;
+        if (mpi_file_rw_at(fh, ptr, (size_t)p->xfer, (MPI_Offset)ops[i].off, is_write, 0) != 0) {
+            fprintf(stderr, "rank %d: MPI independent IO error on path=%s\n", world_rank, p->path);
+            break;
+        }
+    }
+    wallclock_now(&ts_end);
+
+    char ts0[TSBUF_LEN], ts1[TSBUF_LEN];
+    wallclock_iso8601_from(ts_start, ts0, sizeof ts0);
+    wallclock_iso8601_from(ts_end, ts1, sizeof ts1);
+
+    fprintf(stderr,
+        "rank %d: phase %d done %s: backend=%s path=%s xfer=%" PRIu64 "B ops=%" PRIu64
+        " %s flags=%s file_align=%dB mem_align=%dB start_idx=%" PRIu64 " start=%s end=%s\n",
+        world_rank, phase_idx,
+        is_shared_row_flags(p->flags) ? "[SHARED]" :
+        (is_unique_row_flags(p->flags) ? "[UNIQUE]" : "[LEGACY]"),
+        backend_label, p->path, p->xfer, n_ops,
+        is_write ? "[WRITE]" : "[READ]", p->flags,
+        (int)g_file_align_bytes, (int)MEM_ALIGN, start_idx, ts0, ts1);
+    fflush(stderr);
+
+    cursor_cache_set(p->path, is_write, cur);
+    free(ops);
+    free(b.base);
+}
+
+static void exec_phase_data_local_mpi_coll(const phase_t* p,
+                                           int phase_idx,
+                                           uint64_t Nops_local,
+                                           uint64_t start_idx,
+                                           const mpi_hint_cfg_t* hint_cfg,
+                                           int hints_active)
+{
+    int world_rank = 0;
+    MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
+    int is_write = (p->p_write > 0.5);
+
+    MPI_File fh = MPI_FILE_NULL;
+    MPI_Offset fsz = 0;
+    if (mpi_fh_cache_get(p->path, is_write, 0, hint_cfg, hints_active, &fh, &fsz) != 0) {
+        if (world_rank == 0) fprintf(stderr, "ERROR: mpi_fh_cache_get failed for collective path=%s\n", p->path);
+        return;
+    }
+
+    int cur_found = 0;
+    off_t cur = cursor_cache_get(p->path, is_write, &cur_found);
+    if (!cur_found) {
+        if (p->xfer > 0 && start_idx > 0) {
+            __uint128_t prod = ((__uint128_t)start_idx) * ((__uint128_t)p->xfer);
+            cur = (prod > (__uint128_t)LLONG_MAX) ? (off_t)LLONG_MAX : (off_t)prod;
+        } else {
+            cur = 0;
+        }
+    }
+
+    local_op_t* ops = NULL;
+    uint64_t local_ops = 0;
+    if (build_local_ops_plan(p, Nops_local, start_idx, (off_t)fsz, &cur, world_rank, &ops, &local_ops) != 0) {
+        if (world_rank == 0) fprintf(stderr, "ERROR: build_local_ops_plan failed for %s\n", p->path);
+        return;
+    }
+
+    cursor_cache_set(p->path, is_write, cur);
+
+    unsigned long long local_ull = (unsigned long long)local_ops;
+    unsigned long long max_ull = 0ULL;
+    MPI_Allreduce(&local_ull, &max_ull, 1, MPI_UNSIGNED_LONG_LONG, MPI_MAX, MPI_COMM_WORLD);
+
+    buf_t b = alloc_buffer((size_t)(p->xfer > 0 ? p->xfer : 1));
+    if (!b.base) {
+        free(ops);
+        perror("alloc_buffer");
+        return;
+    }
+    void* aligned_ptr = b.base;
+    void* mis_ptr = (void*)((uintptr_t)b.base + 1);
+
+    struct timespec ts_start, ts_end;
+    wallclock_now(&ts_start);
+    for (unsigned long long i = 0ULL; i < max_ull; i++) {
+        size_t len = 0;
+        MPI_Offset off = 0;
+        void* ptr = aligned_ptr;
+        if (i < local_ull) {
+            len = (size_t)p->xfer;
+            off = (MPI_Offset)ops[i].off;
+            ptr = ops[i].mis ? mis_ptr : aligned_ptr;
+        }
+        if (mpi_file_rw_at(fh, ptr, len, off, is_write, 1) != 0) {
+            fprintf(stderr, "rank %d: MPI collective IO error on path=%s iter=%llu\n",
+                    world_rank, p->path, i);
+            break;
+        }
+    }
+    wallclock_now(&ts_end);
+
+    char ts0[TSBUF_LEN], ts1[TSBUF_LEN];
+    wallclock_iso8601_from(ts_start, ts0, sizeof ts0);
+    wallclock_iso8601_from(ts_end, ts1, sizeof ts1);
+    fprintf(stderr,
+        "rank %d: phase %d done %s: backend=MPIIO_COLL path=%s xfer=%" PRIu64 "B ops=%" PRIu64
+        " %s flags=%s file_align=%dB mem_align=%dB start_idx=%" PRIu64 " start=%s end=%s max_ops=%llu\n",
+        world_rank, phase_idx,
+        is_shared_row_flags(p->flags) ? "[SHARED]" :
+        (is_unique_row_flags(p->flags) ? "[UNIQUE]" : "[LEGACY]"),
+        p->path, p->xfer, local_ops,
+        is_write ? "[WRITE]" : "[READ]", p->flags,
+        (int)g_file_align_bytes, (int)MEM_ALIGN, start_idx, ts0, ts1, max_ull);
+    fflush(stderr);
+
+    free(ops);
+    free(b.base);
 }
 
 // === ADD: execute a DATA row for exactly Nops_local ops starting at logical op-index 'start_idx'
@@ -755,7 +1326,7 @@ static void do_posix_meta(const phase_t* p, int phase_idx)
 }
 
 // === REPLACE: run_plan with wavefront scheduler ===
-static void run_plan(FILE* fp)
+static void run_plan(FILE* fp, io_api_t ioapi, col_mode_t cm, const mpi_hint_cfg_t* hint_cfg, int hints_active)
 {
     // 1) Parse all rows first
     phase_t* phases = NULL; size_t cap = 0, nph = 0;
@@ -816,7 +1387,24 @@ static void run_plan(FILE* fp)
             MPI_Barrier(MPI_COMM_WORLD);
             double t_start = MPI_Wtime();
 
-            exec_phase_data_local(P, (int)(idx + 1), my_ops, start_idx_local);
+            if (ioapi == API_MPIIO) {
+                if (cm == COL_COLL) {
+                    exec_phase_data_local_mpi_coll(P, (int)(idx + 1), my_ops, start_idx_local, hint_cfg, hints_active);
+                } else {
+                    exec_phase_data_local_mpi_indep(
+                        P,
+                        (int)(idx + 1),
+                        my_ops,
+                        start_idx_local,
+                        0,
+                        "MPIIO_INDEP",
+                        hint_cfg,
+                        0
+                    );
+                }
+            } else {
+                exec_phase_data_local(P, (int)(idx + 1), my_ops, start_idx_local);
+            }
 
             double t_end = MPI_Wtime();
 
@@ -907,7 +1495,21 @@ static void run_plan(FILE* fp)
 
                 /* 1-based phase number for logs */
                 int phase_no_for_log = (int)(idx + gi + 1);
-                exec_phase_data_local(U, phase_no_for_log, (uint64_t)Nops, 0);
+                if (ioapi == API_MPIIO) {
+                    const char* backend = (cm == COL_COLL) ? "MPIIO_INDEP_UNIQUE_FALLBACK" : "MPIIO_INDEP";
+                    exec_phase_data_local_mpi_indep(
+                        U,
+                        phase_no_for_log,
+                        (uint64_t)Nops,
+                        0,
+                        1,
+                        backend,
+                        hint_cfg,
+                        0
+                    );
+                } else {
+                    exec_phase_data_local(U, phase_no_for_log, (uint64_t)Nops, 0);
+                }
             }
 
             double t1 = MPI_Wtime();
@@ -969,6 +1571,7 @@ static void run_plan(FILE* fp)
     }
 
     fd_cache_close_all();
+    mpi_fh_cache_close_all();
     cursor_cache_close_all();
 
     fprintf(stderr,
@@ -978,6 +1581,13 @@ static void run_plan(FILE* fp)
         (unsigned long long)g_fd_cache_misses,
         (unsigned long long)g_fd_cache_opens,
         (unsigned long long)g_fd_cache_upgrades);
+    fflush(stderr);
+    fprintf(stderr,
+        "rank %d: mpi_fh_cache stats hits=%llu misses=%llu opens=%llu\n",
+        rank,
+        (unsigned long long)g_mpi_fh_cache_hits,
+        (unsigned long long)g_mpi_fh_cache_misses,
+        (unsigned long long)g_mpi_fh_cache_opens);
     fflush(stderr);
 
     if (rank == 0) {
@@ -998,6 +1608,8 @@ int main(int argc, char** argv)
     io_api_t ioapi=API_POSIX;
     meta_api_t metapi=META_POSIX;
     col_mode_t cm=COL_INDEP; /* default mpiio behavior for --collective=no */
+    mpi_hint_cfg_t hint_cfg;
+    memset(&hint_cfg, 0, sizeof(hint_cfg));
 
     for(int i=1;i<argc;i++){
         if(!strcmp(argv[i],"--plan") && i+1<argc) {
@@ -1023,12 +1635,41 @@ int main(int argc, char** argv)
             unsigned long long v = strtoull(argv[++i], NULL, 10);
             if (v == 0ULL) v = 1ULL;
             g_file_align_bytes = (uint64_t)v;
+        } else if(!strcmp(argv[i],"--mpi-num-aggregators") && i+1<argc){
+            long long v = atoll(argv[++i]);
+            if (v > 0) {
+                hint_cfg.set_num_aggs = 1;
+                hint_cfg.num_aggs = (int)v;
+            } else if(rank == 0) {
+                fprintf(stderr, "WARN: invalid --mpi-num-aggregators '%s'; ignoring\n", argv[i]);
+            }
+        } else if(!strcmp(argv[i],"--mpi-collective-buffer-size") && i+1<argc){
+            long long v = atoll(argv[++i]);
+            if (v > 0) {
+                hint_cfg.set_cb_buf = 1;
+                hint_cfg.cb_buf_bytes = v;
+            } else if(rank == 0) {
+                fprintf(stderr, "WARN: invalid --mpi-collective-buffer-size '%s'; ignoring\n", argv[i]);
+            }
+        } else if(!strcmp(argv[i],"--mpi-aggregators-per-client") && i+1<argc){
+            long long v = atoll(argv[++i]);
+            if (v > 0) {
+                hint_cfg.set_aggs_per_client = 1;
+                hint_cfg.aggs_per_client = (int)v;
+            } else if(rank == 0) {
+                fprintf(stderr, "WARN: invalid --mpi-aggregators-per-client '%s'; ignoring\n", argv[i]);
+            }
         }
     }
 
     if(!plan_path){
         if(rank==0){
-            fprintf(stderr,"Usage: %s --plan payload/plan.csv [--io-api posix|mpiio] [--meta-api posix] [--collective no|yes] [--fs-align BYTES]\n", argv[0]);
+            fprintf(stderr,
+                "Usage: %s --plan payload/plan.csv [--io-api posix|mpiio] [--meta-api posix] "
+                "[--collective no|yes] [--fs-align BYTES] "
+                "[--mpi-num-aggregators N] [--mpi-collective-buffer-size BYTES] "
+                "[--mpi-aggregators-per-client K]\n",
+                argv[0]);
         }
         MPI_Finalize();
         return 1;
@@ -1042,13 +1683,42 @@ int main(int argc, char** argv)
         cm = COL_NONE;
     }
 
+    int hints_active = 0;
+    if (ioapi == API_MPIIO && cm == COL_COLL) {
+        hints_active = 1;
+    }
+    if (rank == 0) {
+        char libver[MPI_MAX_LIBRARY_VERSION_STRING];
+        int n = 0;
+        libver[0] = '\0';
+        MPI_Get_library_version(libver, &n);
+        fprintf(stderr, "INFO: MPI library version: %.*s\n", n, libver);
+        fprintf(stderr, "INFO: mode io_api=%s collective=%s fs_align=%" PRIu64 "\n",
+                (ioapi == API_MPIIO ? "mpiio" : "posix"),
+                (cm == COL_COLL ? "yes" : "no"),
+                g_file_align_bytes);
+        if (hint_cfg.set_num_aggs || hint_cfg.set_cb_buf || hint_cfg.set_aggs_per_client) {
+            fprintf(stderr,
+                    "INFO: MPI hint inputs num_aggregators=%s collective_buffer_size=%s aggregators_per_client=%s active=%s\n",
+                    hint_cfg.set_num_aggs ? "set" : "unset",
+                    hint_cfg.set_cb_buf ? "set" : "unset",
+                    hint_cfg.set_aggs_per_client ? "set" : "unset",
+                    hints_active ? "yes" : "no");
+            if (!hints_active) {
+                fprintf(stderr,
+                        "INFO: MPI hint inputs are inactive (require --io-api mpiio and --collective yes).\n");
+            }
+        }
+        fflush(stderr);
+    }
+
     /* All ranks read/iterate plan to stay in step (but only participants open/IO) */
     FILE* fp = fopen(plan_path,"r");
     if(!fp){
         perror("fopen plan");
         MPI_Abort(MPI_COMM_WORLD, 2);
     }
-    run_plan(fp);
+    run_plan(fp, ioapi, cm, &hint_cfg, hints_active);
     fclose(fp);
 
     MPI_Barrier(MPI_COMM_WORLD);
